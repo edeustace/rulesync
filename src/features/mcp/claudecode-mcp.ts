@@ -25,7 +25,7 @@ export class ClaudecodeMcp extends ToolMcp {
   }
 
   /**
-   * In global mode, ~/.claude/.claude.json should not be deleted
+   * In global mode, ~/.claude.json should not be deleted
    * as it may contain other user settings.
    * In local mode, .mcp.json can be safely deleted.
    */
@@ -36,7 +36,7 @@ export class ClaudecodeMcp extends ToolMcp {
   static getSettablePaths({ global }: { global?: boolean } = {}): ToolMcpSettablePaths {
     if (global) {
       return {
-        relativeDirPath: ".claude",
+        relativeDirPath: ".",
         relativeFilePath: ".claude.json",
       };
     }

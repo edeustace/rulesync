@@ -221,7 +221,7 @@ describe("E2E: mcp (global mode)", () => {
   const { getProjectDir, getHomeDir } = useGlobalTestDirectories();
 
   it.each([
-    { target: "claudecode", outputPath: join(".claude", ".claude.json") },
+    { target: "claudecode", outputPath: ".claude.json" },
     { target: "cursor", outputPath: join(".cursor", "mcp.json") },
     { target: "geminicli", outputPath: join(".gemini", "settings.json") },
     { target: "opencode", outputPath: join(".config", "opencode", "opencode.jsonc") },
@@ -314,7 +314,7 @@ describe("E2E: mcp (global mode)", () => {
     });
 
     // Verify: root mcp content is present, non-root mcp content is absent
-    const generatedContent = await readFileContent(join(homeDir, ".claude", ".claude.json"));
+    const generatedContent = await readFileContent(join(homeDir, ".claude.json"));
     expect(generatedContent).toContain("root-server");
     expect(generatedContent).not.toContain("non-root-server");
   });
