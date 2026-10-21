@@ -22,9 +22,10 @@ export const GOOSE_PLUGIN_MCP_DIR_PATH = join(".agents", "plugins", "rulesync");
 export const GOOSE_PLUGIN_MCP_FILE_NAME = ".mcp.json";
 
 // Goose discovers skills under `.goose/skills/<name>/SKILL.md`, each a directory
-// containing a SKILL.md with `name`+`description` frontmatter. rulesync emits
-// only this Goose-specific project path; Goose's portable global skills location
-// (`~/.agents/skills/`) is already served by the agentsskills target.
+// containing a SKILL.md with `name`+`description` frontmatter. Its global roots
+// are `~/.agents/skills/` (already served by the agentsskills target) and the
+// Goose-specific `~/.config/goose/skills/` (`Paths::config_dir().join("skills")`),
+// which the dedicated `goose` target writes in global mode.
 //
 // Upstream now recommends `.agents/skills/` (project) and `~/.agents/skills/`
 // (global) as the standard, discovering `.goose/skills/` (and `.claude/skills/`)
@@ -35,7 +36,9 @@ export const GOOSE_PLUGIN_MCP_FILE_NAME = ".mcp.json";
 // duplicate that output. See the agentsskills target for the recommended path.
 // @see https://goose-docs.ai/docs/mcp/skills-mcp/
 // @see https://goose-docs.ai/docs/guides/context-engineering/using-skills/
+// @see https://github.com/aaif-goose/goose/blob/v1.53.0/crates/goose/src/skills/mod.rs
 export const GOOSE_SKILLS_DIR_PATH = join(GOOSE_DIR, "skills");
+export const GOOSE_GLOBAL_SKILLS_DIR_PATH = join(GOOSE_GLOBAL_DIR, "skills");
 
 // Recipes are reusable YAML workflow files. Goose discovers project recipes in
 // `./.goose/recipes/` and global recipes in `~/.config/goose/recipes/`.
@@ -52,3 +55,9 @@ export const GOOSE_GLOBAL_RECIPES_DIR_PATH = join(GOOSE_GLOBAL_DIR, "recipes");
 // @see https://goose-docs.ai/docs/guides/context-engineering/custom-agents/
 export const GOOSE_AGENTS_DIR_PATH = join(GOOSE_DIR, "agents");
 export const GOOSE_GLOBAL_AGENTS_DIR_PATH = join(GOOSE_GLOBAL_DIR, "agents");
+
+// Review checks (`goose review`). Rulesync writes only the global directory:
+// the project directory is the cross-tool `.agents/checks/` the `amp` checks
+// target already writes.
+export const GOOSE_CHECKS_PROJECT_DIR = join(".agents", "checks");
+export const GOOSE_CHECKS_GLOBAL_DIR = join(GOOSE_GLOBAL_DIR, "checks");

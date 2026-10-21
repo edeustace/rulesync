@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { z } from "zod/mini";
 
@@ -7,13 +8,24 @@ import {
   AUGMENTCODE_SETTINGS_FILE_NAME,
 } from "../../constants/augmentcode-paths.js";
 import type { AiFileParams, ValidationResult } from "../../types/ai-file.js";
-import type { PermissionAction, PermissionsConfig } from "../../types/permissions.js";
-import { readAugmentcodeSettingsWithLocalOverlay } from "../../utils/augmentcode-settings.js";
+import type {
+  AugmentcodePermissionsOverride,
+  PermissionAction,
+  PermissionsConfig,
+} from "../../types/permissions.js";
+import {
+  parseAugmentcodeSettingsDocument,
+  readAugmentcodeSettingsWithLocalOverlay,
+} from "../../utils/augmentcode-settings.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
+import { globToAnchoredRegexSource } from "../../utils/glob.js";
 import { fallbackLogger, type Logger } from "../../utils/logger.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
+import { quoteValueForWarning } from "../../utils/quote-value.js";
 import { applySharedConfigPatch, sharedConfigFileKey } from "../shared/shared-config-gateway.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+import { bashRulesHonoringAllTools } from "./shell-command-categories.js";
 import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
@@ -91,12 +103,40 @@ const AUGMENT_TO_CANONICAL_TOOL_NAMES: Record<string, string> = Object.fromEntri
   Object.entries(CANONICAL_TO_AUGMENT_TOOL_NAMES).map(([k, v]) => [v, k]),
 );
 
+// Current AugmentCode tool names and the legacy names they alias. Auggie's permissions docs
+// (https://docs.augmentcode.com/cli/permissions) renamed `launch-process` / `view` /
+// `str-replace-editor` / `save-file` to `terminal` / `read` / `edit` / `write` and state that
+// the legacy names are aliased to their current equivalents, so a hand-authored settings.json
+// may use either spelling for the same tool. Rulesync keeps EMITTING the legacy names because
+// the shipped CLI (0.36.0 at the time of writing) matches `toolName` exactly and only knows the
+// legacy spellings; this map is only consulted when reading an existing file, so that a row
+// written under a current name is imported, deduplicated and retracted like its legacy twin.
+const CURRENT_TO_LEGACY_AUGMENT_TOOL_NAMES: Record<string, string> = {
+  terminal: "launch-process",
+  read: "view",
+  edit: "str-replace-editor",
+  write: "save-file",
+};
+
 function toAugmentToolName(canonical: string): string {
-  return CANONICAL_TO_AUGMENT_TOOL_NAMES[canonical] ?? canonical;
+  return lookupOwn({ record: CANONICAL_TO_AUGMENT_TOOL_NAMES, key: canonical }) ?? canonical;
+}
+
+/**
+ * Resolve an existing entry's `toolName` to the legacy spelling rulesync emits, so that the
+ * current alias and the legacy name are treated as the same managed tool.
+ */
+function toLegacyAugmentToolName(augmentName: string): string {
+  // Own-property lookups only: `toolName` comes from a user-editable settings.json, so an
+  // inherited name such as `constructor` must fall through instead of yielding a function.
+  return (
+    lookupOwn({ record: CURRENT_TO_LEGACY_AUGMENT_TOOL_NAMES, key: augmentName }) ?? augmentName
+  );
 }
 
 function toCanonicalToolName(augmentName: string): string {
-  return AUGMENT_TO_CANONICAL_TOOL_NAMES[augmentName] ?? augmentName;
+  const legacyName = toLegacyAugmentToolName(augmentName);
+  return lookupOwn({ record: AUGMENT_TO_CANONICAL_TOOL_NAMES, key: legacyName }) ?? legacyName;
 }
 
 function actionToAugmentType(action: PermissionAction): AugmentBasicPermissionType {
@@ -204,28 +244,8 @@ function coerceAuthoredEntries(
 }
 
 /**
- * Convert a glob-like pattern into a regex string for AugmentCode's `shellInputRegex`.
- * Maps glob `*` to `.*`, `?` to `.`, escapes other regex metacharacters, and anchors at both ends.
- */
-function globToShellRegex(glob: string): string {
-  let regex = "";
-  for (const char of glob) {
-    if (char === "*") {
-      regex += ".*";
-    } else if (char === "?") {
-      regex += ".";
-    } else if (/[\\^$.|+(){}[\]]/.test(char)) {
-      regex += `\\${char}`;
-    } else {
-      regex += char;
-    }
-  }
-  return `^${regex}$`;
-}
-
-/**
  * Recover an approximate glob pattern from an AugmentCode regex.
- * Reverses `globToShellRegex` for the common cases produced by us; otherwise returns the regex as-is.
+ * Reverses `globToAnchoredRegexSource` for the common cases produced by us; otherwise returns the regex as-is.
  */
 function shellRegexToGlob(regex: string): string {
   let body = regex;
@@ -260,7 +280,7 @@ function shellRegexToGlob(regex: string): string {
 /**
  * Detect whether an AugmentCode `shellInputRegex` is faithfully roundtrippable
  * through our glob-based representation. Rulesync stores patterns as globs,
- * and on re-export `globToShellRegex` always produces an anchored pattern of
+ * and on re-export `globToAnchoredRegexSource` always produces an anchored pattern of
  * the form `^...$` whose body contains only literal characters, escaped
  * metacharacters, `.*` (from `*`), and `.` (from `?`).
  *
@@ -338,6 +358,7 @@ export class AugmentcodePermissions extends ToolPermissions {
     outputRoot = process.cwd(),
     validate = true,
     global = false,
+    logger,
   }: ToolPermissionsFromFileParams): Promise<AugmentcodePermissions> {
     const paths = AugmentcodePermissions.getSettablePaths({ global });
     // On import, overlay the project-scope `.augment/settings.local.json`
@@ -345,19 +366,33 @@ export class AugmentcodePermissions extends ToolPermissions {
     // user-local permission overrides are picked up. The overlay is project-only
     // (no global `~/.augment/settings.local.json` is documented), so it is
     // skipped in global mode.
-    const fileContent = await readAugmentcodeSettingsWithLocalOverlay({
+    const mergedContent = await readAugmentcodeSettingsWithLocalOverlay({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       baseFileName: paths.relativeFilePath,
       baseFallbackContent: '{"toolPermissions":[]}',
       includeLocalOverlay: !global,
+      logger,
     });
+    // `enabledPlugins` is imported from the committed `settings.json` alone: a
+    // plugin enabled only in `settings.local.json` is personal, and lifting it
+    // into `.rulesync` would turn it (and its hooks and MCP servers) on for
+    // everyone on the next generate.
+    const fileContent = global
+      ? mergedContent
+      : await withBaseEnabledPlugins({
+          mergedContent,
+          baseFilePath: join(outputRoot, paths.relativeDirPath, paths.relativeFilePath),
+        });
     return new AugmentcodePermissions({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath: paths.relativeFilePath,
       fileContent,
       validate,
+      // Forwarded so `toRulesyncPermissions()` knows which scope it read, which
+      // decides whether `recommendedMarketplaces` is imported; `AiFile` records it.
+      global,
     });
   }
 
@@ -373,7 +408,10 @@ export class AugmentcodePermissions extends ToolPermissions {
 
     let settings: AugmentSettings;
     try {
-      const parsed = JSON.parse(existingContent);
+      const parsed = parseAugmentcodeSettingsDocument({
+        fileContent: existingContent,
+        configPath: join(paths.relativeDirPath, paths.relativeFilePath),
+      });
       const result = AugmentSettingsSchema.safeParse(parsed);
       if (!result.success) {
         throw new Error(formatError(result.error));
@@ -423,24 +461,39 @@ export class AugmentcodePermissions extends ToolPermissions {
     // - Entries with unmanaged toolNames: kept verbatim (Rulesync does not own that namespace).
     // - Entries with managed toolNames AND `permission.type === "deny"`: preserved so user-added
     //   denies cannot be silently dropped by regeneration. This applies to ALL managed tools
-    //   (launch-process / view / str-replace-editor / save-file / web-fetch / web-search), not
-    //   just shell commands. Duplicates that exactly match a generated entry are dropped to avoid
-    //   double-emitting the same row.
+    //   (launch-process / view / str-replace-editor / save-file / web-fetch / web-search, or the
+    //   current aliases terminal / read / edit / write), not just shell commands. Duplicates that
+    //   match a generated entry once the alias is resolved are dropped to avoid double-emitting
+    //   the same row.
     // - Existing managed-tool `allow` / `ask-user` entries: replaced (rulesync owns the
     //   permissive surface for managed namespaces).
+    // Keyed by the spelling actually emitted: an existing row is a duplicate when a generated
+    // row re-emits it under its own spelling or under the legacy spelling rulesync manages. A
+    // passed-through current name (a canonical `terminal` category is emitted verbatim) must
+    // not retire an existing legacy-named deny, which is the spelling the shipped CLI honours.
     const generatedKeys = new Set(
       generated.map((e) => `${e.toolName}|${e.shellInputRegex ?? ""}|${e.permission.type}`),
     );
 
     const preservedBasicEntries = basicExistingEntries.filter((entry) => {
-      // Keep all entries whose toolName is unmanaged.
-      if (!MANAGED_AUGMENT_TOOL_NAMES.has(entry.toolName)) return true;
+      // Older rulesync versions emitted the canonical all-tools category as this literal tool
+      // name, but AugmentCode only matches exact tool names. Remove that known-inert legacy row.
+      if (entry.toolName === "*") return false;
+
+      // Keep all entries whose toolName is unmanaged. A current alias (`terminal`, `read`, ...)
+      // names the same tool as the legacy name rulesync emits, so it is managed too.
+      const legacyToolName = toLegacyAugmentToolName(entry.toolName);
+      if (!MANAGED_AUGMENT_TOOL_NAMES.has(legacyToolName)) return true;
 
       // For ANY managed tool: keep existing `deny` entries (fail-closed) unless they are
-      // duplicated by a generated entry (which would be re-emitted with the same shape).
+      // duplicated by a generated entry (which would be re-emitted with the same shape under
+      // the legacy name).
       if (entry.permission.type === "deny") {
-        const key = `${entry.toolName}|${entry.shellInputRegex ?? ""}|${entry.permission.type}`;
-        return !generatedKeys.has(key);
+        const suffix = `|${entry.shellInputRegex ?? ""}|${entry.permission.type}`;
+        return (
+          !generatedKeys.has(`${entry.toolName}${suffix}`) &&
+          !generatedKeys.has(`${legacyToolName}${suffix}`)
+        );
       }
 
       // Otherwise the rulesync-managed namespace replaces existing entries.
@@ -461,8 +514,12 @@ export class AugmentcodePermissions extends ToolPermissions {
       fileKey: sharedConfigFileKey(paths),
       feature: "permissions",
       existingContent,
-      patch: { toolPermissions: [...specialEntries, ...sortedBasic] },
+      patch: {
+        toolPermissions: [...specialEntries, ...sortedBasic],
+        ...buildPluginConsumptionPatch({ override, existing: settings, global, logger }),
+      },
       filePath,
+      logger,
     });
 
     return new AugmentcodePermissions({
@@ -477,7 +534,10 @@ export class AugmentcodePermissions extends ToolPermissions {
   toRulesyncPermissions(): RulesyncPermissions {
     let settings: AugmentSettings;
     try {
-      const parsed = JSON.parse(this.getFileContent());
+      const parsed = parseAugmentcodeSettingsDocument({
+        fileContent: this.getFileContent(),
+        configPath: join(this.getRelativeDirPath(), this.getRelativeFilePath()),
+      });
       const result = AugmentSettingsSchema.safeParse(parsed);
       if (!result.success) {
         throw new Error(formatError(result.error));
@@ -505,8 +565,12 @@ export class AugmentcodePermissions extends ToolPermissions {
     });
 
     const result: Record<string, unknown> = { ...config };
-    if (specialEntries.length > 0) {
-      result.augmentcode = { toolPermissions: specialEntries };
+    const augmentcodeOverride: Record<string, unknown> = {
+      ...(specialEntries.length > 0 ? { toolPermissions: specialEntries } : {}),
+      ...extractPluginConsumptionKeys({ settings, global: this.global }),
+    };
+    if (Object.keys(augmentcodeOverride).length > 0) {
+      result.augmentcode = augmentcodeOverride;
     }
 
     return this.toRulesyncPermissionsDefault({
@@ -516,12 +580,15 @@ export class AugmentcodePermissions extends ToolPermissions {
 
   validate(): ValidationResult {
     // Mirror Kilo's `safeParse`-based pattern: actually verify that the file
-    // content is JSON-parseable and conforms to the AugmentCode settings
+    // content is JSONC-parseable and conforms to the AugmentCode settings
     // schema. A no-op validate would let malformed files slip past the
     // generate/import boundary and surface as confusing errors deeper in the
     // pipeline.
     try {
-      const parsed = JSON.parse(this.fileContent || "{}");
+      const parsed = parseAugmentcodeSettingsDocument({
+        fileContent: this.fileContent || "{}",
+        configPath: join(this.getRelativeDirPath(), this.getRelativeFilePath()),
+      });
       const result = AugmentSettingsSchema.safeParse(parsed);
       if (!result.success) {
         return { success: false, error: result.error };
@@ -550,6 +617,187 @@ export class AugmentcodePermissions extends ToolPermissions {
   }
 }
 
+/**
+ * The plugin-consumption keys the `augmentcode` override authors in
+ * `settings.json`. Each is written only when the override states it, so a key
+ * the user set by hand is left alone otherwise; once stated, the override is
+ * the source of truth and replaces the value in the file (import lifts the
+ * whole existing value into the override, so nothing is lost on a round-trip).
+ * A plugin id dropped from the override is no longer enabled by the settings
+ * file rulesync writes, though Auggie deep-merges `enabledPlugins` across the
+ * user, project and local tiers, so the other tiers still apply. An id the
+ * existing file has but the override does not state — typically one added
+ * with `auggie plugin install` after the last import — is removed with a
+ * warning that says to re-import.
+ *
+ * `recommendedMarketplaces` is honored by Auggie only in the project's
+ * `.augment/settings.json` ("values in user or local settings are ignored"), so
+ * in global mode it is dropped with a warning instead of written somewhere it
+ * does nothing.
+ *
+ * Both make Auggie load code the repository did not ship — a recommended
+ * marketplace is one prompt away from being cloned, and an enabled plugin can
+ * carry its own hooks and MCP servers — so writing either is logged, unless
+ * the file already holds the same value.
+ *
+ * @see https://docs.augmentcode.com/cli/plugins
+ */
+function buildPluginConsumptionPatch({
+  override,
+  existing,
+  global,
+  logger,
+}: {
+  override: AugmentcodePermissionsOverride | undefined;
+  existing: AugmentSettings;
+  global: boolean;
+  logger?: Logger;
+}): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  const existingKeys = extractPluginConsumptionKeys({ settings: existing, global });
+
+  const recommendedMarketplaces = override?.recommendedMarketplaces;
+  if (recommendedMarketplaces !== undefined) {
+    if (global) {
+      logger?.warn(
+        "AugmentCode honors `recommendedMarketplaces` only in a project's `.augment/settings.json`; skipping it in global mode.",
+      );
+    } else {
+      patch.recommendedMarketplaces = recommendedMarketplaces;
+      const existingMarketplaces = existingKeys.recommendedMarketplaces;
+      if (
+        recommendedMarketplaces.length > 0 &&
+        !isDeepStrictEqual(recommendedMarketplaces, existingMarketplaces)
+      ) {
+        logger?.warn(
+          `Writing AugmentCode \`recommendedMarketplaces\` (${recommendedMarketplaces.map(quoteValueForWarning).join(", ")}): Auggie prompts everyone who opens this workspace to install these plugin marketplaces.`,
+        );
+      }
+      warnAboutRemovedPluginIds({
+        key: "recommendedMarketplaces",
+        removed: (existingMarketplaces ?? []).filter(
+          (marketplace) => !recommendedMarketplaces.includes(marketplace),
+        ),
+        logger,
+      });
+    }
+  }
+
+  const enabledPlugins = override?.enabledPlugins;
+  if (enabledPlugins !== undefined) {
+    patch.enabledPlugins = enabledPlugins;
+    const existingPlugins = existingKeys.enabledPlugins;
+    const enabledIds = Object.keys(enabledPlugins).filter((id) => enabledPlugins[id] === true);
+    if (enabledIds.length > 0 && !isDeepStrictEqual(enabledPlugins, existingPlugins)) {
+      logger?.warn(
+        `Writing AugmentCode \`enabledPlugins\` (${enabledIds.map(quoteValueForWarning).join(", ")}): enabled plugins can ship their own hooks and MCP servers.`,
+      );
+    }
+    warnAboutRemovedPluginIds({
+      key: "enabledPlugins",
+      removed: Object.keys(existingPlugins ?? {}).filter(
+        (id) => !Object.hasOwn(enabledPlugins, id),
+      ),
+      logger,
+    });
+  }
+
+  return patch;
+}
+
+/**
+ * A stated key replaces the file's value, so an entry Auggie added since the
+ * last import (`auggie plugin install`) would vanish silently; name it instead.
+ */
+function warnAboutRemovedPluginIds({
+  key,
+  removed,
+  logger,
+}: {
+  key: "recommendedMarketplaces" | "enabledPlugins";
+  removed: string[];
+  logger?: Logger;
+}): void {
+  if (removed.length === 0) return;
+  logger?.warn(
+    `Removing AugmentCode \`${key}\` entries (${removed.map(quoteValueForWarning).join(", ")}) that the existing settings file has but the \`augmentcode\` permissions override does not state. If they were added with \`auggie plugin install\`, add them to the override (or run \`rulesync import --targets augmentcode --features permissions\`) before generating to keep them.`,
+  );
+}
+
+const RecommendedMarketplacesSchema = z.array(z.string());
+const EnabledPluginsSchema = z.record(z.string(), z.boolean());
+
+/**
+ * Lift the plugin-consumption keys back into the `augmentcode` override on
+ * import, so they round-trip. A value whose shape does not match what Auggie
+ * documents is left out rather than failing the import; generation preserves
+ * it in the file untouched, since the override then does not state the key.
+ * `recommendedMarketplaces` is left out in global mode, where Auggie ignores
+ * it and generation would only skip it again with a warning.
+ */
+function extractPluginConsumptionKeys({
+  settings,
+  global,
+}: {
+  settings: AugmentSettings;
+  global: boolean;
+}): { recommendedMarketplaces?: string[]; enabledPlugins?: Record<string, boolean> } {
+  const result: { recommendedMarketplaces?: string[]; enabledPlugins?: Record<string, boolean> } =
+    {};
+  if (!global) {
+    const recommendedMarketplaces = RecommendedMarketplacesSchema.safeParse(
+      settings.recommendedMarketplaces,
+    );
+    if (recommendedMarketplaces.success) {
+      result.recommendedMarketplaces = recommendedMarketplaces.data;
+    }
+  }
+  const enabledPlugins = EnabledPluginsSchema.safeParse(settings.enabledPlugins);
+  if (enabledPlugins.success) {
+    result.enabledPlugins = enabledPlugins.data;
+  }
+  return result;
+}
+
+/**
+ * Replace the overlay-merged `enabledPlugins` with the base `settings.json`
+ * value (or drop it when the base has none), so a plugin enabled only in
+ * `settings.local.json` is not imported. Content that does not parse is
+ * returned unchanged for the constructor's validation to report.
+ */
+async function withBaseEnabledPlugins({
+  mergedContent,
+  baseFilePath,
+}: {
+  mergedContent: string;
+  baseFilePath: string;
+}): Promise<string> {
+  const baseContent = await readFileContentOrNull(baseFilePath);
+  let merged: Record<string, unknown>;
+  let base: Record<string, unknown>;
+  try {
+    merged = parseAugmentcodeSettingsDocument({
+      fileContent: mergedContent,
+      configPath: baseFilePath,
+    });
+    base =
+      baseContent === null
+        ? {}
+        : parseAugmentcodeSettingsDocument({ fileContent: baseContent, configPath: baseFilePath });
+  } catch {
+    return mergedContent;
+  }
+  if (isDeepStrictEqual(merged.enabledPlugins, base.enabledPlugins)) {
+    return mergedContent;
+  }
+  const { enabledPlugins: _localEnabledPlugins, ...rest } = merged;
+  return JSON.stringify(
+    base.enabledPlugins === undefined ? rest : { ...rest, enabledPlugins: base.enabledPlugins },
+    null,
+    2,
+  );
+}
+
 function convertRulesyncToAugmentEntries({
   config,
   logger,
@@ -559,7 +807,39 @@ function convertRulesyncToAugmentEntries({
 }): AugmentToolPermission[] {
   const entries: AugmentToolPermission[] = [];
 
-  for (const [category, rules] of Object.entries(config.permission)) {
+  // AugmentCode has no wildcard toolName, so resolve the all-tools restrictions into its exact
+  // shell tool even when the source did not state a separate `bash` category.
+  const resolvedBashRules = bashRulesHonoringAllTools(config.permission);
+  const permission =
+    config.permission.bash !== undefined || Object.keys(resolvedBashRules).length > 0
+      ? { ...config.permission, bash: resolvedBashRules }
+      : config.permission;
+
+  // The other managed tools (view / save-file / str-replace-editor / web-fetch / web-search) have
+  // no per-input matcher either, so an all-tools restriction can only be carried as a blanket
+  // deny/ask for the whole tool — the same collapse `hasAnyDeny` below applies to a category's own
+  // rules.
+  const allToolsFailClosedType = computeAllToolsFailClosedType(config.permission["*"]);
+
+  // Categories that actually produced at least one entry below. A category can be *stated* but
+  // still emit nothing (e.g. only non-`*` allow/ask patterns for a tool with no per-input matcher,
+  // which are dropped with a warning) — such a category must still be treated as having no rules
+  // of its own for {@link synthesizeManagedToolFallbackEntries}, or the all-tools restriction would
+  // silently fail open for it.
+  const categoriesWithOwnEntries = new Set<string>();
+
+  for (const [category, rules] of Object.entries(permission)) {
+    if (category === "*") {
+      logger?.warn(
+        `AugmentCode permissions: the all-tools '*' category cannot be emitted as a single entry ` +
+          `because AugmentCode has no wildcard toolName. Deny/ask rules are folded into ` +
+          `'launch-process' and, for any other managed tool that has no explicit rules of its ` +
+          `own, applied as a blanket deny/ask; all-tools allow rules and tools that already ` +
+          `define their own rules are left untouched.`,
+      );
+      continue;
+    }
+
     const augmentToolName = toAugmentToolName(category);
     const isManaged = MANAGED_AUGMENT_TOOL_NAMES.has(augmentToolName);
 
@@ -578,7 +858,7 @@ function convertRulesyncToAugmentEntries({
         } else {
           entries.push({
             toolName: augmentToolName,
-            shellInputRegex: globToShellRegex(pattern),
+            shellInputRegex: globToAnchoredRegexSource(pattern),
             permission: { type: augmentType },
           });
         }
@@ -605,6 +885,7 @@ function convertRulesyncToAugmentEntries({
         );
       }
       entries.push({ toolName: augmentToolName, permission: { type: "deny" } });
+      categoriesWithOwnEntries.add(category);
       continue;
     }
 
@@ -617,6 +898,7 @@ function convertRulesyncToAugmentEntries({
           toolName: augmentToolName,
           permission: { type: actionToAugmentType(action) },
         });
+        categoriesWithOwnEntries.add(category);
       } else {
         droppedPatterns.push(pattern);
       }
@@ -630,7 +912,50 @@ function convertRulesyncToAugmentEntries({
     }
   }
 
+  entries.push(
+    ...synthesizeManagedToolFallbackEntries(categoriesWithOwnEntries, allToolsFailClosedType),
+  );
+
   return entries;
+}
+
+/**
+ * The strictest action the all-tools `*` category imposes, for tools with no per-input matcher to
+ * narrow it onto (see {@link synthesizeManagedToolFallbackEntries}). `deny` wins over `ask`,
+ * and an all-tools `allow` never forces an entry — there is nothing to fail closed on.
+ */
+function computeAllToolsFailClosedType(
+  allToolsRules: Record<string, PermissionAction> | undefined,
+): AugmentBasicPermissionType | undefined {
+  if (!allToolsRules) return undefined;
+  const actions = Object.values(allToolsRules);
+  if (actions.some((action) => action === "deny")) return "deny";
+  if (actions.some((action) => action === "ask")) return "ask-user";
+  return undefined;
+}
+
+/**
+ * Extend the same fail-closed treatment `bash` gets (via {@link bashRulesHonoringAllTools}) to the
+ * other managed tools: one that produced no entries of its own above must not fall back to
+ * AugmentCode's own default just because it has no per-input matcher to narrow the all-tools
+ * restriction onto. A category can be stated yet still emit nothing (e.g. only non-`*` allow/ask
+ * patterns, dropped with a warning), so this checks emitted entries rather than whether the
+ * category was merely present in the source config. A tool whose own rules did emit entries is
+ * left untouched here.
+ */
+function synthesizeManagedToolFallbackEntries(
+  categoriesWithOwnEntries: Set<string>,
+  allToolsFailClosedType: AugmentBasicPermissionType | undefined,
+): AugmentToolPermission[] {
+  if (allToolsFailClosedType === undefined) return [];
+  return Object.entries(CANONICAL_TO_AUGMENT_TOOL_NAMES)
+    .filter(
+      ([canonicalName]) => canonicalName !== "bash" && !categoriesWithOwnEntries.has(canonicalName),
+    )
+    .map(([, augmentToolName]) => ({
+      toolName: augmentToolName,
+      permission: { type: allToolsFailClosedType },
+    }));
 }
 
 /**
@@ -729,6 +1054,7 @@ function convertAugmentToRulesyncPermissions({
       continue;
     }
 
+    const legacyToolName = toLegacyAugmentToolName(entry.toolName);
     const canonical = toCanonicalToolName(entry.toolName);
     if (forbiddenMapKeys.has(canonical)) {
       logger?.warn(
@@ -739,13 +1065,13 @@ function convertAugmentToRulesyncPermissions({
     }
     const action = augmentTypeToAction(type);
 
-    // Only launch-process supports per-input pattern recovery via shellInputRegex.
-    // For other categories (view, str-replace-editor, save-file, web-fetch, web-search) the
-    // AugmentCode schema does not carry per-pattern information, so they are imported as the
-    // catch-all `*` pattern. This is the inverse of the fail-closed export side and is documented
-    // in `docs/reference/file-formats.md`.
+    // Only launch-process (or its current alias `terminal`) supports per-input pattern recovery
+    // via shellInputRegex. For other categories (view, str-replace-editor, save-file, web-fetch,
+    // web-search) the AugmentCode schema does not carry per-pattern information, so they are
+    // imported as the catch-all `*` pattern. This is the inverse of the fail-closed export side
+    // and is documented in `docs/reference/file-formats.md`.
     let pattern: string;
-    if (entry.toolName === "launch-process" && entry.shellInputRegex) {
+    if (legacyToolName === "launch-process" && entry.shellInputRegex) {
       const regex = entry.shellInputRegex;
       if (isShellRegexRoundtrippable(regex)) {
         // Faithful import: glob round-trips back to an equivalent regex.
@@ -793,12 +1119,16 @@ function convertAugmentToRulesyncPermissions({
       );
       continue;
     }
-    if (!permission[canonical]) {
-      permission[canonical] = {};
+    // Own-property bucket: a truthiness check on `permission[canonical]` would find the
+    // inherited function for a name such as `toString` and write the rule onto it.
+    let bucket = lookupOwn({ record: permission, key: canonical });
+    if (bucket === undefined) {
+      bucket = {};
+      permission[canonical] = bucket;
     }
-    const existing = permission[canonical][pattern];
+    const existing = lookupOwn({ record: bucket, key: pattern });
     if (existing === undefined || actionPriority[action] > actionPriority[existing]) {
-      permission[canonical][pattern] = action;
+      bucket[pattern] = action;
     }
   }
 

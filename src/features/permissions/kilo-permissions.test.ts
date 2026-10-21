@@ -19,6 +19,13 @@ const withSandbox = (sandbox: Record<string, unknown>): RulesyncPermissions =>
     fileContent: JSON.stringify({ permission: {}, kilo: { sandbox } }),
   });
 
+const withKiloPermission = (permission: Record<string, unknown>): RulesyncPermissions =>
+  new RulesyncPermissions({
+    relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+    relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+    fileContent: JSON.stringify({ permission: {}, kilo: { permission } }),
+  });
+
 describe("KiloPermissions", () => {
   let testDir: string;
   let cleanup: () => Promise<void>;
@@ -468,6 +475,194 @@ describe("KiloPermissions", () => {
       }),
     ).rejects.toThrow(/Failed to parse Kilo Code config/);
   });
+  it("should move exact deny keys last and keep every other key in order", async () => {
+    // Kilo evaluates `permission` last-match-wins in key order. The MCP feature
+    // writes `{server}_{tool}` keys first; the catch-all appended afterwards
+    // must not lift an exact deny.
+    await writeFileContent(
+      join(testDir, "kilo.jsonc"),
+      JSON.stringify({ permission: { github_delete_repo: "deny", "github_*": "ask" } }),
+    );
+    const rulesyncPermissions = new RulesyncPermissions({
+      outputRoot: testDir,
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: { bash: { "rm *": "deny" }, "*": { "*": "allow" } },
+      }),
+    });
+
+    const instance = await KiloPermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    expect(Object.keys(instance.getJson().permission ?? {})).toEqual([
+      "github_*",
+      "bash",
+      "*",
+      "github_delete_repo",
+    ]);
+  });
+
+  it("should keep a catch-all deny written after a category allow in place", async () => {
+    const rulesyncPermissions = new RulesyncPermissions({
+      outputRoot: testDir,
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: { read: { "*": "allow" }, "*": { "/secrets/**": "deny" } },
+      }),
+    });
+
+    const instance = await KiloPermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    expect(Object.keys(instance.getJson().permission ?? {})).toEqual(["read", "*"]);
+  });
+
+  it("should not reorder user-authored keys ahead of a catch-all deny", async () => {
+    await writeFileContent(
+      join(testDir, "kilo.jsonc"),
+      JSON.stringify({ permission: { edit: "allow", "*": "deny" } }),
+    );
+    const rulesyncPermissions = new RulesyncPermissions({
+      outputRoot: testDir,
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({ permission: { bash: { "git *": "allow" } } }),
+    });
+
+    const instance = await KiloPermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    expect(Object.keys(instance.getJson().permission ?? {})).toEqual(["edit", "*", "bash"]);
+  });
+
+  it("should leave MCP tool keys of listed servers to the MCP feature on import", () => {
+    const kilo = new KiloPermissions({
+      outputRoot: testDir,
+      relativeDirPath: ".",
+      relativeFilePath: "kilo.jsonc",
+      fileContent: JSON.stringify({
+        mcp: { github: { type: "local", command: ["gh-mcp"] }, external: { enabled: false } },
+        permission: {
+          github_create_issue: "allow",
+          github_delete_repo: "deny",
+          github_approved: { "*": "allow" },
+          github_list: "ask",
+          other_tool: "deny",
+          external_directory: "deny",
+        },
+      }),
+    });
+
+    const json = kilo.toRulesyncPermissions().getJson();
+
+    expect(json.kilo?.permission).toEqual({
+      github_list: "ask",
+      other_tool: "deny",
+      external_directory: "deny",
+    });
+  });
+
+  describe("markdown_source", () => {
+    it("should drop allow patterns at project scope with a warning", async () => {
+      const logger = createMockLogger();
+
+      const instance = await KiloPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: withKiloPermission({
+          markdown_source: {
+            "/shared/commands/*": "allow",
+            "/private/*": "deny",
+            "/review/*": "ask",
+          },
+        }),
+        logger,
+      });
+
+      expect(JSON.parse(instance.getFileContent()).permission.markdown_source).toEqual({
+        "/private/*": "deny",
+        "/review/*": "ask",
+      });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("/shared/commands/*"));
+    });
+
+    it("should remove a stale project entry when nothing survives narrowing", async () => {
+      await writeFileContent(
+        join(testDir, "kilo.jsonc"),
+        JSON.stringify({ permission: { markdown_source: { "/shared/*": "allow" } } }),
+      );
+
+      const instance = await KiloPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: withKiloPermission({ markdown_source: { "/shared/*": "allow" } }),
+      });
+
+      expect(JSON.parse(instance.getFileContent()).permission).not.toHaveProperty(
+        "markdown_source",
+      );
+    });
+
+    it("should keep a bare deny or ask and drop a bare allow at project scope", async () => {
+      const denied = await KiloPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: withKiloPermission({ markdown_source: "deny" }),
+      });
+      const asked = await KiloPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: withKiloPermission({ markdown_source: "ask" }),
+      });
+      const allowed = await KiloPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: withKiloPermission({ markdown_source: "allow" }),
+      });
+
+      expect(JSON.parse(denied.getFileContent()).permission.markdown_source).toBe("deny");
+      expect(JSON.parse(asked.getFileContent()).permission.markdown_source).toBe("ask");
+      expect(JSON.parse(allowed.getFileContent()).permission).not.toHaveProperty("markdown_source");
+    });
+
+    it("should leave a project entry alone when rulesync does not author the key", async () => {
+      await writeFileContent(
+        join(testDir, "kilo.jsonc"),
+        JSON.stringify({ permission: { markdown_source: { "/shared/*": "allow" } } }),
+      );
+
+      const instance = await KiloPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: withKiloPermission({ edit: "ask" }),
+      });
+
+      expect(JSON.parse(instance.getFileContent()).permission.markdown_source).toEqual({
+        "/shared/*": "allow",
+      });
+    });
+
+    it("should write every pattern verbatim at global scope", async () => {
+      const logger = createMockLogger();
+
+      const instance = await KiloPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: withKiloPermission({
+          markdown_source: { "/shared/commands/*": "allow" },
+        }),
+        global: true,
+        logger,
+      });
+
+      expect(JSON.parse(instance.getFileContent()).permission.markdown_source).toEqual({
+        "/shared/commands/*": "allow",
+      });
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+  });
+
   describe("sandbox override", () => {
     it("should write the tighten-only keys at project scope", async () => {
       const instance = await KiloPermissions.fromRulesyncPermissions({

@@ -30,6 +30,11 @@ rulesync generate --targets claudecode --features rules,subagents
 
 # Generate components inside an existing plugin directory
 rulesync generate --targets antigravity-plugin --features rules,mcp,subagents,skills,hooks --output-roots ./plugins/review-tools
+rulesync generate --targets augmentcode-plugin --features rules,mcp,commands,subagents,skills,hooks --output-roots ./plugins/review-tools
+rulesync generate --targets zcode-plugin --features mcp,commands,subagents,skills,hooks --output-roots ./plugins/review-tools
+rulesync generate --targets vibe-plugin --features mcp,subagents,skills,hooks --output-roots ./plugins/review-tools
+rulesync generate --targets devin-plugin --features rules,mcp,subagents,skills,hooks --output-roots ./plugins/review-tools
+rulesync generate --targets kimi-code-plugin --features rules,commands,subagents,skills --output-roots ./plugins/review-tools
 
 # Generate only rules (no MCP, permissions, commands, or subagents)
 rulesync generate --targets "*" --features rules
@@ -60,6 +65,10 @@ rulesync install --update
 
 # Fail if lockfile is missing or out of sync (for CI); fetch missing artifacts using locked refs
 rulesync install --frozen
+
+# Report sources whose lockfile entry is behind the remote, without writing anything
+# (exit 1 if any is behind or not locked, 2 if a source cannot be resolved)
+rulesync install --outdated
 
 # Install then generate (typical workflow)
 rulesync install && rulesync generate
@@ -97,6 +106,45 @@ rulesync update --force
 
 > **Deprecated feature:** `ignore` remains available to existing projects throughout Rulesync 14.x, but new projects should use `permissions`. Any removal will be decided separately and will not occur before a future major release.
 
+## JSON Output
+
+The global `--json` flag makes a command print a single result document and nothing else. Because that document is the whole of the output, warnings that would otherwise go to standard error are carried inside it, as a top-level `warnings` array of strings:
+
+```json
+{
+  "success": true,
+  "timestamp": "2025-01-01T00:00:00.000Z",
+  "command": "import",
+  "version": "x.y.z",
+  "warnings": [".factory/settings.local.json is a machine-local overrides file …"],
+  "data": { "…": "…" }
+}
+```
+
+The key is omitted when nothing warned, and `--silent` suppresses warnings there as it does on the console. `warnings` sits beside `data` rather than inside it so a command's own captured keys can never collide with it, and it is reported on the failure document too, where a diagnostic about the input is often what explains the failure.
+
+At most 100 warnings are reported, each truncated to 1,000 characters and 8,000 characters in total; a run that exceeds any of those limits says so in a final entry rather than growing the document without bound.
+
+Because that budget is finite, the array carries the diagnostics a run has no other way to report — not a restatement of what `data` already holds. A command that lists something under a captured key writes the list there and warns only about what the list does not say.
+
+## Init Command
+
+`rulesync init` creates the `.rulesync/` directory with sample rule, MCP, subagent, skill, hooks and permissions files, plus a `rulesync.jsonc` configuration file. Existing files are never overwritten.
+
+### User-level defaults
+
+The generated `rulesync.jsonc` starts from `"targets": ["codexcli", "claudecode", "opencode"]` and `"features": ["rules", "mcp", "subagents", "skills", "hooks", "permissions"]`. To seed every new project with your own set instead, put a `rulesync.jsonc` in the user config directory: `$XDG_CONFIG_HOME/rulesync/rulesync.jsonc`, which is `~/.config/rulesync/rulesync.jsonc` when `XDG_CONFIG_HOME` is unset (a relative `XDG_CONFIG_HOME` is ignored, as the XDG specification requires).
+
+```jsonc
+// ~/.config/rulesync/rulesync.jsonc
+{
+  "targets": ["claudecode", "cursor"],
+  "features": ["rules", "skills"],
+}
+```
+
+`init` copies only `targets` and `features` from that file; a key it omits keeps the built-in default, and the object form of `targets` is copied as-is (the top-level `features` key is then left out, since the per-target features live inside the object). Every other key is ignored: the file is a template for `init`, not a configuration layer — `generate` and the other commands read only the project's `rulesync.jsonc` and `rulesync.local.jsonc`. A user config that exists but fails to parse or schema validation (for example, an unknown target name in the array form of `targets`) makes `init` fail rather than silently writing the defaults. The command reports `Seeded targets and features from <path>` when the file was used (`seededFrom` in `--json` output).
+
 ## Generate Command
 
 The `generate` command reads source files from one or more rulesync source trees (default: `<cwd>/.rulesync`; configurable via `--input-roots`) and writes AI tool configuration files to the output directories.
@@ -116,7 +164,71 @@ The `generate` command reads source files from one or more rulesync source trees
 | `--simulate-subagents`      | Generate simulated subagents for tools that do not support them natively                                                                                                                                                                                                                                                                                                                  | `false`               |
 | `--simulate-skills`         | Generate simulated skills for tools that do not support them natively                                                                                                                                                                                                                                                                                                                     | `false`               |
 | `--delete`                  | Delete existing generated files before writing                                                                                                                                                                                                                                                                                                                                            | From `rulesync.jsonc` |
+| `--retire-targets <tools>`  | Comma-separated list of tools the project no longer uses, or no longer uses the listed features for; deletes the outputs Rulesync manages for them (requires `--features`; see below)                                                                                                                                                                                                     | -                     |
 | `--watch, -w`               | Keep running and regenerate whenever rulesync source files change                                                                                                                                                                                                                                                                                                                         | `false`               |
+| `--config, -c <path>`       | Path to the configuration file to load (`rulesync.local.jsonc` next to it still overlays it)                                                                                                                                                                                                                                                                                              | `rulesync.jsonc`      |
+
+> **Note on `--check` and shared root files:** A root file that several targets
+> write, such as `AGENTS.md`, is compared against its owner's output. The owner
+> is the last target in `rulesync.jsonc` that generates rules, even when
+> `--targets` selects a different target, and its output is built as
+> `rulesync generate` with the same options but without `--targets` would
+> build it. See
+> [Target Order and File Conflicts](../guide/configuration.md#target-order-and-file-conflicts).
+
+> **Retiring a target:** Leaving a tool out of `targets` (or out of
+> `--targets`) never deletes its files — not even with `--delete` — because an
+> omitted target only means "not processed in this run". To remove the outputs
+> of a tool the project has dropped, name it and the features Rulesync
+> generated for it explicitly:
+>
+> ```bash
+> # rulesync.jsonc no longer lists cursor; Rulesync generated its rules and mcp
+> rulesync generate --retire-targets cursor --features rules,mcp --dry-run   # preview
+> rulesync generate --retire-targets cursor --features rules,mcp
+> ```
+>
+> For each listed feature, Rulesync deletes the files it would sweep with
+> `--delete` for that tool — the same managed paths, nothing else. Note that
+> `--features` scopes the whole run, not only the retirement — except with the
+> object form of `targets`, or when a retired tool is still configured (see
+> below), where the run keeps each target's configured features and
+> `--features` only names what to retire. The listed features apply to every
+> retired tool, and a managed path is deleted even if you edited it by hand,
+> so preview with `--dry-run` first.
+>
+> The same option retires a single feature of a tool the project keeps. Remove
+> the feature from that tool's entry (or, with the array form of `targets`,
+> from `features`, which drops it for every tool) and name the tool and the
+> feature:
+>
+> ```bash
+> # rulesync.jsonc: { "targets": { "claudecode": ["rules"] } } — mcp was removed
+> rulesync generate --retire-targets claudecode --features mcp --dry-run
+> rulesync generate --retire-targets claudecode --features mcp
+> ```
+>
+> A tool that is still configured may only retire features it no longer
+> generates; naming one it still generates is an error.
+>
+> - Unrelated files beside the managed paths stay, a shared file another tool
+>   merges into (such as `.claude/settings.json`) is never removed, and a
+>   hand-written legacy root Rulesync only reads (such as `.claude/CLAUDE.md`)
+>   is kept.
+> - A path a configured target writes in the same run (for example
+>   `AGENTS.md` written by `codexcli` while `agentsmd` is retired) is kept.
+> - Retirement is idempotent, so an interrupted run can simply be repeated.
+>   `--check` fails while retired outputs remain, and `--json` lists the
+>   retired paths among the deletions.
+> - The option is CLI-only on purpose: retirement is a one-off migration step,
+>   not a standing setting. It requires `--features` (without `*`), and cannot
+>   be combined with `--targets` or `--watch`. A retired target may appear in
+>   `targets` only if none of the listed features is configured for it.
+> - Retirement is skipped with a warning in global mode, when the
+>   configuration file declares targets the run does not cover, and when any
+>   `.rulesync` source file could not be read.
+> - With the object form of `outputRoots`, keep an entry for the retired
+>   target so its outputs can be located.
 
 > **Note on `--delete` and shared output directories:** Several targets write
 > into one directory on purpose — `.agents/agents/`, `.agents/skills/`, and the
@@ -133,6 +245,44 @@ The `generate` command reads source files from one or more rulesync source trees
 > directory of its own, so what the sweep removes there is a `.md` file directly
 > under that root which no `.rulesync/skills/` source produces. The root itself
 > and anything nested inside it are left alone. See [Takt](../tools/takt.md).
+>
+> Skill directories are swept from the inside as well, not only as whole
+> directories. Deleting a supporting file from `.rulesync/skills/<name>/` while
+> keeping the skill removes the generated copy on the next `generate --delete`,
+> and `generate --check` reports such a leftover as out of date rather than
+> passing — which matters most in a pre-commit hook, where an incremental
+> generate would otherwise commit a stale copy of instructions an agent still
+> reads. Two kinds of file inside a generated skill directory are never swept:
+> **hidden entries** and **symbolic links**. A symbolic link is never
+> Rulesync's, since the writer only ever creates real files. A hidden file may
+> be — a hidden supporting file such as a `.env.example` is carried like any
+> other — but a hidden name is also where your own files live (a `.gitkeep`, a
+> `.env` with real values in it), and the sweep cannot tell the two apart, so a
+> stale hidden supporting file is the one leftover it knowingly keeps: delete
+> it by hand. A generated skill
+> directory that is itself a symbolic link — to a vendored checkout, say — is
+> not swept from the inside either: what it reads back was never Rulesync's
+> output, and the run says so with a warning. Only files are swept, so a
+> directory left empty by the sweep stays, and a run that could not read every
+> supporting file its sources carry — one it lacked permission to open, or a
+> tree past the limits a skill directory is walked to, each reported as a
+> warning — sweeps no skill directory from the inside at all: with the source
+> only partly read, a generated file it cannot account for may be one it still
+> wants.
+>
+> An output directory reached through a symbolic link that leads outside the
+> output root — a checked-out `.cursor/commands -> ~/notes`, say — is not swept
+> either: what the sweep would list there are files in the link's target, not
+> Rulesync's output, so each one is kept, and every directory holding them is
+> named once in a `Refusing to delete files in` warning, the same way a write
+> through such a link is refused. A link that stays
+> inside the output root is followed as usual, and an orphan that is itself a
+> symbolic link is removed as a link, leaving its target untouched. A generated
+> skill directory linked onto the output root itself is not written either, so
+> its `SKILL.md` never overwrites a file in the root; and only a skill directory
+> that lands directly below its own skills directory counts as the run's output
+> as a whole, so one linked to an ancestor such as `.claude` does not keep the
+> orphans under that ancestor from being swept.
 
 > **Note on unreadable sources:** This applies to the single-file features —
 > `mcp`, `hooks`, `permissions`, and `ignore` — each of which is generated from
@@ -189,11 +339,57 @@ rulesync generate --check --targets "*" --features "*"
 rulesync generate --watch
 ```
 
+### Mutation plan in JSON output
+
+With the global `--json` flag, `generate` reports the files it wrote, the managed keys of shared configuration files it changed, and the orphans it deleted — or, under `--dry-run` and `--check`, would write, change and delete — as a versioned `plan`, next to the existing per-feature `features` summary:
+
+```json
+{
+  "success": true,
+  "command": "generate",
+  "data": {
+    "features": { "…": "…" },
+    "plan": {
+      "version": 2,
+      "operations": [
+        { "action": "write", "kind": "file", "feature": "mcp", "path": ".codex/config.toml" },
+        {
+          "action": "delete",
+          "kind": "key",
+          "feature": "mcp",
+          "path": ".codex/config.toml",
+          "key": "mcp_servers"
+        },
+        { "action": "write", "kind": "file", "feature": "rules", "path": "CLAUDE.md" },
+        {
+          "action": "delete",
+          "kind": "file",
+          "feature": "rules",
+          "path": ".claude/rules/retired.md"
+        },
+        {
+          "action": "delete",
+          "kind": "directory",
+          "feature": "skills",
+          "path": ".claude/skills/retired"
+        }
+      ]
+    }
+  }
+}
+```
+
+- `action` is `write` or `delete`; `kind` is `file`, `directory` or `key`. A deleted directory is listed once, by its own path, together with everything under it. File and directory deletions come from the `--delete` orphan sweep, so without `--delete` the plan holds no `file` or `directory` deletion. A `key` deletion is part of a shared file's write and is reported with or without `--delete`.
+- `path` is relative to the output root, with `/` separators, and the operation does not name the root. A path several targets write is listed once, and so is a relative path that stands for a file in each of several output roots (`--output-roots a b`, or a tool home override such as `HERMES_HOME`): run one output root at a time when a consumer has to tell them apart.
+- The order is deterministic — features in summary order; within a feature, file writes, then key operations, then deletions; paths sorted, and keys within a path — so a `--dry-run` plan can be compared operation by operation with the plan the following real run reports.
+- A failing command's document carries no `data`, so when `--check` finds the tree out of date, or a `.rulesync/` source could not be read, the plan is reported as `error.details.plan` instead.
+- A shared configuration file Rulesync merges into (`.claude/settings.json`, `.codex/config.toml`, …) appears as a `write` of the whole file, followed by one `key` operation for each top-level key Rulesync owns outright there that the write adds or changes (`write`) or removes (`delete`), with the key's name in `key`. Removing the last MCP server from `.rulesync/mcp.jsonc`, for example, is a `delete` of `mcp_servers` in `.codex/config.toml` (and likewise for `.grok/config.toml`, `context_servers` in Zed's `settings.json`, `mcpServers` in `.augment/settings.json`, `.tabnine/agent/settings.json` and `~/.qoder/settings.json`, `mcp` in `crush.json`, `mcp_servers` in Pool's `settings.yaml`, `amp.mcpServers` in Amp's `settings.json`, `mcpServers` in `.qwen/settings.json`, and `mcp` in `opencode.json`, `.mimocode/mimocode.json` and `kilo.json`; other targets still write an empty object there): the other keys of the file are kept as they are, and the file itself is never deleted. A key Rulesync shares with the user at a deeper level — the merged `permissions` block of `.claude/settings.json`, for example — is not listed, so its change shows only as the file `write`. A key two features write in the same run (the Hermes Agent `plugins` list) is listed under each feature that changes it, which a `--dry-run`, where neither sees the other's write, can report differently from the real run. Two rewrites the `--delete` sweep itself makes are not listed at all: disabling the Hermes Agent commands plugin in its `config.yaml` and retracting Goose slash commands — so `--check` can fail with an empty `operations` list when one of them is the only difference. `version` is bumped whenever an operation gains a new `action` or `kind` value or an existing field changes meaning, so a consumer that authorizes operations should refuse a version it does not know. Version 2 added the `key` kind.
+
 ### Watch mode
 
 `generate --watch` runs one generation immediately and then keeps running, regenerating whenever the rulesync sources change. It is meant for iterating on rules, commands, subagents or skills without re-running the command by hand.
 
-- **What is watched**: the `.rulesync/` source tree (recursively) plus the configuration files next to it (`rulesync.jsonc` and `rulesync.local.jsonc`, or the file passed to `--config`). Generated output is never watched, so a regeneration cannot re-trigger the watcher.
+- **What is watched**: within each input root (`.rulesync/` by default, or every `inputRoots` entry), only the top-level entries `generate` reads: the `rules/`, `commands/`, `subagents/`, `skills/` and `checks/` directories (recursively), the `mcp`, `hooks` and `permissions` files in both their `.jsonc` and legacy `.json` spellings (plus the deprecated `.mcp.json`), and `.aiignore`. Everything else under the root is pruned, so churn in unrelated siblings such as `.git/` or `node_modules/` never triggers a regeneration even when the root is the project directory itself. Symbolic links inside a root are followed, so a linked `rules/` directory reports edits to its targets. The configuration files next to the source tree (`rulesync.jsonc` and `rulesync.local.jsonc`, or the file passed to `--config`) are watched as well. Generated output is never watched, so a regeneration cannot re-trigger the watcher.
 - **Debouncing**: bursts of file-system events (editor save storms, `git checkout` switching many files) are coalesced into a single regeneration after a short quiet period. Changes that arrive while a generation is running trigger exactly one follow-up run.
 - **Errors keep the watcher alive**: a failing generation (e.g. invalid frontmatter saved mid-edit) is reported and watching continues; the process does not exit.
 - **Configuration changes**: editing the configuration file triggers a regeneration, and the new values apply to it because the configuration is re-resolved on every run. The **set of watched paths is fixed at startup**, so changing `inputRoot`/`inputRoots` (or the location of the configuration file itself) requires restarting the command. A warning is printed whenever the configuration file changes as a reminder.
@@ -202,21 +398,29 @@ rulesync generate --watch
 
 ### Tool home overrides win over the output root in global scope
 
-Two tools read their profile location from an environment variable: Hermes Agent (`HERMES_HOME`) and Kimi Code (`KIMI_CODE_HOME`). When one of them is set, `generate --global` and `convert --global` write that tool's output under it, **overriding both `outputRoots` and an explicit `--output-roots`** for that target. See [Supported Tools](./supported-tools.md) for what each profile root contains. This is deliberate — the variable names where the tool itself looks, so honoring the flag instead would produce files the tool never reads. Every other target still uses the configured output root.
+Three tools read their profile location from an environment variable: Hermes Agent (`HERMES_HOME`), Kimi Code (`KIMI_CODE_HOME`), and deepagents-cli (`DEEPAGENTS_HOME`). When one of them is set, `generate --global` and `convert --global` write that tool's output under it, **overriding both `outputRoots` and an explicit `--output-roots`** for that target. See [Supported Tools](./supported-tools.md) for what each profile root contains. This is deliberate — the variable names where the tool itself looks, so honoring the flag instead would produce files the tool never reads. Every other target still uses the configured output root.
 
-The override must be a usable directory: an empty value is ignored (the default profile location applies), and a value that is the filesystem root or an unnormalized path is rejected with an error naming the variable.
+The override must be a usable directory: an empty value is ignored (the default profile location applies), and a value that is the filesystem root or an unnormalized path is rejected with an error naming the variable. `DEEPAGENTS_HOME` is additionally held to the spellings dcode itself accepts — an absolute path, or one beginning with `~/` (expanded against the home directory) — so a relative value, a bare `~`, or a `~user` form is rejected rather than resolved against the working directory, since dcode would refuse to start with it. The home directory itself (`DEEPAGENTS_HOME=~/`) is rejected for the same reason: a profile root owns everything beneath it, so that spelling would scatter the profile across your home.
 
 ### Shared config files are never created empty
 
-Some outputs are files Rulesync merges into rather than owns, because the tool (or you) keeps unrelated settings there: `.amp/settings.json(c)`, `.antigravity/settings.json`, `.claude/settings.json`, `.claude/settings.local.json`, `.codex/config.toml`, `.copilot/settings.json`, `.devin/config.json`, `.factory/settings.json`, `.github/copilot/settings.json`, `.grok/config.toml`, `.vibe/config.toml`, `.vscode/settings.json`, `.zed/settings.json`, `kilo.json(c)`, `opencode.json(c)`, and `reasonix.toml`. These are deliberately **not** added to `.gitignore` by `rulesync gitignore`, so that settings you hand-author in them stay version-controlled.
+Some outputs are files Rulesync merges into rather than owns, because the tool (or you) keeps unrelated settings there: `.amp/settings.json(c)`, `.antigravity/settings.json`, `.claude/settings.json`, `.claude/settings.local.json`, `.codex/config.toml`, `.copilot/settings.json`, `.devin/config.json`, `.factory/settings.json`, `.github/copilot/settings.json`, `.grok/config.toml`, `.grok/sandbox.toml`, `.vibe/config.toml`, `.vscode/settings.json`, `.zcode/config.json`, `.zcode/cli/config.json`, `.zed/settings.json`, `kilo.json(c)`, `.mimocode/mimocode.json(c)`, `opencode.json(c)`, and `reasonix.toml`. These are deliberately **not** added to `.gitignore` by `rulesync gitignore`, so that settings you hand-author in them stay version-controlled.
 
 Because they stay committable, `generate` will not **create** one of them just to hold an empty payload: if Rulesync has nothing to contribute (e.g. no permissions map to that tool), the file is left absent instead of being written as `{}`. A file that already exists is always rewritten as usual, so nothing you authored is dropped. Every other generated file is written even when empty, since for a file Rulesync owns its existence is part of the output.
+
+### Comments in shared JSONC files are preserved
+
+Several of those shared files are JSONC rather than JSON, because the tools themselves put comments in them — VS Code's own "MCP: Add Server" scaffold opens `.vscode/mcp.json` with a comment line. `.vscode/settings.json`, `.vscode/mcp.json`, `.amp/settings.json`, `opencode.json(c)` and `kilo.json(c)` (with their global counterparts) are therefore written back as **edits to the existing text**: only the spans whose values actually changed are rewritten, so the comments, blank lines, and key order everywhere else in the file survive a regenerate, and a `generate` that computes the same content it wrote last time leaves the file byte-identical. A key that Rulesync drops takes its own line with it, but a comment on the line above it stays, because Rulesync cannot tell whether that note described the key or the file around it. A note written after a key on the same line belongs to that key: it is removed with the key, and it stays put when Rulesync adds a new key after it. New keys are appended at the end of the object that holds them, and the region the insert touches is re-indented to the file's own indentation — so an object written on a single line is expanded to one key per line when Rulesync adds to it.
+
+Rulesync falls back to rewriting the whole document when there is nothing to preserve, nothing to edit against, or no way to edit safely: an empty file; a file that does not parse, a byte-order mark included (for `.vscode/settings.json`, `.vscode/mcp.json` and `.amp/settings.json` an unparsable file stops the command instead, rather than have Rulesync overwrite settings it could not read); a file whose root is not an object; a file using `__proto__`, `constructor` or `prototype` as a key (those keys are dropped from every document Rulesync parses, so they are removed rather than left behind); a file that states the same key twice, where an edit would land on the copy the tool itself ignores; a file so large, with so much of it changing, that editing it key by key would take longer than a rewrite is worth, whether the size is the file Rulesync starts from or the document it is taking (a machine-generated file with thousands of entries, all of them replaced, or a small file handed thousands of new ones); a file whose changed keys write more than about 200 KB of new text between them, indentation included, which costs more to re-indent than to write out; and a file the editor itself refuses, which it reports as an error rather than a result. Except for the empty file, every such whole-document rewrite is reported as a warning naming the file and the reason (once per file and reason per run), so a comment that goes missing is announced by the `generate` that dropped it rather than discovered in the next diff. Files in the other formats — JSON, YAML, TOML — are re-serialized as before, so comments in `.codex/config.toml` or `reasonix.toml` are still not retained.
 
 ## Gitignore Command
 
 The `gitignore` command adds generated AI tool configuration files to `.gitignore`. By default, it emits entries only for the tools listed in the `targets` of your `rulesync.jsonc` (controlled by the `gitignoreTargetsOnly` option, which defaults to `true`). Set `gitignoreTargetsOnly` to `false` to emit entries for all supported tools instead. You can also filter the output per-invocation with `--targets` / `--features`, which take precedence over the config.
 
 You can route entries to `.gitattributes` instead by setting `gitignoreDestination` to `"gitattributes"` at root, tool, or tool × feature level. More specific settings take precedence.
+
+Set `gitignoreDestination` to `"gitexclude"` to write entries to Git's untracked, repository-local exclude file (`$GIT_COMMON_DIR/info/exclude`, usually `.git/info/exclude`) instead of a tracked file — for example from `rulesync.local.jsonc`. The path is resolved with `git rev-parse --git-path info/exclude`, so linked worktrees are supported, and the command fails with an error when the project is not inside a Git repository or is not at the repository root. Only the rulesync-fenced block in the exclude file is rewritten, and the file is untouched unless an entry is routed there. Because `.gitignore` takes precedence over the exclude file, an entry shared with a target still routed to `"gitignore"` also stays in `.gitignore`. See [Configuration](../guide/configuration.md#per-feature-options) for details.
 
 > **No `rulesync.jsonc` in the project?** Entries for all supported tools are emitted. `gitignoreTargetsOnly` is only applied when a config file exists, so users without a config still get useful `.gitignore` coverage.
 
@@ -368,6 +572,10 @@ rulesync fetch owner/repo@ref:path   # Both ref and path
 | `--interactive, -i`     | Interactively select skills to fetch via a checkbox prompt; nothing is selected initially, press `<a>` to select/deselect all (requires the skills feature and a TTY) | Disabled                         |
 | `--token <token>`       | Git provider token for private repositories                                                                                                                           | `GITHUB_TOKEN` or `GH_TOKEN` env |
 
+### Executable Bits
+
+Skills can ship scripts that agents are expected to run. The GitHub contents API that `fetch` downloads from carries no file mode, so when a run fetches a skill's supporting files `fetch` reads the repository tree once and marks every such file that git records as executable (`100755`) with mode `0755` after writing it (a rules-only fetch makes no tree request); `rulesync generate` then carries that bit into each generated skill directory. Two warnings cover the cases where this cannot be done: a tree listing GitHub cut short (very large repositories), and a tree that could not be read at all. In both cases the files are still fetched, without the bit, and the warning names the file modes as what was lost so you can `chmod` them yourself.
+
 ### Pruning Fetched Skill Directories
 
 A skill is a directory (`skills/<name>/SKILL.md` plus its supporting files), not a single file. When the upstream skill drops or renames a file, an additive fetch would leave the old local copy in place, and the directory would become a mixture of the current upstream files and orphaned leftovers. Agents read whatever is in the directory, so a stale reference or an outdated script keeps steering them long after upstream removed it.
@@ -398,18 +606,64 @@ The scope is deliberately narrow:
 - A local file that the filesystem holds as the same file as one just fetched — a second name for it on a case-insensitive or Unicode-normalizing filesystem, or a hard link — is kept, even though the remote list does not carry that name. The same applies to a symbolic link that resolves to a file or directory this run wrote: it is kept rather than unlinked, since the fetch may have written through it.
 - A skill directory Rulesync cannot read or delete from — a permission it does not hold, a disk that gave out — stops that skill's prune where it failed rather than the whole fetch. Rulesync warns, still lists whatever it had already deleted, and moves on to the next skill.
 - Nothing more than 15 directories below the skill directory is pruned. That is a limit on the local walk, deep enough that a fetched tree stays well inside it; Rulesync warns and leaves anything deeper alone.
-- A skill directory whose name ends in a dot or a space, or whose name has the `NAME~1` shape of a Windows short name, is not pruned. Some systems resolve such a name to a different directory, so the directory that name reads as may not be the directory it opens.
+- A skill directory whose name ends in a dot or an ASCII space, whose name has the `NAME~1` shape of a Windows short name, or whose name is a Windows reserved device name such as `NUL` or `COM1`, is never fetched in the first place (see [Skill Names That Look Alike](#skill-names-that-look-alike)), so there is nothing of it to prune. A local directory of such a name is left exactly as it was. A file _inside_ a skill whose own path has such a segment is skipped on its own (see [Remote Paths Windows Reads Differently](#remote-paths-windows-reads-differently)), and the skill it belongs to is then not pruned in that run.
+- A skill directory whose name differs from another in `skills/` — one that was already there, or one this same fetch just wrote — only in ways some filesystems ignore — its case, or whether an accented letter is written composed or decomposed — is not pruned either, for the same reason: macOS and Windows resolve `skills/PDF` to an existing `skills/pdf`, and macOS resolves a decomposed name to the composed directory of the same name, so pruning it would judge the local skill's own files stale.
 - A skill whose remote listing came back incomplete — GitHub caps a directory listing at 1,000 entries, and entries such as symlinks and submodules cannot be fetched — is not pruned either. Rulesync warns instead, because a local file that upstream still ships cannot be told apart from one it dropped.
 - `--conflict skip` disables pruning. That flag says to leave existing local files alone, and it also means the local copies are not this run's output, so they cannot be judged against the remote list.
 - `--target <tool>` never prunes, because that conversion path does not fetch skills at all.
 
 Pass `--no-prune` to get the old purely additive behavior.
 
-#### Remote Paths Containing a Backslash
+#### Remote Paths Windows Reads Differently
 
-A backslash is an ordinary character in a filename on Linux and macOS, and a directory separator on Windows. A remote file whose path contains one therefore names one file on some systems and a nested path on others, so `fetch` skips it and warns rather than picking an interpretation. The rest of the fetch continues normally.
+A backslash is an ordinary character in a filename on Linux and macOS, and a directory separator on Windows. A colon is ordinary too here, and on Windows it separates a file from one of its alternate data streams, so `skills/pdf::$INDEX_ALLOCATION` is another way of writing `skills/pdf` rather than a directory of its own. A remote file whose path contains either character therefore names one file on some systems and something else on others, so `fetch` skips it and warns rather than picking an interpretation. The rest of the fetch continues normally.
+
+The same applies, segment by segment, to every path `fetch` writes — a rules file, a directory inside a skill, the file at the end of the path — when a segment is one Windows resolves to a different name: a segment ending in a dot or an ASCII space, which Windows strips, so `skills/deploy/references/notes.` is the existing `notes` there; one shaped like a `NAME~1` 8.3 short name, such as `scripts~1/run.sh`, which opens whatever long name it stands for; or a reserved device name — `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM1`–`COM9`, `LPT1`–`LPT9`, in any case and with any extension, so `nul.md` and `con.sh` count, as do `nul .md` with a space before the extension and `com¹` with a superscript digit, both of which Windows reads as the device — which is not a file there at all but the device itself. Such a file would land beside, or on top of, a sibling the repository never published, so it is skipped with a warning that quotes the segment as it is (a trailing space would not show otherwise), on every platform and not only on Windows, because the same output directory may be checked out on several. A skill directory of such a name is handled one level up, by dropping the whole skill (see [Skill Names That Look Alike](#skill-names-that-look-alike)).
 
 Because the skipped file is still part of the remote skill, the skill directory it came from is not pruned in that run either — a local copy of a file the remote still ships would otherwise be indistinguishable from one it dropped.
+
+#### Skill Names That Look Alike
+
+A repository can publish two skill directories whose names a terminal draws the same way — `skill` spelled with a Cyrillic `ѕ`, or the fullwidth `ｓｋｉｌｌ` beside the plain one. Each is still a separate entry with its own name, so a selection writes exactly the directories that were checked; the risk is only that an entry cannot be told apart by sight from what it appears to be — another entry, a skill you already have, or the plainer, shorter name its own row reads as.
+
+The interactive prompt therefore prefixes such an entry with `[!]` and the reason, ahead of the name itself:
+
+```text
+? Select skills to fetch (press <a> to select/deselect all)
+ ◯ pdf
+ ◯ [!] another entry differs from it only by lookalike letters — skill
+ ◯ [!] another entry differs from it only by lookalike letters; mi… — ѕkill
+```
+
+The mark comes first so that a name — which the remote repository chooses — cannot be spelled to look like a mark of its own, or reorder one away. A label wider than one line is shortened with an ellipsis for the same reason; the budget is measured in terminal columns, so a name of ideographic spaces cannot buy extra width by being few characters, and it is taken from the terminal the prompt is drawn in — the window's own width, less the five columns the pointer and the checkbox can take between them, and never more than 72 — so a pane split in half shortens the labels along with it. A terminal that does not say how wide it is counts as whatever the `CLI_WIDTH` environment variable says, and as 80 columns when that is unset too, the same fallback the prompt uses when it wraps the rows, and no terminal shortens a label below 16: past that a row would be an ellipsis and little else, and rows that cannot be told apart at all are worse than a row that wraps. The name is measured first and the reasons take the room that is left, which is why the second label above is cut: a cut takes the reasons from the tail, and the mark and the start of the first reason always survive. Two entries whose labels read alike are numbered — `(1) `, `(2) `, in front for the same reason the mark is — so they stay distinct. That covers labels shortened into the same text, and equally `git` beside `ɡit`, where both rows carry the same note and the names are one shape: the numbers do not say which row is which, but they do say there are two of them, and the value behind a label is untouched, so a shortened entry still selects the skill it names. A name that itself begins the way a marked row does is given a mark of its own saying so — judged by the shape it is drawn in rather than the characters it is spelled with, so `(l)` and a `[ǃ]` written with U+01C3 LATIN LETTER RETROFLEX CLICK are marked alongside the plain `(1)` and `[!]`.
+
+An entry is marked for any of seven reasons:
+
+- **The name carries more whitespace than the row shows.** This reason is written first: the picker cuts an overlong note from its tail, and every other reason says the row may be taken for another one, which can still be checked by eye, while this one says the row itself reaches further than it shows. A run of whitespace is drawn as one gap however long it is, and whitespace at either end of a name is drawn as nothing at all, so ` pdf` and `pdf  reader` reach past what can be seen of them. Both halves of a pair like `pdf` and ` pdf` are already marked as sharing a display form; this reason is what marks the padded name when it is alone on the list. A single blank inside a name that is merely not the plain space is not marked here: it is drawn, so it is a question of which character was chosen rather than of how far the name reaches, and the reason below answers that one. At the start it is marked like any other blank, since there the question is not which character was chosen but that the name reaches past where it appears to end. At the end the same holds for every blank but the ASCII space: a name ending in that, or in a dot, is a name Windows folds onto another, and is dropped rather than marked (see below).
+- **The name carries a mark drawn over the character before it.** An enclosing mark — the box of a keycap, U+20E3, or an enclosing circle, U+20DD — is drawn over the character in front of it and takes no column of its own, so `pdf` with one after it occupies the three columns of `pdf` and is a fourth directory underneath. It is drawn, so the name is offered rather than dropped, and marked whether or not a plain `pdf` is on the list. The one place such a mark belongs is an emoji keycap — `1️⃣`, spelled as UTS #51 spells it — which is not marked; every other enclosing mark is. Only enclosing marks count: the combining accents and vowel signs Vietnamese, Devanagari and Arabic are written with are ordinary and are left alone. Listed second, after the whitespace reason, for the same reason that one is first.
+- **The name carries a character drawn as a plain space.** A blank that a terminal draws in one column, exactly as it draws the plain space, without being one: U+00A0 NO-BREAK SPACE, U+1680 OGHAM SPACE MARK, the U+2000–U+200A quads and spaces, U+202F NARROW NO-BREAK SPACE and U+205F MEDIUM MATHEMATICAL SPACE. `pdf` and `reader` joined by one of those reads on screen as exactly `pdf reader`, and because names are compared with their whitespace collapsed and normalized, the pair is already reported when the plain spelling is on the list — this reason is what marks the substitution when it is alone there, the same case the lookalike tables cover for U+2010 HYPHEN. U+3000 IDEOGRAPHIC SPACE is not marked: it is two columns wide, so the row it is printed on tells it apart, and an ordinary `設定 ガイド` written with it is left alone. Listed third, after the mark reason, for the same reason those two come first: it says what the row itself is drawn as, whatever else is on the list.
+- **Another entry has the same display form.** Names are compared with their hidden characters removed, normalized (NFKC), their whitespace collapsed, and lowercased, so `Skill`, `skill`, ` skill` and the fullwidth `ｓｋｉｌｌ` all collide.
+- **Another entry differs from it only by lookalike letters.** Two names that read the same once each character is replaced by the Latin letter it is drawn as — `copy` beside the same word spelled entirely in Cyrillic. A name does not have to leave the Latin alphabet to qualify: `c0py` with a zero, `ruIes` with a capital I for the l, `Ⅰist` with the Roman numeral one, and `git` with the script `ɡ` or the dotless `ı` are all marked against the plain spelling. Two letters drawn as one count as well — `forrnat` for `format`, `revievv` for `review` — which no table of single characters can see. `cl` for `d` is left out of that short list on purpose: it opens too many ordinary words, and folding it would report `clone` against a `done` you happen to have. The separator counts too, since nearly every skill name is kebab-case and a name that swaps only its hyphen for U+2010 HYPHEN — drawn identically, belonging to no script, and left alone by the compatibility normalization — would otherwise pass every check as plain ASCII. Neither name mixes scripts on its own, so this pair is visible only by comparing the two.
+- **The name reads as Latin letters but is written in another script.** Every letter of it is drawn as a Latin one without being Latin, which is the whole-script confusable of UTS #39: `copy` spelled with four Cyrillic letters is marked even when no Latin `copy` is on the list. This check uses the narrower list of letters that are drawn as a _lowercase_ Latin letter while being lowercase themselves, so an ordinary Russian or Greek word — `текст`, `κατα` — is not marked: its letters are ones whose capitals resemble Latin capitals, which is not the same thing. Cherokee, Coptic, Lisu, Osage, Deseret and Tifinagh are taken whole instead of letter by letter — a name written in nothing but one of them is marked — since those alphabets are drawn in Latin letter shapes throughout. Canadian Aboriginal Syllabics and Vai are not: their letters are shapes of their own, so a name in either reads as nothing Latin, and only a mixture with Latin is marked.
+- **The name mixes scripts.** A single name built from scripts that share letter shapes, such as `good` with a Cyrillic `о`. The alphabets treated as lookalikes are Latin, Cyrillic, Greek, Armenian, Cherokee, Coptic, Lisu, Canadian Aboriginal Syllabics, Osage, Deseret, Vai and Tifinagh, which are among the ones UTS #39 records as confusable with each other. Japanese, Korean and Chinese names mix scripts by nature and routinely carry Latin, so those combinations are not marked, and neither is Latin beside a script that shares no shapes with it.
+
+The display-form and lookalike reasons are asked of the skills already in the output directory as well as of the other entries, and say `a local skill` in place of `another entry` when that is where the twin is. Without that comparison a repository publishing only the imitation — `dep1oy` against a `deploy` you have had for months — is a single plain-ASCII name in one script with nothing on the list to compare it against, and every check stays quiet. A local skill that names the directory an entry would be written into is the skill that entry would refresh rather than one imitating it, so it is not a collision and is not marked; a second fetch of the same repository is therefore as quiet as the first. Where the two spellings differ only in case, or only in how the name is composed in Unicode, whether they name one directory is the filesystem's answer rather than the listing's — macOS and Windows resolve `skills/PDF` to an existing `skills/pdf`, Linux does not — so Rulesync asks it, and marks the pair only where they really are two directories — and only where the two also read alike, so that a local skill a _second_ entry imitates keeps its place in the comparison while the first entry refreshes it. A fullwidth `ｐｄｆ` is a second directory everywhere and is always marked. Where both another entry and a local skill collide with a name, the entry is the one named, since that is the pair you can compare on screen.
+
+A `fetch` that shows no prompt — a plain one, or one selecting with `--skills` — prints the same reasons as a warning listing the names they apply to, so a scripted run is told what an interactive one would have been shown. The names are judged against everything the repository publishes and everything already in the output directory, as the prompt judges them, and listed for what the run actually writes: `--skills c0py` is told that the name reads like another entry even though the `copy` that makes it so was never fetched.
+
+The mark is display-only: it never removes a skill from the list. It is also not a complete answer — the table of lookalike letters holds the common pairs rather than every one, and a name written entirely in a script the table does not map is compared against nothing — so treat it as a hint to look closer, not as a guarantee that unmarked entries are distinct.
+
+Names that cannot be shown honestly at all are a separate case: a skill directory whose name carries a control character, one that draws as nothing — a zero-width space, a Hangul filler, a braille blank — or one that draws as nothing but blank space or combining marks with no letter to sit on is dropped rather than marked, with a warning naming it in stripped form. So is a name that merely begins with a combining mark: the mark is drawn over whatever the terminal printed before the name — the checkbox, the quote around a name in a warning — and the name reads as the letters after it, which is what the warning shows. That drop applies to every `fetch`, including a plain one with neither `--skills` nor `--interactive`, because such a directory on disk cannot be told from the plain name it imitates in any line Rulesync prints.
+
+A name that Windows resolves to a different directory is dropped the same way, with a warning that quotes it as it is: a skill directory whose name ends in a dot or an ASCII space — Windows strips both when it opens a path, so `deploy.` is the existing `deploy` there; any other trailing blank it keeps, so a name ending in a no-break or an ideographic space is fetched and only marked — whose name has the `NAME~1` shape of an 8.3 short name, which on a volume that generates short names opens whatever long name it stands for, or whose name is a reserved device name — `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`, `CONOUT$`, `COM1`–`COM9` or `LPT1`–`LPT9`, in any case and with any extension, so `nul.md` counts, and so do `nul .md` and `com¹` — which cannot be a directory there at all. Such a name reads as one directory and is written into another, so with the default `--conflict overwrite` it would replace the files of a local skill the repository never published. The drop applies on every platform, not only on Windows, because the same output directory may be checked out on several; a repository that ships `deploy.` and `deploy` side by side loses only the first. The shape only counts at the end of a name, and the reservation only on the whole name before its first dot (spaces before that dot dropped first), so `data~2parser`, `v1.0`, `console` and `com10` are ordinary names and are fetched. The segments below the skill directory are held to the same shapes file by file (see [Remote Paths Windows Reads Differently](#remote-paths-windows-reads-differently)).
+
+A zero-width joiner or a variation selector is dropped only where it hides something. It is kept beside the scripts that are written with one — the Arabic family, the Indic scripts, Mongolian — and beside the pictographs an emoji sequence is built from; anywhere else it can be nothing but padding, so `pdf` with a joiner in it is dropped, and so is `設定` with one between its two characters. Standing where its own script puts it — a Persian or Indic name written with a zero-width non-joiner, an emoji name built from a chain of joiners — it is left alone and the name is fetched normally. A joiner is held to both of its neighbors, since it exists to bind two characters: a name that merely ends in one is a second directory drawn exactly like the name beside it, and is dropped. A variation selector is held only to the character before it, which is the one whose form it selects, so an emoji name may end in one. The keycap sequences — `1️⃣`, `#️⃣`, `*️⃣`, spelled as UTS #51 spells them: one of `0`–`9`, `#` or `*`, then U+FE0F, then U+20E3 — are matched whole, since what they are built on is a digit or an ASCII sign rather than a pictograph. Only the whole sequence is kept: a digit followed by a variation selector with no enclosing keycap behind it is padding still, and is dropped still.
+
+#### Remote Paths in Rulesync's Output
+
+Path names come from the remote repository, so every one that Rulesync prints — the fetch summary, warnings, and debug lines — has its control characters stripped first. A crafted path cannot forge or erase the lines around it, which is what makes the record of what was written and deleted worth reading.
+
+The `--json` output is the exception: it carries each path exactly as the repository spells it, because a machine consumer needs the real name to act on it. Anything that renders a value out of that JSON into a terminal has to strip it itself.
 
 ### Examples
 

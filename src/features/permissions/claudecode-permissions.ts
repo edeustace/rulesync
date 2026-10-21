@@ -6,15 +6,29 @@ import type { ClaudeSettingsJson } from "../../types/claude-settings.js";
 import type { PermissionAction, PermissionsConfig } from "../../types/permissions.js";
 import { stripControlCharacters } from "../../utils/control-characters.js";
 import { formatError } from "../../utils/error.js";
-import { readFileContentOrNull } from "../../utils/file.js";
+import { readFileContentOrNull, toPosixPath } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
 import { PROTOTYPE_POLLUTION_KEYS } from "../../utils/prototype-pollution.js";
+import { isRecord } from "../../utils/type-guards.js";
 import {
   applyPermissions,
   CLAUDE_SETTINGS_SHARED_FILE_KEY,
+  serializeSharedConfigFile,
   SHARED_CONFIG_OWNERSHIP,
 } from "../shared/shared-config-gateway.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+import {
+  collectTrustAffectingSandboxPaths,
+  isNonEmptyList,
+  isNonEmptyMap,
+  isNotFalse,
+  isNotTrue,
+  readSandboxPath,
+  type TrustAffectingEntry,
+  type TrustAffectingSandboxPath,
+  warnOnTrustAffectingEntries,
+} from "./sandbox-trust.js";
+import { ALL_TOOLS_PERMISSION_CATEGORY } from "./shell-command-categories.js";
 import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
@@ -74,20 +88,6 @@ function parseClaudePermissionEntry(entry: string): { toolName: string; pattern:
 }
 
 /**
- * Claude Code's file permission checks match only `Edit(path)` and `Read(path)`
- * rules. A `Write(path)`, `NotebookEdit(path)` or `Glob(path)` rule "is accepted
- * but never matched by those checks, so Claude Code warns at startup for each
- * allow, deny, or ask rule in one of these unmatched forms" — so a canonical
- * `write`/`notebookedit`/`glob` rule with a pattern is emitted in the form the
- * docs prescribe instead. A tool-name rule with no path is unaffected: it
- * matches the tool everywhere and produces no warning.
- * @see https://code.claude.com/docs/en/permissions
- */
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-/**
  * Merge `patch` into `base`, recursing into plain objects so a sibling key at
  * any depth survives. Arrays and scalars are replaced, since a list the author
  * states is the list they mean.
@@ -100,8 +100,7 @@ function deepMergeRecords(
   for (const [key, value] of Object.entries(patch)) {
     if (PROTOTYPE_POLLUTION_KEYS.has(key)) continue;
     const existing = merged[key];
-    merged[key] =
-      isPlainRecord(existing) && isPlainRecord(value) ? deepMergeRecords(existing, value) : value;
+    merged[key] = isRecord(existing) && isRecord(value) ? deepMergeRecords(existing, value) : value;
   }
   return merged;
 }
@@ -178,13 +177,8 @@ function resolveSandboxParent({
   root: Record<string, unknown>;
   segments: readonly string[];
 }): Record<string, unknown> | undefined {
-  let parent: Record<string, unknown> = root;
-  for (const segment of segments) {
-    const next = parent[segment];
-    if (!isPlainRecord(next)) return undefined;
-    parent = next;
-  }
-  return parent;
+  const resolved = readSandboxPath({ sandbox: root, path: segments });
+  return isRecord(resolved) ? resolved : undefined;
 }
 
 /**
@@ -219,42 +213,6 @@ function deleteSandboxPath({
 }
 
 /**
- * One setting this generate is about to write that widens what Claude Code
- * trusts. `label` names the setting as it appears in the target file (with the
- * value spliced in where the value is what widens), and `reason` is the verb
- * phrase that completes "it ...". They are collected rather than logged one by
- * one so a file that sets many of them produces a single summary line instead
- * of a run of near-identical warnings.
- */
-type TrustAffectingEntry = {
-  readonly label: string;
-  readonly reason: string;
-};
-
-/**
- * The one warning that names every trust-affecting setting this generate wrote
- * to `relativeFilePath`. Emitted once per file: the individual reasons are what
- * matter, but the "review this as you would a hook" framing only needs saying
- * once, and repeating it per key buries the reasons in boilerplate.
- */
-function warnOnTrustAffectingEntries({
-  entries,
-  relativeFilePath,
-  logger,
-}: {
-  entries: readonly TrustAffectingEntry[];
-  relativeFilePath: string;
-  logger?: Logger;
-}): void {
-  if (entries.length === 0) return;
-  const one = entries.length === 1;
-  const details = entries.map(({ label, reason }) => `'${label}' — ${reason}`).join("; ");
-  logger?.warn(
-    `Claude Code permissions: writing ${entries.length} trust-affecting ${one ? "setting" : "settings"} to ${relativeFilePath}; review ${one ? "it" : "them"} as you would a hook, especially if this permissions file came from 'rulesync fetch'. ${details}.`,
-  );
-}
-
-/**
  * The `permissions.defaultMode` values that start a session with fewer prompts
  * than the default. `plan` and `default` are absent because they do not widen
  * anything.
@@ -264,6 +222,52 @@ const CLAUDECODE_WIDENING_DEFAULT_MODES: Readonly<Record<string, string>> = {
   auto: "shell commands are then auto-approved by a classifier rather than by you",
   bypassPermissions: "every session then starts with no permission prompts at all",
 };
+
+/**
+ * The `permissions.defaultMode` values Claude Code ignores in a project's
+ * `.claude/settings.json` and `.claude/settings.local.json`; rulesync writes the
+ * former at project scope. `auto` there falls back to the built-in
+ * default (skipping a `defaultMode` from `~/.claude/settings.json`), and
+ * `bypassPermissions` starts the session in Manual mode, so both are dropped at
+ * project scope rather than committed as a mode that never applies. Every other
+ * value applies from any settings file. Since v2.1.257.
+ *
+ * @see https://code.claude.com/docs/en/permission-modes#which-mode-a-session-starts-in
+ */
+const CLAUDECODE_PROJECT_SCOPE_IGNORED_DEFAULT_MODES: ReadonlySet<string> = new Set([
+  "auto",
+  "bypassPermissions",
+]);
+
+/**
+ * Drop a project-scope `permissions.defaultMode` Claude Code ignores there (see
+ * {@link CLAUDECODE_PROJECT_SCOPE_IGNORED_DEFAULT_MODES}), warning in the same
+ * voice as the other values the project-scoped file cannot honor.
+ */
+function stripProjectScopeIgnoredDefaultMode({
+  fields,
+  global,
+  relativeFilePath,
+  logger,
+}: {
+  fields: Record<string, unknown>;
+  global: boolean;
+  relativeFilePath: string;
+  logger?: Logger;
+}): void {
+  const { defaultMode } = fields;
+  if (
+    global ||
+    typeof defaultMode !== "string" ||
+    !CLAUDECODE_PROJECT_SCOPE_IGNORED_DEFAULT_MODES.has(defaultMode)
+  ) {
+    return;
+  }
+  logger?.warn(
+    `Claude Code permissions: 'permissions.defaultMode: "${defaultMode}"' is not honored in the project-scoped ${relativeFilePath}, so it is not written there — Claude Code applies "auto" and "bypassPermissions" only from user or managed settings or the --permission-mode flag. Author it in the global scope instead, and remove any defaultMode an earlier generate may have left in ${relativeFilePath}.`,
+  );
+  delete fields.defaultMode;
+}
 
 /**
  * The `permissions` fields that widen rather than restrict: a `defaultMode` that
@@ -316,20 +320,6 @@ const CLAUDECODE_COMMAND_EXECUTING_SANDBOX_PATHS: readonly (readonly string[])[]
 ];
 
 /**
- * The predicates the "which value actually widens?" tables are built from.
- * Each names the value that does *not* widen and reports everything else, never
- * the reverse: the override is authored JSONC, so a key can carry any value at
- * all, and one Claude Code coerces is still honored. Reporting an off-type value
- * keeps the warning fail-safe — silence has to mean "this cannot loosen
- * anything", not "this is not the type the table expected".
- */
-const isNotFalse = (value: unknown): boolean => value !== false;
-const isNotTrue = (value: unknown): boolean => value !== true;
-const isNonEmptyList = (value: unknown): boolean => !Array.isArray(value) || value.length > 0;
-const isNonEmptyMap = (value: unknown): boolean =>
-  !isPlainRecord(value) || Object.keys(value).length > 0;
-
-/**
  * `sandbox` paths that loosen the sandbox rather than naming something to run:
  * they let commands out of it, weaken the isolation it provides, or redirect
  * where its traffic goes. They are written like `env` is — the ordinary uses are
@@ -345,11 +335,7 @@ const isNonEmptyMap = (value: unknown): boolean =>
  *
  * @see https://code.claude.com/docs/en/sandboxing
  */
-const CLAUDECODE_TRUST_AFFECTING_SANDBOX_PATHS: readonly {
-  readonly path: readonly string[];
-  readonly reason: string;
-  readonly widens: (value: unknown) => boolean;
-}[] = [
+const CLAUDECODE_TRUST_AFFECTING_SANDBOX_PATHS: readonly TrustAffectingSandboxPath[] = [
   {
     path: ["allowAppleEvents"],
     reason: "lets sandboxed commands send Apple Events, which removes code-execution isolation",
@@ -451,29 +437,6 @@ const CLAUDECODE_TRUST_AFFECTING_SANDBOX_PATHS: readonly {
     widens: () => true,
   },
 ];
-
-/**
- * Every authored `sandbox` path that loosens the sandbox. Nothing is removed —
- * the values are written, just not silently. Called on the filtered `sandbox`
- * so it never claims to be writing a path the scope filters dropped.
- */
-function collectTrustAffectingSandboxPaths({
-  sandbox,
-}: {
-  sandbox: Record<string, unknown>;
-}): TrustAffectingEntry[] {
-  const entries: TrustAffectingEntry[] = [];
-  for (const { path, reason, widens } of CLAUDECODE_TRUST_AFFECTING_SANDBOX_PATHS) {
-    const leaf = path.at(-1);
-    if (leaf === undefined) continue;
-    const parent = resolveSandboxParent({ root: sandbox, segments: path.slice(0, -1) });
-    if (parent === undefined) continue;
-    const value = parent[leaf];
-    if (value === undefined || !widens(value)) continue;
-    entries.push({ label: `sandbox.${path.join(".")}`, reason });
-  }
-  return entries;
-}
 
 /**
  * One class of `sandbox` paths rulesync refuses to write, paired with the
@@ -578,14 +541,14 @@ function stripProjectIgnoredMaskEntries({
   logger?: Logger;
 }): Record<string, unknown> {
   const credentials = sandbox.credentials;
-  if (!isPlainRecord(credentials)) return sandbox;
+  if (!isRecord(credentials)) return sandbox;
 
   const filteredCredentials: Record<string, unknown> = { ...credentials };
   let changed = false;
   for (const listKey of CLAUDECODE_MASKABLE_CREDENTIAL_LISTS) {
     const list = filteredCredentials[listKey];
     if (!Array.isArray(list)) continue;
-    const kept = list.filter((entry) => !(isPlainRecord(entry) && entry.mode === "mask"));
+    const kept = list.filter((entry) => !(isRecord(entry) && entry.mode === "mask"));
     if (kept.length === list.length) continue;
     changed = true;
     const dropped = list.length - kept.length;
@@ -628,15 +591,15 @@ const CLAUDECODE_FEATURE_OWNED_SETTINGS_KEYS: readonly string[] = Object.entries
  * passthrough must not carry. `permissions` and `sandbox` have their own merge
  * branches (the managed `allow`/`ask`/`deny` arrays and the scope filtering
  * respectively), `permission` is rulesync's own canonical tool-scoped block
- * rather than a settings key, `$schema` is an editor pointer rather than a
- * Claude Code setting, and the rest belong to the other features writing this
- * shared file.
+ * rather than a settings key, the keys the gateway ensures on the file
+ * (`$schema`) are editor pointers rather than Claude Code settings, and the
+ * rest belong to the other features writing this shared file.
  */
 const CLAUDECODE_NON_PASSTHROUGH_OVERRIDE_KEYS: ReadonlySet<string> = new Set([
   "permission",
   "permissions",
   "sandbox",
-  "$schema",
+  ...Object.keys(SHARED_CONFIG_OWNERSHIP[CLAUDE_SETTINGS_SHARED_FILE_KEY]?.ensuredKeys ?? {}),
   ...CLAUDECODE_FEATURE_OWNED_SETTINGS_KEYS,
 ]);
 
@@ -650,24 +613,92 @@ const CLAUDECODE_NON_PASSTHROUGH_OVERRIDE_KEYS: ReadonlySet<string> = new Set([
  *
  * Derived from the per-key **Scope** column of the settings reference: every
  * top-level key documented as `User or managed` or `User, local, or managed`.
+ * `enableArtifact` is deliberately absent: it is documented as `Any file` —
+ * every file can turn the Artifact tool off, and none can turn it back on — so
+ * a project file does honor it. `processWrapper` is also `User or managed`, but it is refused
+ * in both scopes by `CLAUDECODE_COMMAND_EXECUTING_KEYS`, which runs first.
+ *
+ * `autoContinueAtUsageLimit` is dropped at project scope for a stronger reason
+ * than the others: when no user or managed file sets it, a project or local
+ * value turns the feature *off* whatever the value is, so committing a `true`
+ * would silently do the opposite of what it says.
  *
  * @see https://code.claude.com/docs/en/settings-reference
  */
 const CLAUDECODE_USER_SCOPE_ONLY_KEYS: ReadonlySet<string> = new Set([
+  "appendPlugins",
   "askUserQuestionTimeout",
+  "autoContinueAtUsageLimit",
   "autoMode",
+  "bashEditDiffEnabled",
+  "desktopSessionCleanupPeriodDays",
   "dialogExpiry",
-  "enableArtifact",
+  "feedbackDrafts",
   "footerLinksRegexes",
+  "forceLoginGatewayUrl",
+  "modelPicker",
   "pluginConfigs",
+  "prependPlugins",
   "skipAutoPermissionPrompt",
   "skipDangerousModePermissionPrompt",
   "spellcheck",
   "sshConfigs",
+  "syncClaudeAiPlugins",
   "syncClaudeAiSkills",
   "useAutoModeDuringPlan",
   "vimInsertModeRemaps",
 ]);
+
+/**
+ * Nested settings paths under an otherwise project-honored top-level key that
+ * Claude Code reads only from user settings — the nested counterpart of
+ * {@link CLAUDECODE_USER_SCOPE_ONLY_KEYS}. `worktree` is `Any file`, but
+ * `worktree.location` (where Desktop SSH sessions create worktrees on the
+ * remote machine) is documented with a `User` scope, so it is dropped from a
+ * project `.claude/settings.json` and written only under `--global`, while its
+ * siblings are kept.
+ *
+ * @see https://code.claude.com/docs/en/settings-reference#worktree-location
+ */
+const CLAUDECODE_USER_SCOPE_ONLY_NESTED_PATHS: readonly (readonly string[])[] = [
+  ["worktree", "location"],
+];
+
+/**
+ * Drops {@link CLAUDECODE_USER_SCOPE_ONLY_NESTED_PATHS} from the top-level
+ * passthrough at project scope, in place, warning once per dropped path. The
+ * authored subtree is copied before the deletion so the caller's config is not
+ * mutated, and a parent the removal emptied is dropped with it.
+ */
+function stripUserScopeOnlyNestedPaths({
+  overrides,
+  global,
+  relativeFilePath,
+  logger,
+}: {
+  overrides: Record<string, unknown>;
+  global: boolean;
+  relativeFilePath: string;
+  logger?: Logger;
+}): void {
+  if (global) return;
+  for (const path of CLAUDECODE_USER_SCOPE_ONLY_NESTED_PATHS) {
+    const [topLevelKey] = path;
+    if (topLevelKey === undefined || !isRecord(overrides[topLevelKey])) continue;
+    const copy: Record<string, unknown> = {
+      [topLevelKey]: structuredClone(overrides[topLevelKey]),
+    };
+    if (!deleteSandboxPath({ target: copy, path })) continue;
+    if (copy[topLevelKey] === undefined) {
+      delete overrides[topLevelKey];
+    } else {
+      overrides[topLevelKey] = copy[topLevelKey];
+    }
+    logger?.warn(
+      `Claude Code permissions: '${path.map((segment) => displayKey(segment)).join(".")}' is not honored in the project-scoped ${relativeFilePath}, so it is not written there — Claude Code reads it from user settings only. Author it in the global scope instead, and check that file for a stale value an earlier generate may have left there.`,
+    );
+  }
+}
 
 /**
  * Top-level settings keys neither file rulesync writes can honor, with the file
@@ -682,35 +713,63 @@ const CLAUDECODE_USER_SCOPE_ONLY_KEYS: ReadonlySet<string> = new Set([
  */
 const CLAUDECODE_UNHONORED_KEY_SOURCES: Readonly<Record<string, string>> = {
   allowAllClaudeAiMcps: "managed settings",
+  allowClaudeInChromeWithManagedMcp: "managed settings",
   allowedChannelPlugins: "managed settings",
+  allowedProviders: "managed settings",
   allowManagedHooksOnly: "managed settings",
   allowManagedMcpServersOnly: "managed settings",
   allowManagedPermissionRulesOnly: "managed settings",
   autoConnectIde: "~/.claude.json",
   autoInstallIdeExtension: "~/.claude.json",
+  availableModelsMatch: "managed settings",
   blockedMarketplaces: "managed settings",
   browserExternalPageTools: "managed settings",
   channelsEnabled: "managed settings",
+  claudeInChromeDefaultEnabled: "~/.claude.json",
   claudeMd: "managed settings",
+  copyFullResponse: "~/.claude.json",
+  copyOnSelect: "~/.claude.json",
+  defaultToAgentsView: "~/.claude.json",
+  deniedModels: "managed settings",
   diffTool: "~/.claude.json",
   disableBrowserExternalNavigation: "managed settings",
   disableCommandPluginSources: "managed settings",
+  disableDesktopLocalSessions: "managed settings",
   disableMobileSimulatorTools: "managed settings",
   disableSideloadFlags: "managed settings",
   externalEditorContext: "~/.claude.json",
-  forceLoginGatewayUrl: "managed settings",
   forceRemoteSettingsRefresh: "managed settings",
+  gatewayInternalNetworks: "managed settings",
+  leftArrowOpensAgents: "~/.claude.json",
+  managedMcpServers: "managed settings",
+  managedSourcesBehavior: "managed settings",
+  modelPricing: "managed settings",
   parentSettingsBehavior: "managed settings",
-  permissionExplainerEnabled: "~/.claude.json",
   pluginSuggestionMarketplaces: "managed settings",
   pluginTrustMessage: "managed settings",
+  prStatusFooterEnabled: "~/.claude.json",
   requiredMaximumVersion: "managed settings",
   requiredMinimumVersion: "managed settings",
   sshHostAllowlist: "managed settings",
   strictKnownMarketplaces: "managed settings",
   strictPluginOnlyCustomization: "managed settings",
-  teammateDefaultModel: "~/.claude.json",
   wslInheritsWindowsSettings: "managed settings",
+};
+
+/**
+ * Top-level settings keys Claude Code has removed, with the version that
+ * removed each. Current versions ignore them wherever they are set, so they
+ * are dropped in **both** scopes, and the warning names the version so the
+ * author knows to delete the key rather than move it to another file.
+ *
+ * Derived from the "Removed in" notes of the settings reference.
+ *
+ * @see https://code.claude.com/docs/en/settings-reference
+ */
+const CLAUDECODE_REMOVED_KEYS: Readonly<Record<string, string>> = {
+  permissionExplainerEnabled: "v2.1.257",
+  taskOutputMaxChars: "v2.1.277",
+  teammateDefaultModel: "v2.1.234",
 };
 
 /**
@@ -849,6 +908,217 @@ const CLAUDECODE_PROJECT_SCOPE_IGNORED_VALUES: Readonly<
 };
 
 /**
+ * `env` variables Claude Code ignores in every settings file: identity and
+ * messaging variables its hosting environments own or export themselves, and
+ * switches it reads from the launch environment only. Writing one to either
+ * scope commits a setting that never applies.
+ *
+ * @see https://code.claude.com/docs/en/settings-reference#variables-claude-code-ignores-in-env
+ */
+const CLAUDECODE_ENV_IGNORED_IN_EVERY_FILE: ReadonlySet<string> = new Set([
+  "CLAUDE_CODE_ACCOUNT_UUID",
+  "CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT",
+  "CLAUDE_CODE_DISABLE_INLINE_SHELL_RM_PROMPT",
+  "CLAUDE_CODE_DISABLE_POWERSHELL_CMD_RM_DENY",
+  "CLAUDE_CODE_DISABLE_SUBSTITUTION_RM_PROMPT",
+  "CLAUDE_CODE_MESSAGING_SOCKET",
+  "CLAUDE_CODE_MESSAGING_TOKEN",
+  "CLAUDE_CODE_PROJECT_DIR_NAME",
+  "CLAUDE_CODE_REMOTE",
+  "CLAUDE_CODE_RESTRICTED",
+]);
+
+/**
+ * `env` variables a project or local settings file cannot set, because a
+ * checked-out repository should not control them: where Claude Code stores its
+ * own files, what session content it exports, where telemetry goes, how it
+ * starts or syncs, the timers on an unanswered dialog, and whether it processes
+ * attachments or expands `@` file mentions. Claude Code drops them there, so they are skipped at project scope and emitted only under `--global`.
+ *
+ * Only the names the settings reference lists are covered; its directory and
+ * Windows groups are introduced with "such as", so an unlisted member of those
+ * families is still written. Windows variable names are case-insensitive, so
+ * that group is matched without regard to case.
+ *
+ * @see https://code.claude.com/docs/en/settings-reference#variables-claude-code-ignores-in-env
+ */
+const CLAUDECODE_ENV_PROJECT_IGNORED_NAMES: ReadonlySet<string> = new Set([
+  "BETA_TRACING_ENDPOINT",
+  "CLAUDE_AFK_COUNTDOWN_MS",
+  "CLAUDE_AFK_TIMEOUT_MS",
+  "CLAUDE_CODE_DISABLE_ATTACHMENTS",
+  "CLAUDE_CODE_DISABLE_FILE_MENTIONS",
+  "CLAUDE_CODE_ENABLE_TELEMETRY",
+  "CLAUDE_CODE_ENHANCED_TELEMETRY_BETA",
+  "CLAUDE_CODE_PLUGIN_CACHE_DIR",
+  "CLAUDE_CODE_PLUGIN_SEED_DIR",
+  "CLAUDE_CODE_PROCESS_WRAPPER",
+  "CLAUDE_CODE_SYNC_PLUGINS",
+  "CLAUDE_CODE_SYNC_SKILLS",
+  "CLAUDE_CODE_TMPDIR",
+  "CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS",
+  "CLAUDE_CONFIG_DIR",
+  "ENABLE_BETA_TRACING_DETAILED",
+  "ENABLE_ENHANCED_TELEMETRY_BETA",
+  "HOME",
+  "OTEL_EXPORTER_PROMETHEUS_HOST",
+  "OTEL_EXPORTER_PROMETHEUS_PORT",
+  "OTEL_LOG_ASSISTANT_RESPONSES",
+  "OTEL_LOG_RAW_API_BODIES",
+  "TEMP",
+  "TMP",
+  "TMPDIR",
+]);
+
+const CLAUDECODE_ENV_PROJECT_IGNORED_WINDOWS_NAMES: ReadonlySet<string> = new Set([
+  "COMSPEC",
+  "LOCALAPPDATA",
+  "PATHEXT",
+  "PROGRAMDATA",
+  "PROGRAMW6432",
+  "PSMODULEPATH",
+  "SYSTEMROOT",
+]);
+
+const CLAUDECODE_ENV_OTLP_IGNORED_SUFFIXES = [
+  "_ENDPOINT",
+  "_HEADERS",
+  "_PROTOCOL",
+  "_CERTIFICATE",
+  "_CLIENT_KEY",
+  "_INSECURE",
+] as const;
+
+const CLAUDECODE_ENV_EXPORTER_OFF_VALUES: ReadonlySet<string> = new Set(["none"]);
+const CLAUDECODE_ENV_CONTENT_OFF_VALUES: ReadonlySet<string> = new Set(["0", "false", "no", "off"]);
+
+/**
+ * Telemetry variables a project file may still set to a value that turns
+ * something off, since a repository may opt its own checkout out of telemetry:
+ * `none` for the exporter selectors and "an off value such as `0`" for the
+ * content variables. Because the reference does not enumerate the off values,
+ * the common spellings of false are all kept, compared without regard to case —
+ * writing a value Claude Code ignores is the old behavior, while dropping an
+ * opt-out it honors would remove a privacy setting. `OTEL_LOG_ASSISTANT_RESPONSES`
+ * has no such exception and sits in the plain name table above.
+ *
+ * `CLAUDE_CODE_ENABLE_CFC` follows the same shape for a different reason: a
+ * project cannot turn Claude in Chrome on, since a checked-out repository must
+ * not be able to connect Claude to the user's browser, so only an off value is
+ * kept at project scope.
+ *
+ * @see https://code.claude.com/docs/en/chrome#project-settings-cant-turn-on-chrome
+ */
+const CLAUDECODE_ENV_PROJECT_HONORED_OFF_VALUES: Readonly<Record<string, ReadonlySet<string>>> = {
+  OTEL_LOGS_EXPORTER: CLAUDECODE_ENV_EXPORTER_OFF_VALUES,
+  OTEL_METRICS_EXPORTER: CLAUDECODE_ENV_EXPORTER_OFF_VALUES,
+  OTEL_TRACES_EXPORTER: CLAUDECODE_ENV_EXPORTER_OFF_VALUES,
+  OTEL_LOG_USER_PROMPTS: CLAUDECODE_ENV_CONTENT_OFF_VALUES,
+  OTEL_LOG_TOOL_CONTENT: CLAUDECODE_ENV_CONTENT_OFF_VALUES,
+  OTEL_LOG_TOOL_DETAILS: CLAUDECODE_ENV_CONTENT_OFF_VALUES,
+  CLAUDE_CODE_ENABLE_CFC: CLAUDECODE_ENV_CONTENT_OFF_VALUES,
+};
+
+function isProjectIgnoredEnvVariable(name: string, value: unknown): boolean {
+  if (CLAUDECODE_ENV_PROJECT_IGNORED_NAMES.has(name) || name.startsWith("XDG_")) return true;
+  const upper = name.toUpperCase();
+  if (CLAUDECODE_ENV_PROJECT_IGNORED_WINDOWS_NAMES.has(upper) || upper.startsWith("PROGRAMFILES")) {
+    return true;
+  }
+  if (
+    name.startsWith("OTEL_EXPORTER_OTLP_") &&
+    CLAUDECODE_ENV_OTLP_IGNORED_SUFFIXES.some((suffix) => name.endsWith(suffix))
+  ) {
+    return true;
+  }
+  if (Object.hasOwn(CLAUDECODE_ENV_PROJECT_HONORED_OFF_VALUES, name)) {
+    const offValues = CLAUDECODE_ENV_PROJECT_HONORED_OFF_VALUES[name] as ReadonlySet<string>;
+    const isOff =
+      (typeof value === "string" || typeof value === "number" || typeof value === "boolean") &&
+      offValues.has(String(value).trim().toLowerCase());
+    return !isOff;
+  }
+  return false;
+}
+
+/**
+ * Copy of the authored `env` map with the variables the target file cannot
+ * honor removed, warning once per list. Only names are logged, never values —
+ * an `env` value is often a credential. Like `stripSandboxPaths`, only the
+ * override copy is filtered, so a value already in the target file is left
+ * untouched.
+ */
+function stripIgnoredEnvVariables({
+  env,
+  global,
+  relativeFilePath,
+  logger,
+}: {
+  env: Record<string, unknown>;
+  global: boolean;
+  relativeFilePath: string;
+  logger?: Logger;
+}): Record<string, unknown> {
+  const kept: Record<string, unknown> = {};
+  const ignoredEverywhere: string[] = [];
+  const ignoredAtProjectScope: string[] = [];
+  for (const [name, value] of Object.entries(env)) {
+    if (PROTOTYPE_POLLUTION_KEYS.has(name)) continue;
+    if (CLAUDECODE_ENV_IGNORED_IN_EVERY_FILE.has(name)) {
+      ignoredEverywhere.push(displayKey(name));
+      continue;
+    }
+    if (!global && isProjectIgnoredEnvVariable(name, value)) {
+      ignoredAtProjectScope.push(displayKey(name));
+      continue;
+    }
+    kept[name] = value;
+  }
+  if (ignoredEverywhere.length > 0) {
+    logger?.warn(
+      `Claude Code permissions: Claude Code ignores ${ignoredEverywhere.map((name) => `'env.${name}'`).join(", ")} in every settings file, so ${ignoredEverywhere.length === 1 ? "it is" : "they are"} not written to ${relativeFilePath}. Set ${ignoredEverywhere.length === 1 ? "it" : "them"} in the environment Claude Code starts from instead, and check ${relativeFilePath} for a stale value an earlier generate may have left there.`,
+    );
+  }
+  if (ignoredAtProjectScope.length > 0) {
+    logger?.warn(
+      `Claude Code permissions: ${ignoredAtProjectScope.map((name) => `'env.${name}'`).join(", ")} ${ignoredAtProjectScope.length === 1 ? "is" : "are"} not honored in the project-scoped ${relativeFilePath}, so ${ignoredAtProjectScope.length === 1 ? "it is" : "they are"} not written there — Claude Code ignores variables there that choose where it writes its files, export session content or telemetry, change how it starts or syncs, set dialog timers, turn attachments or file mentions off, or turn Claude in Chrome on (a value that turns telemetry or Chrome off, such as "none" or "0", is still written). Author ${ignoredAtProjectScope.length === 1 ? "it" : "them"} in the global scope instead, and check that file for a stale value an earlier generate may have left there.`,
+    );
+  }
+  return kept;
+}
+
+/**
+ * Narrows the authored `env` map in the top-level passthrough to the variables
+ * the target file honors, in place. When every variable is dropped the key is
+ * removed: writing an empty map would change nothing, and reporting `env` as
+ * trust-affecting would name a setting that was not written.
+ */
+function scopeEnvOverride({
+  overrides,
+  global,
+  relativeFilePath,
+  logger,
+}: {
+  overrides: Record<string, unknown>;
+  global: boolean;
+  relativeFilePath: string;
+  logger?: Logger;
+}): void {
+  if (!isRecord(overrides.env)) return;
+  const honoredEnv = stripIgnoredEnvVariables({
+    env: overrides.env,
+    global,
+    relativeFilePath,
+    logger,
+  });
+  if (Object.keys(honoredEnv).length > 0) {
+    overrides.env = honoredEnv;
+  } else {
+    delete overrides.env;
+  }
+}
+
+/**
  * A key name is authored data that ends up in a log line, so strip the control
  * characters that would let it forge a line or hide the warnings beside it, and
  * cap the length.
@@ -873,6 +1143,29 @@ const CLAUDECODE_SETTINGS_KEY_ALIASES: Readonly<Record<string, string>> = {
   additionalMarketplaces: "extraKnownMarketplaces",
   allowedMarketplaces: "strictKnownMarketplaces",
 };
+
+/**
+ * The warning for a key that neither scope can honor — one Claude Code has
+ * removed, or one read only from a file rulesync does not generate — or
+ * `undefined` when the key may be written in at least one scope.
+ */
+function neverHonoredKeyWarning({
+  canonicalKey,
+  shown,
+  relativeFilePath,
+}: {
+  canonicalKey: string;
+  shown: string;
+  relativeFilePath: string;
+}): string | undefined {
+  if (Object.hasOwn(CLAUDECODE_REMOVED_KEYS, canonicalKey)) {
+    return `Claude Code permissions: '${shown}' was removed in Claude Code ${CLAUDECODE_REMOVED_KEYS[canonicalKey]} and has no effect on current versions, so it is not written to ${relativeFilePath}. Delete it from .rulesync/permissions.jsonc, and check ${relativeFilePath} for a stale value an earlier generate may have left there.`;
+  }
+  if (Object.hasOwn(CLAUDECODE_UNHONORED_KEY_SOURCES, canonicalKey)) {
+    return `Claude Code permissions: '${shown}' is only honored in ${CLAUDECODE_UNHONORED_KEY_SOURCES[canonicalKey]}, which rulesync does not generate, so it is not written to ${relativeFilePath}. Set it in that file by hand, and check ${relativeFilePath} for a stale value an earlier generate may have left there.`;
+  }
+  return undefined;
+}
 
 /**
  * Copy of the authored top-level passthrough with the keys the target file
@@ -907,10 +1200,9 @@ function stripUnhonoredTopLevelKeys({
       );
       continue;
     }
-    if (Object.hasOwn(CLAUDECODE_UNHONORED_KEY_SOURCES, canonicalKey)) {
-      logger?.warn(
-        `Claude Code permissions: '${shown}' is only honored in ${CLAUDECODE_UNHONORED_KEY_SOURCES[canonicalKey]}, which rulesync does not generate, so it is not written to ${relativeFilePath}. Set it in that file by hand, and check ${relativeFilePath} for a stale value an earlier generate may have left there.`,
-      );
+    const neverHonored = neverHonoredKeyWarning({ canonicalKey, shown, relativeFilePath });
+    if (neverHonored !== undefined) {
+      logger?.warn(neverHonored);
       continue;
     }
     if (!global && CLAUDECODE_USER_SCOPE_ONLY_KEYS.has(canonicalKey)) {
@@ -948,6 +1240,16 @@ function stripUnhonoredTopLevelKeys({
   return { filtered, trustAffecting };
 }
 
+/**
+ * Claude Code's file permission checks match only `Edit(path)` and `Read(path)`
+ * rules. A `Write(path)`, `NotebookEdit(path)` or `Glob(path)` rule "is accepted
+ * but never matched by those checks, so Claude Code warns at startup for each
+ * allow, deny, or ask rule in one of these unmatched forms" — so a canonical
+ * `write`/`notebookedit`/`glob` rule with a pattern is emitted in the form the
+ * docs prescribe instead. A tool-name rule with no path is unaffected: it
+ * matches the tool everywhere and produces no warning.
+ * @see https://code.claude.com/docs/en/permissions
+ */
 const CLAUDE_PATH_RULE_ALIASES: Record<string, string> = {
   Write: "Edit",
   NotebookEdit: "Edit",
@@ -1051,6 +1353,12 @@ export class ClaudecodePermissions extends ToolPermissions {
       const nonListFields = Object.fromEntries(
         Object.entries(rest).filter(([key]) => !PROTOTYPE_POLLUTION_KEYS.has(key)),
       );
+      stripProjectScopeIgnoredDefaultMode({
+        fields: nonListFields,
+        global,
+        relativeFilePath: paths.relativeFilePath,
+        logger,
+      });
       trustAffecting.push(...collectWideningPermissionFields({ fields: nonListFields }));
       settings.permissions = { ...settings.permissions, ...nonListFields };
     }
@@ -1060,7 +1368,7 @@ export class ClaudecodePermissions extends ToolPermissions {
     // (`network.deniedDomains`, `filesystem.denyRead`), so replacing `network`
     // wholesale to set one flag would drop the restrictions beside it.
     const overrideSandbox = config.claudecode?.sandbox;
-    if (isPlainRecord(overrideSandbox)) {
+    if (isRecord(overrideSandbox)) {
       // A subset of `sandbox.*` is ignored in a repository's settings.json, so
       // at project scope those paths are dropped rather than committed as a
       // policy that never applies.
@@ -1083,10 +1391,15 @@ export class ClaudecodePermissions extends ToolPermissions {
           });
       // Collected from the filtered result so the summary never names a path
       // the scope filters just dropped.
-      trustAffecting.push(...collectTrustAffectingSandboxPaths({ sandbox: scopedSandbox }));
+      trustAffecting.push(
+        ...collectTrustAffectingSandboxPaths({
+          sandbox: scopedSandbox,
+          paths: CLAUDECODE_TRUST_AFFECTING_SANDBOX_PATHS,
+        }),
+      );
       if (Object.keys(scopedSandbox).length > 0) {
         settings.sandbox = deepMergeRecords(
-          isPlainRecord(settings.sandbox) ? settings.sandbox : {},
+          isRecord(settings.sandbox) ? settings.sandbox : {},
           scopedSandbox,
         );
       }
@@ -1107,6 +1420,18 @@ export class ClaudecodePermissions extends ToolPermissions {
       if (value === undefined) continue;
       overrideTopLevel[key] = value;
     }
+    scopeEnvOverride({
+      overrides: overrideTopLevel,
+      global,
+      relativeFilePath: paths.relativeFilePath,
+      logger,
+    });
+    stripUserScopeOnlyNestedPaths({
+      overrides: overrideTopLevel,
+      global,
+      relativeFilePath: paths.relativeFilePath,
+      logger,
+    });
     const { filtered: scopedTopLevel, trustAffecting: trustAffectingTopLevel } =
       stripUnhonoredTopLevelKeys({
         overrides: overrideTopLevel,
@@ -1123,8 +1448,9 @@ export class ClaudecodePermissions extends ToolPermissions {
     }
 
     warnOnTrustAffectingEntries({
+      toolLabel: "Claude Code",
       entries: trustAffecting,
-      relativeFilePath: paths.relativeFilePath,
+      relativeFilePath: toPosixPath(join(paths.relativeDirPath, paths.relativeFilePath)),
       logger,
     });
 
@@ -1141,7 +1467,11 @@ export class ClaudecodePermissions extends ToolPermissions {
       deny,
       logger,
     });
-    const fileContent = JSON.stringify(merged, null, 2);
+    const fileContent = serializeSharedConfigFile({
+      fileKey: CLAUDE_SETTINGS_SHARED_FILE_KEY,
+      document: merged,
+      existingContent,
+    });
 
     return new ClaudecodePermissions({
       outputRoot,
@@ -1189,7 +1519,7 @@ export class ClaudecodePermissions extends ToolPermissions {
     // `CLAUDECODE_MANAGED_ONLY_SANDBOX_PATHS` for why keeping the author's value
     // is worth the warning it costs on every generate.
     const { sandbox } = settings;
-    if (isPlainRecord(sandbox)) {
+    if (isRecord(sandbox)) {
       const importedSandbox = structuredClone(sandbox);
       for (const path of CLAUDECODE_COMMAND_EXECUTING_SANDBOX_PATHS) {
         deleteSandboxPath({ target: importedSandbox, path });
@@ -1271,8 +1601,18 @@ function convertRulesyncToClaudePermissions({
   // hear about it rather than discover it later.
   const actionByEntry = new Map<string, PermissionAction>();
 
+  const allToolsPatterns: string[] = [];
+
   for (const [category, rules] of Object.entries(config.permission)) {
     const claudeToolName = toClaudeToolName(category);
+    if (category === ALL_TOOLS_PERMISSION_CATEGORY) {
+      // Claude Code names a tool per rule and has no key standing for every
+      // one, so `*` is written through as the tool name it is not: the entry
+      // round-trips back to the same canonical rule, but Claude Code matches no
+      // tool with it and enforces nothing. Say so, since the rule the author
+      // wrote there is usually the restricting one.
+      allToolsPatterns.push(...Object.keys(rules));
+    }
     for (const [pattern, action] of Object.entries(rules)) {
       const entry = buildClaudePermissionEntry(claudeToolName, pattern);
       const previous = actionByEntry.get(entry);
@@ -1296,6 +1636,15 @@ function convertRulesyncToClaudePermissions({
           break;
       }
     }
+  }
+
+  if (allToolsPatterns.length > 0) {
+    logger?.warn(
+      `Claude Code permissions: a rule names one tool, and there is no name standing for every ` +
+        `tool, so the all-tools '*' rule(s) for ${allToolsPatterns.join(", ")} were written as ` +
+        `'*(pattern)' entries that Claude Code matches against no tool. Write them under the ` +
+        `categories they are meant for (for example 'bash' or 'read') to have them enforced.`,
+    );
   }
 
   return { allow, ask, deny };

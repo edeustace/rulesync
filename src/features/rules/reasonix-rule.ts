@@ -16,6 +16,12 @@ import {
 
 export type ReasonixRuleParams = AiFileParams & {
   root?: boolean;
+  /**
+   * Set when the file is `REASONIX.local.md` rather than the shared
+   * `REASONIX.md`, so the import flow maps it back to a canonical
+   * `localRoot: true` rule instead of overwriting the shared root rule.
+   */
+  localRoot?: boolean;
 };
 
 /**
@@ -70,8 +76,8 @@ export class ReasonixRule extends ToolRule {
    * (same exclusions, import-only, project scope).
    * @see https://github.com/esengine/DeepSeek-Reasonix/blob/v1.18.0/docs/SESSION_MEMORY_RETRIEVAL.md
    */
-  static getNestedFilePatterns({ outputRoot }: { outputRoot: string }): ToolRuleNestedFilePatterns {
-    return this.buildNestedFilePatterns({ outputRoot, fileName: REASONIX_RULE_FILE_NAME });
+  static getNestedFilePatterns(): ToolRuleNestedFilePatterns {
+    return this.buildNestedFilePatterns({ fileName: REASONIX_RULE_FILE_NAME });
   }
 
   /**

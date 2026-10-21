@@ -6,11 +6,13 @@ import { MAX_FILE_SIZE } from "../constants/rulesync-paths.js";
 import {
   createTempDirectory,
   directoryExists,
-  getFileSize,
+  getFileSizeAndExecutableBit,
   isSymlink,
-  listDirectoryFiles,
+  listDirectoryEntryNames,
+  posixRelativePathEscapesRoot,
   readFileContent,
   removeTempDirectory,
+  resolvedRelativePath,
 } from "../utils/file.js";
 import type { Logger } from "../utils/logger.js";
 import { findControlCharacter } from "../utils/validation.js";
@@ -120,6 +122,62 @@ export async function resolveRefToSha(url: string, ref: string): Promise<string>
 }
 
 /**
+ * Resolve the repository-local exclude file (`info/exclude`) for the Git
+ * repository containing `cwd`. The path comes from `git rev-parse --git-path`
+ * rather than `<cwd>/.git/info/exclude`, so it honors linked worktrees (where
+ * `.git` is a file and the exclude file lives under `$GIT_COMMON_DIR`) and
+ * `GIT_DIR` / `GIT_COMMON_DIR` overrides.
+ *
+ * `prefix` is the path of `cwd` relative to the worktree's top-level directory
+ * (empty at the top level, otherwise ending with `/`). Patterns in the exclude
+ * file are matched relative to the top level, so callers can warn when `cwd`
+ * is a subdirectory.
+ */
+export async function resolveGitExcludePath({
+  cwd,
+}: {
+  cwd: string;
+}): Promise<{ excludePath: string; prefix: string }> {
+  await checkGitAvailable();
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync(
+      "git",
+      ["rev-parse", "--show-prefix", "--git-path", "info/exclude"],
+      { cwd, timeout: GIT_TIMEOUT_MS },
+    ));
+  } catch (error) {
+    throw new GitClientError(
+      `Failed to resolve the Git exclude file (info/exclude) from "${cwd}". ` +
+        "Is this directory inside a Git repository?",
+      error,
+    );
+  }
+  const [prefix = "", rawPath = ""] = stdout.split(/\r?\n/);
+  const trimmedPath = rawPath.trim();
+  if (trimmedPath === "") {
+    throw new GitClientError(
+      `Failed to resolve the Git exclude file (info/exclude) from "${cwd}": git returned no path.`,
+    );
+  }
+  return {
+    excludePath: isAbsolute(trimmedPath) ? trimmedPath : join(cwd, trimmedPath),
+    prefix: prefix.trim(),
+  };
+}
+
+/**
+ * A file read from a cloned repository. `executable` is the checked-out
+ * file's execute bit, which git sets from a `100755` tree entry.
+ */
+export type GitSkillFile = {
+  relativePath: string;
+  content: string;
+  size: number;
+  executable?: boolean;
+};
+
+/**
  * Clone a repo at the given branch or tag and return all files under skillsPath.
  * When `resolvedRef` is provided, fetch and check out that exact commit before
  * reading files so a mutable branch cannot drift from its lockfile SHA.
@@ -130,7 +188,7 @@ export async function fetchSkillFiles(params: {
   resolvedRef?: string;
   skillsPath: string;
   logger?: Logger;
-}): Promise<Array<{ relativePath: string; content: string; size: number }>> {
+}): Promise<GitSkillFile[]> {
   const { url, ref, resolvedRef, skillsPath, logger } = params;
   validateGitUrl(url, { logger });
   validateRef(ref);
@@ -211,6 +269,19 @@ export async function fetchSkillFiles(params: {
     }
     const skillsDir = isRootPath ? tmpDir : join(tmpDir, skillsPath);
     if (!(await directoryExists(skillsDir))) return [];
+    // `walkDirectory` skips symlinks it meets inside the tree, but never checks the
+    // directory it starts from. A source repository can commit `skillsPath` itself
+    // (or one of its parents) as a symlink pointing outside the clone, which would
+    // make us read and install local files from the consuming machine. Resolve every
+    // link and refuse a start directory that does not stay inside the clone.
+    const unsafeReason = await findUnsafeStartDirectoryReason({
+      rootPath: tmpDir,
+      targetPath: skillsDir,
+    });
+    if (unsafeReason !== undefined) {
+      logger?.warn(`Skipping "${skillsPath}" from ${url}: ${unsafeReason}.`);
+      return [];
+    }
     return await walkDirectory(skillsDir, skillsDir, 0, { totalFiles: 0, totalSize: 0 }, logger);
   } catch (error) {
     if (error instanceof GitClientError) throw error;
@@ -218,6 +289,31 @@ export async function fetchSkillFiles(params: {
   } finally {
     await removeTempDirectory(tmpDir);
   }
+}
+
+/**
+ * Why the directory a walk would start from must not be read, or `undefined`
+ * when it is safe. It is unsafe when its links resolve outside the clone, or
+ * into the clone's own `.git`: that stays inside the clone but would hand its
+ * metadata (config, hooks) to the caller as rule or skill files. `.git` is
+ * compared case-insensitively, since a case-insensitive file system resolves
+ * `.GIT` to the same directory.
+ */
+async function findUnsafeStartDirectoryReason({
+  rootPath,
+  targetPath,
+}: {
+  rootPath: string;
+  targetPath: string;
+}): Promise<string | undefined> {
+  const relativePath = await resolvedRelativePath({ rootPath, targetPath });
+  if (posixRelativePathEscapesRoot(relativePath)) {
+    return "it resolves outside the repository through a symlink";
+  }
+  if (relativePath.split("/")[0]?.toLowerCase() === ".git") {
+    return 'it resolves into the ".git" directory';
+  }
+  return undefined;
 }
 
 const MAX_WALK_DEPTH = 20;
@@ -233,15 +329,17 @@ async function walkDirectory(
   depth: number = 0,
   ctx: WalkContext = { totalFiles: 0, totalSize: 0 },
   logger?: Logger,
-): Promise<Array<{ relativePath: string; content: string; size: number }>> {
+): Promise<GitSkillFile[]> {
   if (depth > MAX_WALK_DEPTH) {
     throw new GitClientError(
       `Directory tree exceeds max depth of ${MAX_WALK_DEPTH}: "${dir}". Aborting to prevent resource exhaustion.`,
     );
   }
-  const results: Array<{ relativePath: string; content: string; size: number }> = [];
-  for (const name of await listDirectoryFiles(dir)) {
-    if (name === ".git") continue;
+  const results: GitSkillFile[] = [];
+  for (const name of await listDirectoryEntryNames(dir)) {
+    // Case-insensitive on purpose, like the start-directory check: a `.GIT`
+    // directory is skipped too, even on a case-sensitive file system.
+    if (name.toLowerCase() === ".git") continue;
     const fullPath = join(dir, name);
     if (await isSymlink(fullPath)) {
       logger?.warn(`Skipping symlink "${fullPath}".`);
@@ -250,7 +348,7 @@ async function walkDirectory(
     if (await directoryExists(fullPath)) {
       results.push(...(await walkDirectory(fullPath, outputRoot, depth + 1, ctx, logger)));
     } else {
-      const size = await getFileSize(fullPath);
+      const { size, executable } = await getFileSizeAndExecutableBit(fullPath);
       if (size > MAX_FILE_SIZE) {
         logger?.warn(
           `Skipping file "${fullPath}" (${(size / 1024 / 1024).toFixed(2)}MB exceeds ${MAX_FILE_SIZE / 1024 / 1024}MB limit).`,
@@ -270,7 +368,7 @@ async function walkDirectory(
         );
       }
       const content = await readFileContent(fullPath);
-      results.push({ relativePath: relative(outputRoot, fullPath), content, size });
+      results.push({ relativePath: relative(outputRoot, fullPath), content, size, executable });
     }
   }
   return results;

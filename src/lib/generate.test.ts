@@ -1,3 +1,4 @@
+import { chmod, mkdir } from "node:fs/promises";
 import { join } from "node:path";
 
 import { intersection } from "es-toolkit";
@@ -9,18 +10,22 @@ import { IgnoreProcessor } from "../features/ignore/ignore-processor.js";
 import { McpProcessor } from "../features/mcp/mcp-processor.js";
 import { PermissionsProcessor } from "../features/permissions/permissions-processor.js";
 import { RulesProcessor } from "../features/rules/rules-processor.js";
+import { ensureAntigravityPluginManifests } from "../features/shared/antigravity-plugin-manifest.js";
 import { RulesyncSkill } from "../features/skills/rulesync-skill.js";
 import { SkillsProcessor } from "../features/skills/skills-processor.js";
 import { RulesyncSubagent } from "../features/subagents/rulesync-subagent.js";
 import { SubagentsProcessor } from "../features/subagents/subagents-processor.js";
 import { mockProcessorBase } from "../test-utils/mock-feature-processor.js";
 import { createMockLogger } from "../test-utils/mock-logger.js";
+import { setupTestDirectory } from "../test-utils/test-directories.js";
+import { PACKAGING_TOOL_TARGETS } from "../types/tool-targets.js";
 import {
   directoryExists,
   fileExists,
   isPresentButUnresolvable,
   readFileContentOrNull,
 } from "../utils/file.js";
+import { assertPluginRootSafe } from "../utils/plugin-root.js";
 import {
   generate,
   GENERATION_STEP_GRAPH,
@@ -34,6 +39,7 @@ const createMockSkillsProcessor = () => ({
   loadToolDirsToDelete: vi.fn().mockResolvedValue([]),
   loadToolFlatFilesToDelete: vi.fn().mockResolvedValue([]),
   removeOrphanFlatFiles: vi.fn().mockResolvedValue(0),
+  removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(0),
   ...mockProcessorBase(),
   loadRulesyncDirs: vi.fn().mockResolvedValue([]),
   convertRulesyncDirsToToolDirs: vi.fn().mockResolvedValue([]),
@@ -57,6 +63,18 @@ vi.mock("../utils/file.js", async (importOriginal) => {
     isPresentButUnresolvable: vi.fn(),
     readFileContentOrNull: vi.fn(),
     addTrailingNewline: actual.addTrailingNewline,
+  };
+});
+vi.mock("../features/shared/antigravity-plugin-manifest.js", () => ({
+  ensureAntigravityPluginManifests: vi
+    .fn()
+    .mockResolvedValue({ count: 0, paths: [], hasDiff: false, sourceLoadFailed: false }),
+}));
+vi.mock("../utils/plugin-root.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../utils/plugin-root.js")>();
+  return {
+    ...actual,
+    assertPluginRootSafe: vi.fn(),
   };
 });
 vi.mock("es-toolkit", () => ({
@@ -196,6 +214,7 @@ describe("inspectInputRoots", () => {
 const createMockAiFile = (filePath: string, content: string) => ({
   getFilePath: () => filePath,
   getFileContent: () => content,
+  getClaimedDirPaths: () => [],
 });
 
 // Real rulesync instances (not mocks) for the skill/subagent collision-warning
@@ -241,15 +260,21 @@ describe("generate", () => {
     getOutputRoots: ReturnType<typeof vi.fn>;
     getTargets: ReturnType<typeof vi.fn>;
     getConfigFileTargets: ReturnType<typeof vi.fn>;
+    getConfigFileFeatures: ReturnType<typeof vi.fn>;
+    getConfigFileFeatureOptions: ReturnType<typeof vi.fn>;
     getFeatures: ReturnType<typeof vi.fn>;
     getFeatureOptions: ReturnType<typeof vi.fn>;
     getDelete: ReturnType<typeof vi.fn>;
+    getRetireTargets: ReturnType<typeof vi.fn>;
     getCheck: ReturnType<typeof vi.fn>;
     getGlobal: ReturnType<typeof vi.fn>;
     getSimulateCommands: ReturnType<typeof vi.fn>;
+    getPreserveUnownedHooks: ReturnType<typeof vi.fn>;
     getFlattenedCommandNaming: ReturnType<typeof vi.fn>;
     getSimulateSubagents: ReturnType<typeof vi.fn>;
     getSimulateSkills: ReturnType<typeof vi.fn>;
+    getLanguage: ReturnType<typeof vi.fn>;
+    getDeriveSubprojectPathFromGlobs: ReturnType<typeof vi.fn>;
     isPreviewMode: ReturnType<typeof vi.fn>;
     getInputRoots: ReturnType<typeof vi.fn>;
   };
@@ -261,15 +286,25 @@ describe("generate", () => {
       getOutputRoots: vi.fn().mockReturnValue(["."]),
       getTargets: vi.fn().mockReturnValue(["claudecode"]),
       getConfigFileTargets: vi.fn().mockReturnValue(["claudecode"]),
+      // Defaults to the (possibly CLI-overridden) features, like `Config` does
+      // when no config file selection is recorded.
+      getConfigFileFeatures: vi.fn((target: string): unknown =>
+        (mockConfig.getFeatures as (target: string) => unknown)(target),
+      ),
       getFeatures: vi.fn().mockReturnValue(["rules"]),
       getFeatureOptions: vi.fn().mockReturnValue(undefined),
+      getConfigFileFeatureOptions: vi.fn().mockReturnValue(undefined),
       getDelete: vi.fn().mockReturnValue(false),
+      getRetireTargets: vi.fn().mockReturnValue([]),
       getCheck: vi.fn().mockReturnValue(false),
       getGlobal: vi.fn().mockReturnValue(false),
       getSimulateCommands: vi.fn().mockReturnValue(false),
+      getPreserveUnownedHooks: vi.fn().mockReturnValue(false),
       getFlattenedCommandNaming: vi.fn().mockReturnValue("basename"),
       getSimulateSubagents: vi.fn().mockReturnValue(false),
       getSimulateSkills: vi.fn().mockReturnValue(false),
+      getLanguage: vi.fn().mockReturnValue(undefined),
+      getDeriveSubprojectPathFromGlobs: vi.fn().mockReturnValue(false),
       isPreviewMode: vi.fn().mockReturnValue(false),
       getInputRoots: vi.fn().mockReturnValue([process.cwd()]),
     };
@@ -376,6 +411,7 @@ describe("generate", () => {
         loadToolDirsToDelete: vi.fn().mockResolvedValue([]),
         loadToolFlatFilesToDelete: vi.fn().mockResolvedValue([]),
         removeOrphanFlatFiles: vi.fn().mockResolvedValue(0),
+        removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(0),
         ...mockProcessorBase(),
         loadRulesyncDirs: vi.fn().mockResolvedValue([mockSkill]),
         convertRulesyncDirsToToolDirs: vi.fn().mockResolvedValue([]),
@@ -399,7 +435,13 @@ describe("generate", () => {
       mockConfig.getDelete.mockReturnValue(true);
 
       const existingFiles = [{ file: "existing", getFilePath: () => "/path/to/existing" }];
-      const generatedFiles = [{ tool: "converted", getFilePath: () => "/path/to/converted" }];
+      const generatedFiles = [
+        {
+          tool: "converted",
+          getFilePath: () => "/path/to/converted",
+          getClaimedDirPaths: () => [],
+        },
+      ];
       const mockProcessor = {
         loadToolFiles: vi.fn().mockResolvedValue(existingFiles),
         removeOrphanAiFiles: vi.fn().mockResolvedValue(0),
@@ -425,7 +467,9 @@ describe("generate", () => {
       // Same file path for both existing and generated - should not be deleted
       const samePath = "/path/to/file";
       const existingFiles = [{ file: "existing", getFilePath: () => samePath }];
-      const generatedFiles = [{ tool: "converted", getFilePath: () => samePath }];
+      const generatedFiles = [
+        { tool: "converted", getFilePath: () => samePath, getClaimedDirPaths: () => [] },
+      ];
       const mockProcessor = {
         loadToolFiles: vi.fn().mockResolvedValue(existingFiles),
         removeOrphanAiFiles: vi.fn().mockResolvedValue(0),
@@ -459,6 +503,203 @@ describe("generate", () => {
       expect(RulesProcessor).toHaveBeenCalledTimes(2);
       expect(RulesProcessor).toHaveBeenCalledWith(expect.objectContaining({ outputRoot: "dir1" }));
       expect(RulesProcessor).toHaveBeenCalledWith(expect.objectContaining({ outputRoot: "dir2" }));
+    });
+
+    describe("check mode with a shared root file owned by another target (#3198)", () => {
+      const makeRootFile = (toolTarget: string) => ({
+        getFilePath: () => "/repo/AGENTS.md",
+        getFileContent: () => `root for ${toolTarget}`,
+        getRelativePathFromCwd: () => "AGENTS.md",
+        getClaimedDirPaths: () => [],
+      });
+
+      // Every target emits `./AGENTS.md`; the last target in config order owns it.
+      const setUp = ({
+        cliTargets,
+        diskMatches,
+        sourceLoadFails = () => false,
+      }: {
+        cliTargets: string[];
+        diskMatches: (toolTarget: string) => boolean;
+        sourceLoadFails?: (toolTarget: string) => boolean;
+      }) => {
+        const processors = new Map<string, { writeAiFiles: ReturnType<typeof vi.fn> }>();
+        mockConfig.getCheck.mockReturnValue(true);
+        mockConfig.isPreviewMode.mockReturnValue(true);
+        mockConfig.getTargets.mockReturnValue(cliTargets);
+        mockConfig.getConfigFileTargets.mockReturnValue(["codexcli", "claudecode", "opencode"]);
+        vi.mocked(RulesProcessor.getToolTargets).mockReturnValue([
+          "codexcli",
+          "claudecode",
+          "opencode",
+        ]);
+        vi.mocked(RulesProcessor.getFactory).mockReturnValue({
+          class: {
+            getSettablePaths: () => ({
+              root: { relativeDirPath: ".", relativeFilePath: "AGENTS.md" },
+            }),
+          },
+          meta: {},
+        } as unknown as ReturnType<typeof RulesProcessor.getFactory>);
+        vi.mocked(RulesProcessor).mockImplementation(function ({
+          toolTarget,
+        }: {
+          toolTarget: string;
+        }) {
+          const processor = {
+            loadToolFiles: vi.fn().mockResolvedValue([]),
+            removeOrphanAiFiles: vi.fn().mockResolvedValue(0),
+            ...mockProcessorBase(),
+            loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
+            convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([makeRootFile(toolTarget)]),
+            writeAiFiles: vi.fn().mockImplementation(async (files: unknown[]) => {
+              const changed = files.length > 0 && !diskMatches(toolTarget) ? 1 : 0;
+              return { count: changed, paths: changed ? ["AGENTS.md"] : [] };
+            }),
+            hasRulesyncSourceLoadFailure: vi.fn().mockReturnValue(sourceLoadFails(toolTarget)),
+          };
+          processors.set(toolTarget, processor);
+          return processor as unknown as RulesProcessor;
+        } as never);
+        return processors;
+      };
+
+      afterEach(() => {
+        // `clearAllMocks` keeps return values, so undo the factory stub here.
+        vi.mocked(RulesProcessor.getFactory).mockReset();
+      });
+
+      it("should compare the skipped root file against the owner's output when the owner is not checked", async () => {
+        const processors = setUp({
+          cliTargets: ["codexcli"],
+          diskMatches: () => false,
+        });
+
+        const result = await generate({ logger, config: mockConfig as never });
+
+        // codexcli does not own AGENTS.md, so its own write sees nothing...
+        expect(processors.get("codexcli")?.writeAiFiles).toHaveBeenCalledWith([]);
+        // ...but the owner's expected content is still compared against disk.
+        expect(processors.get("opencode")?.writeAiFiles).toHaveBeenCalledWith([
+          expect.objectContaining({ getFileContent: expect.any(Function) }),
+        ]);
+        const [ownerFile] = processors.get("opencode")?.writeAiFiles.mock.calls[0]?.[0] ?? [];
+        expect(ownerFile.getFileContent()).toBe("root for opencode");
+        expect(result.hasDiff).toBe(true);
+      });
+
+      it("should report no diff when the disk matches the owner's output", async () => {
+        const processors = setUp({
+          cliTargets: ["codexcli"],
+          diskMatches: (toolTarget) => toolTarget === "opencode",
+        });
+
+        const result = await generate({ logger, config: mockConfig as never });
+
+        expect(processors.get("opencode")?.writeAiFiles).toHaveBeenCalledTimes(1);
+        expect(result.hasDiff).toBe(false);
+      });
+
+      it("should not re-check the root file when the owner is part of the run", async () => {
+        const processors = setUp({
+          cliTargets: ["codexcli", "opencode"],
+          diskMatches: (toolTarget) => toolTarget === "opencode",
+        });
+
+        const result = await generate({ logger, config: mockConfig as never });
+
+        expect(RulesProcessor).toHaveBeenCalledTimes(2);
+        expect(processors.get("codexcli")?.writeAiFiles).toHaveBeenCalledTimes(1);
+        expect(processors.get("codexcli")?.writeAiFiles).toHaveBeenCalledWith([]);
+        expect(processors.get("opencode")?.writeAiFiles).toHaveBeenCalledTimes(1);
+        expect(result.hasDiff).toBe(false);
+      });
+
+      it("should not let a target without rules in the config file own the root file", async () => {
+        const processors = setUp({
+          cliTargets: ["codexcli"],
+          diskMatches: (toolTarget) => toolTarget === "claudecode",
+        });
+        // opencode is last but only configured for MCP, so it never writes
+        // AGENTS.md; claudecode is the last target that does.
+        mockConfig.getConfigFileFeatures.mockImplementation((target: string) =>
+          target === "opencode" ? ["mcp"] : ["rules"],
+        );
+
+        const result = await generate({ logger, config: mockConfig as never });
+
+        expect(processors.has("opencode")).toBe(false);
+        expect(processors.get("claudecode")?.writeAiFiles).toHaveBeenCalledTimes(1);
+        expect(result.hasDiff).toBe(false);
+      });
+
+      it("should judge targets in the run by the run's features, not the config file's (#1894)", async () => {
+        const processors = setUp({
+          cliTargets: ["codexcli", "opencode"],
+          diskMatches: (toolTarget) => toolTarget === "opencode",
+        });
+        // The config file only enables MCP, but `--features rules` makes both
+        // targets in the run write AGENTS.md, so opencode still owns it.
+        mockConfig.getConfigFileFeatures.mockReturnValue(["mcp"]);
+
+        const result = await generate({ logger, config: mockConfig as never });
+
+        expect(processors.get("codexcli")?.writeAiFiles).toHaveBeenCalledTimes(1);
+        expect(processors.get("codexcli")?.writeAiFiles).toHaveBeenCalledWith([]);
+        expect(result.hasDiff).toBe(false);
+      });
+
+      it("should compare the non-owner's output when the owner does not write to that output root", async () => {
+        const processors = setUp({
+          cliTargets: ["codexcli"],
+          diskMatches: () => false,
+        });
+        mockConfig.getOutputRoots.mockImplementation((target?: string) =>
+          target === "opencode" ? ["elsewhere"] : ["."],
+        );
+
+        const result = await generate({ logger, config: mockConfig as never });
+
+        expect(processors.has("opencode")).toBe(false);
+        const codexcliWrites = processors.get("codexcli")?.writeAiFiles.mock.calls ?? [];
+        expect(codexcliWrites).toHaveLength(2);
+        expect(codexcliWrites[0]?.[0]).toEqual([]);
+        expect(codexcliWrites[1]?.[0]?.[0]?.getFileContent()).toBe("root for codexcli");
+        expect(result.hasDiff).toBe(true);
+      });
+
+      it("should build the owner's output with the owner's rules options from the config file", async () => {
+        setUp({ cliTargets: ["codexcli"], diskMatches: () => true });
+        mockConfig.getConfigFileFeatureOptions.mockImplementation(
+          (target: string, feature: string) =>
+            target === "opencode" && feature === "rules"
+              ? { ruleDiscoveryMode: "none" }
+              : undefined,
+        );
+
+        await generate({ logger, config: mockConfig as never });
+
+        expect(mockConfig.getConfigFileFeatureOptions).toHaveBeenCalledWith("opencode", "rules");
+        expect(RulesProcessor).toHaveBeenCalledWith(
+          expect.objectContaining({
+            toolTarget: "opencode",
+            featureOptions: { ruleDiscoveryMode: "none" },
+          }),
+        );
+      });
+
+      it("should propagate a source load failure from the owner's processor", async () => {
+        setUp({
+          cliTargets: ["codexcli"],
+          diskMatches: () => true,
+          sourceLoadFails: (toolTarget) => toolTarget === "opencode",
+        });
+
+        const result = await generate({ logger, config: mockConfig as never });
+
+        expect(result.hasDiff).toBe(false);
+        expect(result.sourceLoadFailed).toBe(true);
+      });
     });
   });
 
@@ -531,6 +772,59 @@ describe("generate", () => {
         loadRulesyncFiles: vi.fn().mockResolvedValue([]),
         convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
+      };
+      vi.mocked(IgnoreProcessor).mockImplementation(function () {
+        return mockProcessor as unknown as IgnoreProcessor;
+      });
+
+      const result = await generate({ logger, config: mockConfig as never });
+
+      expect(result.ignoreCount).toBe(0);
+      expect(mockProcessor.convertRulesyncFilesToToolFiles).not.toHaveBeenCalled();
+      expect(mockProcessor.writeAiFiles).not.toHaveBeenCalled();
+    });
+
+    it("should still convert and write when the processor emits files for an empty source", async () => {
+      // A processor whose output is one aggregate file (Pool subagents) must
+      // write it even with no source, so entries generated earlier get retracted.
+      mockConfig.getFeatures.mockReturnValue(["ignore"]);
+
+      const mockProcessor = {
+        loadToolFiles: vi.fn().mockResolvedValue([]),
+        removeAiFiles: vi.fn().mockResolvedValue(undefined),
+        ...mockProcessorBase(),
+        emitsToolFilesForEmptySource: vi.fn().mockReturnValue(true),
+        loadRulesyncFiles: vi.fn().mockResolvedValue([]),
+        convertRulesyncFilesToToolFiles: vi
+          .fn()
+          .mockResolvedValue([{ getFilePath: () => "out", getClaimedDirPaths: () => [] }]),
+        writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: ["out"] }),
+      };
+      vi.mocked(IgnoreProcessor).mockImplementation(function () {
+        return mockProcessor as unknown as IgnoreProcessor;
+      });
+
+      const result = await generate({ logger, config: mockConfig as never });
+
+      expect(result.ignoreCount).toBe(1);
+      expect(mockProcessor.convertRulesyncFilesToToolFiles).toHaveBeenCalledWith([]);
+      expect(mockProcessor.writeAiFiles).toHaveBeenCalled();
+    });
+
+    it("should not retract for an empty source when loading the source failed", async () => {
+      mockConfig.getFeatures.mockReturnValue(["ignore"]);
+
+      const mockProcessor = {
+        loadToolFiles: vi.fn().mockResolvedValue([]),
+        removeAiFiles: vi.fn().mockResolvedValue(undefined),
+        ...mockProcessorBase(),
+        emitsToolFilesForEmptySource: vi.fn().mockReturnValue(true),
+        hasRulesyncSourceLoadFailure: vi.fn().mockReturnValue(true),
+        loadRulesyncFiles: vi.fn().mockResolvedValue([]),
+        convertRulesyncFilesToToolFiles: vi
+          .fn()
+          .mockResolvedValue([{ getFilePath: () => "out", getClaimedDirPaths: () => [] }]),
+        writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: ["out"] }),
       };
       vi.mocked(IgnoreProcessor).mockImplementation(function () {
         return mockProcessor as unknown as IgnoreProcessor;
@@ -761,12 +1055,15 @@ describe("generate", () => {
         loadToolDirsToDelete: vi.fn().mockResolvedValue([]),
         loadToolFlatFilesToDelete: vi.fn().mockResolvedValue([]),
         removeOrphanFlatFiles: vi.fn().mockResolvedValue(0),
+        removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(0),
         ...mockProcessorBase(),
         loadRulesyncDirs: vi.fn().mockResolvedValue([]),
         convertRulesyncDirsToToolDirs: vi.fn().mockResolvedValue([
           {
             dir: "skill",
             getDirPath: () => "/path/to/skill",
+            getOutputRoot: () => "/path/to",
+            getRelativeDirPath: () => ".",
             ownsDirTree: () => true,
             getMainFile: () => undefined,
             getOtherFiles: () => [],
@@ -815,6 +1112,7 @@ describe("generate", () => {
         loadToolDirsToDelete: vi.fn().mockResolvedValue([]),
         loadToolFlatFilesToDelete: vi.fn().mockResolvedValue([]),
         removeOrphanFlatFiles: vi.fn().mockResolvedValue(0),
+        removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(0),
         ...mockProcessorBase(),
         loadRulesyncDirs: vi.fn().mockResolvedValue([mockSkill]),
         convertRulesyncDirsToToolDirs: vi.fn().mockResolvedValue([]),
@@ -837,6 +1135,8 @@ describe("generate", () => {
         {
           dir: "existing-skill",
           getDirPath: () => "/path/to/existing",
+          getOutputRoot: () => "/path/to",
+          getRelativeDirPath: () => ".",
           ownsDirTree: () => true,
           getMainFile: () => undefined,
           getOtherFiles: () => [],
@@ -846,6 +1146,8 @@ describe("generate", () => {
         {
           dir: "generated-skill",
           getDirPath: () => "/path/to/generated",
+          getOutputRoot: () => "/path/to",
+          getRelativeDirPath: () => ".",
           ownsDirTree: () => true,
           getMainFile: () => undefined,
           getOtherFiles: () => [],
@@ -855,6 +1157,7 @@ describe("generate", () => {
         loadToolDirsToDelete: vi.fn().mockResolvedValue(existingDirs),
         loadToolFlatFilesToDelete: vi.fn().mockResolvedValue([]),
         removeOrphanFlatFiles: vi.fn().mockResolvedValue(0),
+        removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(0),
         removeOrphanAiDirs: vi.fn().mockResolvedValue(0),
         ...mockProcessorBase(),
         loadRulesyncDirs: vi.fn().mockResolvedValue([]),
@@ -899,6 +1202,7 @@ describe("generate", () => {
         loadToolDirsToDelete: vi.fn().mockResolvedValue([]),
         loadToolFlatFilesToDelete: vi.fn().mockResolvedValue(existingFlatFiles),
         removeOrphanFlatFiles: vi.fn().mockResolvedValue(1),
+        removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(0),
         removeOrphanAiDirs: vi.fn().mockResolvedValue(0),
         ...mockProcessorBase(),
         loadRulesyncDirs: vi.fn().mockResolvedValue([]),
@@ -917,6 +1221,89 @@ describe("generate", () => {
       });
       expect(result.hasDiff).toBe(true);
     });
+
+    it("should report a diff when only a file inside a kept skill dir was swept", async () => {
+      // A stale companion file inside a directory this run still generates is
+      // removed by neither sweep above, so the third one is the only thing that
+      // can report the run as having changed anything. Without that, `--check`
+      // would call a tree with a stale file in it up to date.
+      mockConfig.getFeatures.mockReturnValue(["skills"]);
+      mockConfig.getDelete.mockReturnValue(true);
+
+      const generatedDirs = [
+        {
+          getDirPath: () => "/path/to/.claude/skills/kept",
+          getOutputRoot: () => "/path/to",
+          getRelativeDirPath: () => ".claude/skills",
+          ownsDirTree: () => true,
+          getMainFile: () => ({ name: "SKILL.md", body: "" }),
+          getOtherFiles: () => [],
+        },
+      ];
+      const mockSkillsProcessor = {
+        loadToolDirsToDelete: vi.fn().mockResolvedValue([]),
+        loadToolFlatFilesToDelete: vi.fn().mockResolvedValue([]),
+        removeOrphanFlatFiles: vi.fn().mockResolvedValue(0),
+        removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(1),
+        removeOrphanAiDirs: vi.fn().mockResolvedValue(0),
+        ...mockProcessorBase(),
+        loadRulesyncDirs: vi.fn().mockResolvedValue([]),
+        convertRulesyncDirsToToolDirs: vi.fn().mockResolvedValue(generatedDirs),
+        writeAiDirs: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
+      };
+      vi.mocked(SkillsProcessor).mockImplementation(function () {
+        return mockSkillsProcessor as unknown as SkillsProcessor;
+      });
+
+      const result = await generate({ logger, config: mockConfig as never });
+
+      // The directories this run generated, not a re-enumeration of the disk:
+      // the sweep has to see the tree as the sweeps before it left it.
+      expect(mockSkillsProcessor.removeOrphanFilesInAiDirs).toHaveBeenCalledWith({
+        generatedDirs,
+        isClaimed: expect.any(Function),
+      });
+      expect(result.hasDiff).toBe(true);
+    });
+    it.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+      "should go on without a tree claim when a skill directory's links cannot be read",
+      async () => {
+        // The orphan sweep keeps a path it cannot follow; the tree claim has to
+        // be just as forgiving instead of rejecting the whole run with EACCES.
+        // `writeAiDirs` is mocked here: the real one walks the same paths first.
+        const { testDir, cleanup } = await setupTestDirectory();
+        const lockedDir = join(testDir, "locked");
+        await mkdir(join(lockedDir, "skills"), { recursive: true });
+        await chmod(lockedDir, 0o000);
+        try {
+          mockConfig.getFeatures.mockReturnValue(["skills"]);
+          mockConfig.getDelete.mockReturnValue(true);
+          const mockSkillsProcessor = {
+            ...createMockSkillsProcessor(),
+            removeOrphanAiDirs: vi.fn().mockResolvedValue(0),
+          };
+          mockSkillsProcessor.convertRulesyncDirsToToolDirs.mockResolvedValue([
+            {
+              getDirPath: () => join(lockedDir, "skills", "foo"),
+              getOutputRoot: () => testDir,
+              getRelativeDirPath: () => join("locked", "skills"),
+              ownsDirTree: () => true,
+              getMainFile: () => undefined,
+              getOtherFiles: () => [],
+            },
+          ]);
+          vi.mocked(SkillsProcessor).mockImplementation(function () {
+            return mockSkillsProcessor as unknown as SkillsProcessor;
+          });
+
+          await expect(generate({ logger, config: mockConfig as never })).resolves.toBeDefined();
+          expect(mockSkillsProcessor.removeOrphanAiDirs).toHaveBeenCalled();
+        } finally {
+          await chmod(lockedDir, 0o755);
+          await cleanup();
+        }
+      },
+    );
   });
 
   describe("permissions feature", () => {
@@ -1040,6 +1427,7 @@ describe("generate", () => {
         loadToolDirsToDelete: vi.fn().mockResolvedValue([]),
         loadToolFlatFilesToDelete: vi.fn().mockResolvedValue([]),
         removeOrphanFlatFiles: vi.fn().mockResolvedValue(0),
+        removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(0),
         ...mockProcessorBase(),
         loadRulesyncDirs: vi.fn().mockResolvedValue([]),
         convertRulesyncDirsToToolDirs: vi.fn().mockResolvedValue([]),
@@ -1078,6 +1466,77 @@ describe("generate", () => {
     });
   });
 
+  describe("plugin root safety check", () => {
+    it.each(PACKAGING_TOOL_TARGETS)(
+      "should check every output root of packaging target %s in project mode",
+      async (target) => {
+        mockConfig.getTargets.mockReturnValue([target]);
+        mockConfig.getOutputRoots.mockReturnValue(["/plugins/a", "/plugins/b"]);
+        mockConfig.getFeatures.mockReturnValue(["rules"]);
+
+        await generate({ logger, config: mockConfig as never });
+
+        expect(assertPluginRootSafe).toHaveBeenCalledWith({
+          toolTarget: target,
+          outputRoot: "/plugins/a",
+        });
+        expect(assertPluginRootSafe).toHaveBeenCalledWith({
+          toolTarget: target,
+          outputRoot: "/plugins/b",
+        });
+      },
+    );
+  });
+
+  describe("Antigravity plugin manifest", () => {
+    it("ensures a manifest in every antigravity-plugin output root in project mode", async () => {
+      mockConfig.getTargets.mockReturnValue(["antigravity-plugin"]);
+      mockConfig.getOutputRoots.mockReturnValue(["/plugins/a", "/plugins/b"]);
+      mockConfig.getFeatures.mockReturnValue(["rules"]);
+      vi.mocked(ensureAntigravityPluginManifests).mockResolvedValueOnce({
+        count: 2,
+        paths: ["plugin.json", "plugin.json"],
+        hasDiff: true,
+        sourceLoadFailed: false,
+      });
+
+      const result = await generate({ logger, config: mockConfig as never });
+
+      expect(ensureAntigravityPluginManifests).toHaveBeenCalledWith(
+        expect.objectContaining({ outputRoots: ["/plugins/a", "/plugins/b"] }),
+      );
+      expect(result.pluginManifestCount).toBe(2);
+      expect(result.pluginManifestPaths).toEqual(["plugin.json", "plugin.json"]);
+      expect(result.hasDiff).toBe(true);
+    });
+
+    it("ensures no manifest when antigravity-plugin is not a target", async () => {
+      mockConfig.getTargets.mockReturnValue(["claudecode-plugin"]);
+      mockConfig.getOutputRoots.mockReturnValue(["/plugins/a"]);
+      mockConfig.getFeatures.mockReturnValue(["rules"]);
+
+      const result = await generate({ logger, config: mockConfig as never });
+
+      expect(ensureAntigravityPluginManifests).toHaveBeenCalledWith(
+        expect.objectContaining({ outputRoots: [] }),
+      );
+      expect(result.pluginManifestCount).toBe(0);
+    });
+
+    it("ensures no manifest in global mode", async () => {
+      mockConfig.getGlobal.mockReturnValue(true);
+      mockConfig.getTargets.mockReturnValue(["antigravity-plugin"]);
+      mockConfig.getOutputRoots.mockReturnValue(["/home/user"]);
+      mockConfig.getFeatures.mockReturnValue(["rules"]);
+
+      await generate({ logger, config: mockConfig as never });
+
+      expect(ensureAntigravityPluginManifests).toHaveBeenCalledWith(
+        expect.objectContaining({ outputRoots: [] }),
+      );
+    });
+  });
+
   describe("global mode", () => {
     beforeEach(() => {
       mockConfig.getGlobal.mockReturnValue(true);
@@ -1102,6 +1561,37 @@ describe("generate", () => {
 
       expect(RulesProcessor.getToolTargets).toHaveBeenCalledWith({ global: true });
     });
+
+    it.each(PACKAGING_TOOL_TARGETS)(
+      "should skip packaging target %s without checking the home directory for symlinks",
+      async (target) => {
+        mockConfig.getTargets.mockReturnValue(["claudecode", target]);
+        mockConfig.getOutputRoots.mockReturnValue(["/home/user"]);
+        mockConfig.getFeatures.mockReturnValue(["rules", "skills"]);
+
+        await generate({ logger, config: mockConfig as never });
+
+        expect(assertPluginRootSafe).not.toHaveBeenCalledWith(
+          expect.objectContaining({ toolTarget: target }),
+        );
+        expect(assertPluginRootSafe).toHaveBeenCalledWith({
+          toolTarget: "claudecode",
+          outputRoot: "/home/user",
+        });
+        // One target-level warning, not one more per enabled feature.
+        const targetWarnings = vi
+          .mocked(logger.warn)
+          .mock.calls.filter(([message]) => String(message).includes(`'${target}'`));
+        expect(targetWarnings).toEqual([
+          [
+            `Target '${target}' is a plugin packaging target and supports only project scope. Re-run without '--global'. Skipping.`,
+          ],
+        ]);
+        expect(RulesProcessor).toHaveBeenCalledWith(
+          expect.objectContaining({ toolTarget: "claudecode", global: true }),
+        );
+      },
+    );
   });
 
   describe("dry run mode (dry-run/check)", () => {
@@ -1497,6 +1987,7 @@ describe("generate", () => {
           loadToolDirsToDelete: vi.fn().mockResolvedValue([]),
           loadToolFlatFilesToDelete: vi.fn().mockResolvedValue([]),
           removeOrphanFlatFiles: vi.fn().mockResolvedValue(0),
+          removeOrphanFilesInAiDirs: vi.fn().mockResolvedValue(0),
           ...mockProcessorBase(),
           loadRulesyncDirs: vi.fn().mockResolvedValue([makeRulesyncSkill(params.skillName)]),
           convertRulesyncDirsToToolDirs: vi.fn().mockResolvedValue([]),
@@ -1659,9 +2150,12 @@ describe("GENERATION_STEP_GRAPH", () => {
     expect(() => resolveExecutionOrder(asRunnableSteps())).not.toThrow();
   });
 
-  it("declares every dependsOn edge for a reason: an overlapping writesSharedFile token, or the known rules->skills value dependency", () => {
+  it("declares every dependsOn edge for a reason: an overlapping writesSharedFile token, or a known value dependency", () => {
     const byId = new Map(GENERATION_STEP_GRAPH.map((meta) => [meta.id, meta]));
-    const knownValueDependencies = new Set(["rules->skills"]);
+    // `checks->skills` is a path dependency the derived tokens cannot express:
+    // Factory Droid's checks output is a file inside the skills tree, whose own
+    // settable path is the directory around it.
+    const knownValueDependencies = new Set(["rules->skills", "checks->skills"]);
 
     for (const step of GENERATION_STEP_GRAPH) {
       for (const dep of step.dependsOn ?? []) {

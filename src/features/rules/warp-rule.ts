@@ -1,152 +1,98 @@
 import { join } from "node:path";
 
-import { WARP_GLOBAL_RULE_DIR, WARP_RULE_FILE_NAME } from "../../constants/warp-paths.js";
-import { AiFileParams, ValidationResult } from "../../types/ai-file.js";
+import { WARP_GLOBAL_RULE_DIR, WARP_LEGACY_RULE_FILE_NAME } from "../../constants/warp-paths.js";
+import { AiFileParams } from "../../types/ai-file.js";
 import { readFileContent } from "../../utils/file.js";
-import { RulesyncRule } from "./rulesync-rule.js";
 import {
-  ToolRule,
-  ToolRuleForDeletionParams,
-  ToolRuleFromFileParams,
-  ToolRuleFromRulesyncRuleParams,
-  ToolRuleSettablePaths,
-} from "./tool-rule.js";
+  NestedAgentsmdRule,
+  NestedAgentsmdRuleFamily,
+  NestedAgentsmdRuleSettablePaths,
+  NestedAgentsmdRuleSettablePathsGlobal,
+} from "./nested-agentsmd-rule.js";
+import { ToolRuleFromFileParams, ToolRuleImportOnlyRoot } from "./tool-rule.js";
 
 export type WarpRuleParams = AiFileParams & {
   root?: boolean;
 };
 
+export type WarpRuleSettablePaths = NestedAgentsmdRuleSettablePaths & {
+  /** The legacy root `WARP.md`, read on import only. */
+  importOnlyRoots?: ToolRuleImportOnlyRoot[];
+};
+
 /**
- * Warp reads project rules only from `AGENTS.md` (or the back-compat `WARP.md`)
- * at the repository root and in subdirectories that match the project tree — it
- * does NOT scan a `.warp/memories/` directory and does not follow references out
- * of a rules file. rulesync's topic-based non-root rules have no project
- * subdirectory to map onto, so their bodies are folded into the single root
- * `./AGENTS.md` by the RulesProcessor; there is no separate non-root output
- * location (`nonRoot` is `undefined`).
+ * Warp rules.
+ *
+ * Warp reads project rules from `AGENTS.md` (or the back-compat `WARP.md`) at
+ * the repository root and in subdirectories "for more targeted guidance": it
+ * applies the root file plus the current directory's file, and the
+ * subdirectory's rules take precedence over the root's. Nested per-directory
+ * files are therefore a real scoping surface. Warp does NOT scan a
+ * `.warp/memories/` directory and does not follow references out of a rules
+ * file, so every non-root rule without `agentsmd.subprojectPath` folds into
+ * the root `./AGENTS.md`.
+ *
+ * A legacy root `WARP.md` is read on import when the root `AGENTS.md` is
+ * absent, so a repository that has not moved to `AGENTS.md` yet imports its
+ * rules. It is never written or deleted. When both exist, Warp reads
+ * `WARP.md`, so import keeps reading the `AGENTS.md` rulesync manages and warns
+ * that Warp ignores it, as generate already does.
  *
  * In global mode, Warp reads a third rule source from `~/.agents/AGENTS.md`
  * (the cross-tool agent config directory), indexed like project rules and also
  * used from remote hosts in SSH sessions. The same root-fold policy applies.
  *
- * @see https://docs.warp.dev/agent-platform/capabilities/rules/
+ * @see https://docs.warp.dev/agents/capabilities/rules/
  * @see https://docs.warp.dev/terminal/settings/file-locations/
  */
-export type WarpRuleSettablePaths = Pick<ToolRuleSettablePaths, "root"> & {
-  root: {
-    relativeDirPath: string;
-    relativeFilePath: string;
-  };
-  nonRoot?: undefined;
-};
-
-export class WarpRule extends ToolRule {
-  constructor({ fileContent, root, ...rest }: WarpRuleParams) {
-    super({
-      ...rest,
-      fileContent,
-      root: root ?? false,
-    });
+export class WarpRule extends NestedAgentsmdRule {
+  protected static getFamily(): NestedAgentsmdRuleFamily {
+    return { globalDir: WARP_GLOBAL_RULE_DIR, toolTarget: "warp" };
   }
 
-  static getSettablePaths({
-    global = false,
-  }: {
-    global?: boolean;
-    excludeToolDir?: boolean;
-  } = {}): WarpRuleSettablePaths {
-    if (global) {
-      return {
-        root: {
-          relativeDirPath: WARP_GLOBAL_RULE_DIR,
-          relativeFilePath: WARP_RULE_FILE_NAME,
-        },
-      };
+  static override getSettablePaths(
+    options: { global?: boolean; excludeToolDir?: boolean } = {},
+  ): WarpRuleSettablePaths | NestedAgentsmdRuleSettablePathsGlobal {
+    const paths = super.getSettablePaths(options);
+    if (options.global) {
+      return paths;
     }
     return {
-      root: {
-        relativeDirPath: ".",
-        relativeFilePath: WARP_RULE_FILE_NAME,
-      },
+      ...paths,
+      importOnlyRoots: [
+        {
+          relativeDirPath: ".",
+          relativeFilePath: WARP_LEGACY_RULE_FILE_NAME,
+          onlyWhenRootAbsent: true,
+          outranksRoot: true,
+        },
+      ],
     };
   }
 
-  static async fromFile({
-    outputRoot = process.cwd(),
-    // Warp reads rules only from the root `AGENTS.md`, so the incoming
-    // `relativeFilePath` is ignored and the root file is read.
-    relativeFilePath: _relativeFilePath,
-    validate = true,
-    global = false,
-  }: ToolRuleFromFileParams): Promise<WarpRule> {
-    const { root } = this.getSettablePaths({ global });
-    const relativePath = join(root.relativeDirPath, root.relativeFilePath);
-    const fileContent = await readFileContent(join(outputRoot, relativePath));
-
-    return new WarpRule({
-      outputRoot,
-      relativeDirPath: root.relativeDirPath,
-      relativeFilePath: root.relativeFilePath,
-      fileContent,
-      validate,
-      root: true,
-    });
-  }
-
-  static fromRulesyncRule({
-    outputRoot = process.cwd(),
-    rulesyncRule,
-    validate = true,
-    global = false,
-  }: ToolRuleFromRulesyncRuleParams): WarpRule {
-    const { root } = this.getSettablePaths({ global });
-    const isRoot = rulesyncRule.getFrontmatter().root ?? false;
-
-    // Both root and non-root rules target the single root `./AGENTS.md`; the
-    // RulesProcessor folds the non-root bodies (`root: false`) into the root rule
-    // and drops the redundant non-root instances before writing.
-    return new WarpRule({
-      outputRoot,
-      relativeDirPath: root.relativeDirPath,
-      relativeFilePath: root.relativeFilePath,
-      fileContent: rulesyncRule.getBody(),
-      validate,
-      root: isRoot,
-    });
-  }
-
-  toRulesyncRule(): RulesyncRule {
-    return this.toRulesyncRuleDefault();
-  }
-
-  validate(): ValidationResult {
-    return { success: true, error: null };
-  }
-
-  static forDeletion({
-    outputRoot = process.cwd(),
-    relativeDirPath,
-    relativeFilePath,
-    global = false,
-  }: ToolRuleForDeletionParams): WarpRule {
-    const { root } = this.getSettablePaths({ global });
-    const isRoot =
-      relativeFilePath === root.relativeFilePath && relativeDirPath === root.relativeDirPath;
-
-    return new WarpRule({
-      outputRoot,
+  static override async fromFile(params: ToolRuleFromFileParams): Promise<NestedAgentsmdRule> {
+    const {
+      outputRoot = process.cwd(),
       relativeDirPath,
       relativeFilePath,
-      fileContent: "",
-      validate: false,
-      root: isRoot,
-    });
-  }
-
-  static isTargetedByRulesyncRule(rulesyncRule: RulesyncRule): boolean {
-    return this.isTargetedByRulesyncRuleDefault({
-      rulesyncRule,
-      toolTarget: "warp",
-    });
+      validate = true,
+    } = params;
+    // The legacy root `WARP.md` found through `importOnlyRoots` is Warp's root
+    // rule, so it imports as the root (overview) rule.
+    const isLegacyRoot =
+      !params.global &&
+      relativeFilePath === WARP_LEGACY_RULE_FILE_NAME &&
+      (relativeDirPath === undefined || relativeDirPath === ".");
+    if (isLegacyRoot) {
+      return new this({
+        outputRoot,
+        relativeDirPath: ".",
+        relativeFilePath: WARP_LEGACY_RULE_FILE_NAME,
+        fileContent: await readFileContent(join(outputRoot, WARP_LEGACY_RULE_FILE_NAME)),
+        validate,
+        root: true,
+      });
+    }
+    return super.fromFile(params);
   }
 }

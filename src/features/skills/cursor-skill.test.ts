@@ -124,6 +124,57 @@ This is the body of the cursor skill.`;
         description: "Test skill description",
       });
     });
+
+    it("should fall back to the root-level license/compatibility/metadata when the cursor section omits them", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "root-fields",
+        frontmatter: {
+          name: "root-fields",
+          description: "Root-level standard fields",
+          license: "MIT",
+          compatibility: "Requires git",
+          metadata: { author: "root" },
+        },
+        body: "Body",
+      });
+
+      const frontmatter = CursorSkill.fromRulesyncSkill({ rulesyncSkill }).getFrontmatter();
+      // Cursor models `metadata` alone, so the other root-level fields never
+      // reach its frontmatter.
+      expect(frontmatter).toEqual({
+        name: "root-fields",
+        description: "Root-level standard fields",
+        metadata: { author: "root" },
+      });
+    });
+
+    it("should let the cursor section override the root-level license/compatibility/metadata", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "section-wins",
+        frontmatter: {
+          name: "section-wins",
+          description: "Section overrides the root-level fields",
+          license: "MIT",
+          compatibility: "Requires git",
+          metadata: { author: "root" },
+          cursor: {
+            metadata: { author: "section" },
+          },
+        },
+        body: "Body",
+      });
+
+      const frontmatter = CursorSkill.fromRulesyncSkill({ rulesyncSkill }).getFrontmatter();
+      expect(frontmatter).toEqual({
+        name: "section-wins",
+        description: "Section overrides the root-level fields",
+        metadata: { author: "section" },
+      });
+    });
   });
 
   describe("isTargetedByRulesyncSkill", () => {
@@ -232,6 +283,83 @@ This is the body of the cursor skill.`;
       expect(fm.paths).toEqual(["src/**/*.ts"]);
       expect(fm["disable-model-invocation"]).toBe(true);
       expect(fm.metadata).toEqual({ author: "rulesync" });
+    });
+
+    it("should round-trip the Custom Modes badge fields icon and color through the cursor section", () => {
+      const skill = new CursorSkill({
+        outputRoot: testDir,
+        relativeDirPath: join(".cursor", "skills"),
+        dirName: "badge-skill",
+        frontmatter: {
+          name: "badge-skill",
+          description: "Badged",
+          icon: "rocket",
+          color: "purple",
+        },
+        body: "Body",
+        validate: true,
+      });
+
+      const rulesyncSkill = skill.toRulesyncSkill();
+      expect(rulesyncSkill.getFrontmatter().cursor).toEqual({ icon: "rocket", color: "purple" });
+
+      const roundTripped = CursorSkill.fromRulesyncSkill({ rulesyncSkill });
+      expect(roundTripped.getFrontmatter().icon).toBe("rocket");
+      expect(roundTripped.getFrontmatter().color).toBe("purple");
+      // Cursor falls back to its default badge for unknown values, so they are not rejected.
+      expect(
+        CursorSkill.fromRulesyncSkill({
+          rulesyncSkill: new RulesyncSkill({
+            dirName: "odd-badge",
+            frontmatter: {
+              name: "odd-badge",
+              description: "d",
+              targets: ["cursor"],
+              cursor: { icon: "not-a-real-icon" },
+            },
+            body: "Body",
+          }),
+        }).getFrontmatter().icon,
+      ).toBe("not-a-real-icon");
+    });
+
+    it("should normalize the legacy globs field into paths on import and never emit it", () => {
+      const legacy = new CursorSkill({
+        outputRoot: testDir,
+        relativeDirPath: join(".cursor", "skills"),
+        dirName: "legacy-skill",
+        frontmatter: {
+          name: "legacy-skill",
+          description: "Legacy",
+          globs: ["src/**/*.ts"],
+        },
+        body: "Body",
+        validate: true,
+      });
+      expect(legacy.toRulesyncSkill().getFrontmatter().cursor).toEqual({
+        paths: ["src/**/*.ts"],
+      });
+      const regenerated = CursorSkill.fromRulesyncSkill({
+        rulesyncSkill: legacy.toRulesyncSkill(),
+      });
+      expect(regenerated.getFrontmatter().paths).toEqual(["src/**/*.ts"]);
+      expect(regenerated.getFrontmatter()).not.toHaveProperty("globs");
+
+      // `paths` wins when both are present, matching Cursor's own precedence.
+      const both = new CursorSkill({
+        outputRoot: testDir,
+        relativeDirPath: join(".cursor", "skills"),
+        dirName: "both-skill",
+        frontmatter: {
+          name: "both-skill",
+          description: "Both",
+          paths: "docs/**",
+          globs: ["src/**/*.ts"],
+        },
+        body: "Body",
+        validate: true,
+      });
+      expect(both.toRulesyncSkill().getFrontmatter().cursor).toEqual({ paths: "docs/**" });
     });
 
     it("should pick up root-level disable-model-invocation when cursor section omits it", () => {

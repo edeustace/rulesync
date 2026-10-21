@@ -393,6 +393,32 @@ describe("DeepagentsHooks", () => {
       expect(rulesyncHooks.getJson().hooks).toEqual({});
     });
 
+    it("should drop a v2 event named toString instead of keying by Object.prototype.toString (#2757)", () => {
+      const hooks = new DeepagentsHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".deepagents",
+        relativeFilePath: "hooks.json",
+        // JSON.parse yields an own enumerable `toString` key, unlike an object
+        // literal whose `toString` the lookup map would inherit from
+        // Object.prototype.
+        fileContent: JSON.stringify({
+          hooks: {
+            SessionStart: [{ hooks: [{ type: "command", command: "echo start" }] }],
+            toString: [{ hooks: [{ type: "command", command: "echo crafted" }] }],
+          },
+        }),
+      });
+
+      const canonical = hooks.toRulesyncHooks().getJson();
+
+      expect(canonical.hooks.sessionStart).toEqual([{ type: "command", command: "echo start" }]);
+      // deepagents only imports events it maps, so the unmapped name is dropped
+      // like any other unknown event rather than resolving to
+      // Object.prototype.toString and landing under its stringified source.
+      expect(Object.keys(canonical.hooks)).toEqual(["sessionStart"]);
+      expect((canonical as { deepagents?: unknown }).deepagents).toBeUndefined();
+    });
+
     it("should import the pre-v2 flat list format", () => {
       const hooks = new DeepagentsHooks({
         outputRoot: testDir,
@@ -415,6 +441,26 @@ describe("DeepagentsHooks", () => {
       ]);
       expect(canonical.hooks.sessionEnd).toEqual([{ type: "command", command: "echo multi" }]);
       expect(canonical.hooks.stop).toEqual([{ type: "command", command: "pnpm test --runInBand" }]);
+    });
+
+    it("should drop a legacy event named toString instead of keying by Object.prototype.toString (#2757)", () => {
+      const hooks = new DeepagentsHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".deepagents",
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          hooks: [{ command: ["bash", "-c", "echo start"], events: ["session.start", "toString"] }],
+        }),
+      });
+
+      const canonical = hooks.toRulesyncHooks().getJson();
+
+      expect(canonical.hooks.sessionStart).toEqual([{ type: "command", command: "echo start" }]);
+      // The legacy event list is filtered the same way as the v2 record: an
+      // unmapped name is dropped, never resolved through the lookup map's
+      // prototype.
+      expect(Object.keys(canonical.hooks)).toEqual(["sessionStart"]);
+      expect((canonical as { deepagents?: unknown }).deepagents).toBeUndefined();
     });
 
     it("should import the legacy context.offload event as canonical contextOffload", () => {
@@ -447,5 +493,49 @@ describe("DeepagentsHooks", () => {
       expect(hooks.getRelativeFilePath()).toBe("hooks.json");
       expect(JSON.parse(hooks.getFileContent())).toEqual({ hooks: {} });
     });
+  });
+});
+
+describe("DeepagentsHooks with DEEPAGENTS_HOME", () => {
+  const originalDeepagentsHome = process.env.DEEPAGENTS_HOME;
+  const originalHomeDir = process.env.HOME_DIR;
+
+  beforeEach(() => {
+    // `getDeepagentsHome` compares the override against the home directory,
+    // which the test environment refuses to resolve without `HOME_DIR`.
+    process.env.HOME_DIR = "/rulesync-home";
+  });
+
+  afterEach(() => {
+    if (originalDeepagentsHome === undefined) delete process.env.DEEPAGENTS_HOME;
+    else process.env.DEEPAGENTS_HOME = originalDeepagentsHome;
+    if (originalHomeDir === undefined) delete process.env.HOME_DIR;
+    else process.env.HOME_DIR = originalHomeDir;
+  });
+
+  it("drops the .deepagents prefix in global scope when DEEPAGENTS_HOME is set", () => {
+    process.env.DEEPAGENTS_HOME = "/custom-deepagents";
+    expect(DeepagentsHooks.getSettablePaths({ global: true })).toEqual({
+      relativeDirPath: ".",
+      relativeFilePath: "hooks.json",
+    });
+    expect(DeepagentsHooks.getSettablePaths({ global: false })).toEqual({
+      relativeDirPath: ".deepagents",
+      relativeFilePath: "hooks.json",
+    });
+  });
+
+  it("imports back into the rulesync home rather than the profile root", () => {
+    process.env.HOME_DIR = "/rulesync-home";
+    process.env.DEEPAGENTS_HOME = "/custom-deepagents";
+    const hooks = new DeepagentsHooks({
+      outputRoot: "/custom-deepagents",
+      relativeDirPath: ".",
+      relativeFilePath: "hooks.json",
+      fileContent: JSON.stringify({ hooks: {} }),
+      global: true,
+    });
+
+    expect(hooks.toRulesyncHooks().getOutputRoot()).toBe("/rulesync-home");
   });
 });

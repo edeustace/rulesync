@@ -2,6 +2,7 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { CLAUDECODE_SETTINGS_SCHEMA_URL } from "../../constants/claudecode-paths.js";
 import {
   RULESYNC_PERMISSIONS_FILE_NAME,
   RULESYNC_RELATIVE_DIR_PATH,
@@ -11,6 +12,14 @@ import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
 import { ClaudecodePermissions } from "./claudecode-permissions.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+
+/** The one-rule source the `$schema` cases generate from. */
+const schemaCaseRulesyncPermissions = (): RulesyncPermissions =>
+  new RulesyncPermissions({
+    relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+    relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+    fileContent: JSON.stringify({ permission: { bash: { "git *": "allow" } } }),
+  });
 
 describe("ClaudecodePermissions", () => {
   let testDir: string;
@@ -684,6 +693,37 @@ describe("ClaudecodePermissions", () => {
       expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining("2 existing Read deny"));
     });
 
+    it("should say the all-tools '*' category names no Claude Code tool", async () => {
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({
+          permission: {
+            "*": { "rm *": "deny" },
+            bash: { "*": "allow" },
+          },
+        }),
+      });
+
+      const mockLogger = createMockLogger();
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        logger: mockLogger,
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      // A Claude Code rule names one tool, so `*(rm *)` matches none. The entry
+      // is kept because it carries the rule back on import, but an inert deny
+      // sitting beside a blanket allow is exactly what the author must hear
+      // about.
+      expect(content.permissions.deny).toEqual(["*(rm *)"]);
+      expect(content.permissions.allow).toEqual(["Bash"]);
+      expect(mockLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("matches against no tool"),
+      );
+    });
+
     it("should not warn when permissions does not manage Read tool", async () => {
       const settingsDir = join(testDir, ".claude");
       await ensureDir(settingsDir);
@@ -955,7 +995,9 @@ describe("ClaudecodePermissions", () => {
 
       const content = JSON.parse(instance.getFileContent());
       expect(content.hooks).toBeUndefined();
-      expect(content.$schema).toBeUndefined();
+      // The override's `$schema` never reaches the file; the one written is the
+      // gateway's own pointer at the published schema.
+      expect(content.$schema).toBe(CLAUDECODE_SETTINGS_SCHEMA_URL);
     });
 
     it("drops a user/managed-only key at project scope and warns", async () => {
@@ -985,6 +1027,199 @@ describe("ClaudecodePermissions", () => {
       );
     });
 
+    it("writes `enableArtifact` at project scope, since every file can turn the tool off", async () => {
+      const mockLogger = createMockLogger();
+      const warnSpy = vi.spyOn(mockLogger, "warn");
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({
+          permission: { bash: { "git *": "allow" } },
+          claudecode: { enableArtifact: false },
+        }),
+      });
+
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        logger: mockLogger,
+      });
+
+      expect(JSON.parse(instance.getFileContent()).enableArtifact).toBe(false);
+      expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("'enableArtifact'"));
+    });
+
+    it("drops the user/managed-only keys from the 2026-09 reference refresh at project scope", async () => {
+      const mockLogger = createMockLogger();
+      const warnSpy = vi.spyOn(mockLogger, "warn");
+      const userScopeOnly = {
+        autoContinueAtUsageLimit: true,
+        bashEditDiffEnabled: true,
+        desktopSessionCleanupPeriodDays: 30,
+        feedbackDrafts: "off",
+        modelPicker: { options: [{ model: "opus", label: "Opus" }] },
+        appendPlugins: ["audit@acme"],
+        prependPlugins: ["sec-default@builtin"],
+        syncClaudeAiPlugins: false,
+        // "User or managed" since v2.1.295, so `--global` writes it.
+        forceLoginGatewayUrl: "https://gateway.example.com",
+      };
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({
+          permission: { bash: { "git *": "allow" } },
+          claudecode: { ...userScopeOnly, editorMode: "vim" },
+        }),
+      });
+
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        logger: mockLogger,
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      expect(content.editorMode).toBe("vim");
+      for (const key of Object.keys(userScopeOnly)) {
+        expect(content[key]).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining(`'${key}' is not honored in the project-scoped`),
+        );
+      }
+
+      const globalLogger = createMockLogger();
+      const globalWarnSpy = vi.spyOn(globalLogger, "warn");
+      const globalInstance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        global: true,
+        logger: globalLogger,
+      });
+      const globalContent = JSON.parse(globalInstance.getFileContent());
+      for (const [key, value] of Object.entries(userScopeOnly)) {
+        expect(globalContent[key]).toEqual(value);
+      }
+      expect(globalWarnSpy).not.toHaveBeenCalledWith(
+        expect.stringContaining("is not honored in the project-scoped"),
+      );
+    });
+
+    it("drops the managed-only and ~/.claude.json keys from the 2026-09 reference refresh in global mode", async () => {
+      const mockLogger = createMockLogger();
+      const warnSpy = vi.spyOn(mockLogger, "warn");
+      const unhonored = {
+        copyOnSelect: "~/.claude.json",
+        disableDesktopLocalSessions: "managed settings",
+        gatewayInternalNetworks: "managed settings",
+        managedMcpServers: "managed settings",
+        managedSourcesBehavior: "managed settings",
+        modelPricing: "managed settings",
+        allowClaudeInChromeWithManagedMcp: "managed settings",
+        allowedProviders: "managed settings",
+        availableModelsMatch: "managed settings",
+        deniedModels: "managed settings",
+        claudeInChromeDefaultEnabled: "~/.claude.json",
+        copyFullResponse: "~/.claude.json",
+        defaultToAgentsView: "~/.claude.json",
+        leftArrowOpensAgents: "~/.claude.json",
+        prStatusFooterEnabled: "~/.claude.json",
+      };
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({
+          permission: { bash: { "git *": "allow" } },
+          claudecode: {
+            copyOnSelect: false,
+            disableDesktopLocalSessions: true,
+            gatewayInternalNetworks: ["203.0.113.0/24"],
+            managedMcpServers: { search: { type: "http", url: "https://example.com/mcp" } },
+            managedSourcesBehavior: "merge",
+            modelPricing: { multiplier: 0.5 },
+            allowClaudeInChromeWithManagedMcp: true,
+            allowedProviders: ["anthropic"],
+            availableModelsMatch: "exact",
+            deniedModels: ["claude-haiku-.*"],
+            claudeInChromeDefaultEnabled: true,
+            copyFullResponse: true,
+            defaultToAgentsView: true,
+            leftArrowOpensAgents: true,
+            prStatusFooterEnabled: false,
+          },
+        }),
+      });
+
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        global: true,
+        logger: mockLogger,
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      for (const [key, source] of Object.entries(unhonored)) {
+        expect(content[key]).toBeUndefined();
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining(`'${key}' is only honored in ${source}`),
+        );
+      }
+    });
+
+    it("drops the user-only worktree.location at project scope and keeps its siblings", async () => {
+      const mockLogger = createMockLogger();
+      const warnSpy = vi.spyOn(mockLogger, "warn");
+      const authored = {
+        permission: { bash: { "git *": "allow" } },
+        claudecode: {
+          worktree: { location: "~/worktrees", sparsePaths: ["src"] },
+        },
+      };
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify(authored),
+      });
+
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        logger: mockLogger,
+      });
+
+      expect(JSON.parse(instance.getFileContent()).worktree).toEqual({ sparsePaths: ["src"] });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("'worktree.location' is not honored in the project-scoped"),
+      );
+
+      const globalInstance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        global: true,
+      });
+      expect(JSON.parse(globalInstance.getFileContent()).worktree).toEqual(
+        authored.claudecode.worktree,
+      );
+    });
+
+    it("drops a worktree block left empty by removing worktree.location at project scope", async () => {
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({
+          permission: { bash: { "git *": "allow" } },
+          claudecode: { worktree: { location: "~/worktrees" } },
+        }),
+      });
+
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+      });
+
+      expect(JSON.parse(instance.getFileContent())).not.toHaveProperty("worktree");
+    });
+
     it("writes a user-scope key in global mode", async () => {
       const rulesyncPermissions = new RulesyncPermissions({
         relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
@@ -1003,6 +1238,48 @@ describe("ClaudecodePermissions", () => {
 
       expect(JSON.parse(instance.getFileContent()).spellcheck).toBe(true);
     });
+
+    it.each([false, true])(
+      "drops a key Claude Code removed and names the removing version (global: %s)",
+      async (global) => {
+        const mockLogger = createMockLogger();
+        const warnSpy = vi.spyOn(mockLogger, "warn");
+        const removed = {
+          permissionExplainerEnabled: "v2.1.257",
+          taskOutputMaxChars: "v2.1.277",
+          teammateDefaultModel: "v2.1.234",
+        };
+        const rulesyncPermissions = new RulesyncPermissions({
+          relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+          relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+          fileContent: JSON.stringify({
+            permission: { bash: { "git *": "allow" } },
+            claudecode: {
+              permissionExplainerEnabled: false,
+              taskOutputMaxChars: 50000,
+              teammateDefaultModel: "sonnet",
+            },
+          }),
+        });
+
+        const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions,
+          global,
+          logger: mockLogger,
+        });
+
+        const content = JSON.parse(instance.getFileContent());
+        for (const [key, version] of Object.entries(removed)) {
+          expect(content[key]).toBeUndefined();
+          expect(warnSpy).toHaveBeenCalledWith(
+            expect.stringContaining(`'${key}' was removed in Claude Code ${version}`),
+          );
+        }
+        expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("is only honored in"));
+        expect(content.permissions.allow).toEqual(["Bash(git *)"]);
+      },
+    );
 
     it("drops a managed-only or ~/.claude.json key in both scopes and warns", async () => {
       const mockLogger = createMockLogger();
@@ -1213,6 +1490,7 @@ describe("ClaudecodePermissions", () => {
       const instance = await ClaudecodePermissions.fromRulesyncPermissions({
         outputRoot: testDir,
         rulesyncPermissions,
+        global: true,
         logger: mockLogger,
       });
 
@@ -1330,12 +1608,49 @@ describe("ClaudecodePermissions", () => {
       const instance = await ClaudecodePermissions.fromRulesyncPermissions({
         outputRoot: testDir,
         rulesyncPermissions,
+        global: true,
         logger: mockLogger,
       });
 
       expect(JSON.parse(instance.getFileContent()).permissions.defaultMode).toBe(mode);
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining(expected));
     });
+
+    it.each(["auto", "bypassPermissions"])(
+      "drops a project-scope defaultMode of %s, which Claude Code ignores there",
+      async (mode) => {
+        const mockLogger = createMockLogger();
+        const warnSpy = vi.spyOn(mockLogger, "warn");
+        const rulesyncPermissions = new RulesyncPermissions({
+          relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+          relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+          fileContent: JSON.stringify({
+            permission: { bash: { "git *": "allow" } },
+            claudecode: { permissions: { defaultMode: mode, additionalDirectories: [] } },
+          }),
+        });
+
+        const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions,
+          logger: mockLogger,
+        });
+
+        const content = JSON.parse(instance.getFileContent());
+        expect(content.permissions.defaultMode).toBeUndefined();
+        expect(content.permissions.additionalDirectories).toEqual([]);
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining(
+            `'permissions.defaultMode: "${mode}"' is not honored in the project-scoped settings.json`,
+          ),
+        );
+        // The widening warning would describe a mode that never takes effect.
+        expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("auto-approved"));
+        expect(warnSpy).not.toHaveBeenCalledWith(
+          expect.stringContaining("no permission prompts at all"),
+        );
+      },
+    );
 
     it("stays quiet about a defaultMode that widens nothing", async () => {
       const mockLogger = createMockLogger();
@@ -1717,6 +2032,212 @@ describe("ClaudecodePermissions", () => {
       expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("'enableAllProjectMcpServers'"));
     });
 
+    describe("env variables Claude Code ignores", () => {
+      const envCase = (env: Record<string, unknown>): RulesyncPermissions =>
+        new RulesyncPermissions({
+          relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+          relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+          fileContent: JSON.stringify({
+            permission: { bash: { "git *": "allow" } },
+            claudecode: { env },
+          }),
+        });
+
+      it("drops project-ignored variables at project scope and keeps the rest", async () => {
+        const mockLogger = createMockLogger();
+        const warnSpy = vi.spyOn(mockLogger, "warn");
+
+        const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: envCase({
+            DISABLE_AUTO_COMPACT: "1",
+            CLAUDE_CODE_ENABLE_TELEMETRY: "1",
+            OTEL_EXPORTER_OTLP_ENDPOINT: "https://otel.test",
+            OTEL_EXPORTER_OTLP_METRICS_HEADERS: "Authorization=secret-token",
+            OTEL_EXPORTER_OTLP_TIMEOUT: "5000",
+            OTEL_EXPORTER_PROMETHEUS_PORT: "9464",
+            OTEL_LOGS_EXPORTER: "none",
+            OTEL_METRICS_EXPORTER: "otlp",
+            OTEL_LOG_USER_PROMPTS: "0",
+            OTEL_LOG_TOOL_CONTENT: 0,
+            OTEL_TRACES_EXPORTER: "NONE",
+            OTEL_LOG_TOOL_DETAILS: "1",
+            OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY: "/tmp/key.pem",
+            systemroot: "C:\\Windows",
+            PROGRAMW6432: "C:\\Programs",
+            OTEL_LOG_ASSISTANT_RESPONSES: "0",
+            XDG_CONFIG_HOME: "/tmp/xdg",
+            HOME: "/tmp/home",
+            "ProgramFiles(x86)": "C:\\Programs",
+            Comspec: "C:\\cmd.exe",
+            CLAUDE_CODE_SYNC_SKILLS: "1",
+            CLAUDE_CODE_PROCESS_WRAPPER: "/usr/bin/wrap",
+          }),
+          logger: mockLogger,
+        });
+
+        const content = JSON.parse(instance.getFileContent());
+        expect(content.env).toEqual({
+          DISABLE_AUTO_COMPACT: "1",
+          OTEL_EXPORTER_OTLP_TIMEOUT: "5000",
+          OTEL_LOGS_EXPORTER: "none",
+          OTEL_LOG_USER_PROMPTS: "0",
+          OTEL_LOG_TOOL_CONTENT: 0,
+          OTEL_TRACES_EXPORTER: "NONE",
+        });
+        const messages = warnSpy.mock.calls.map(([message]) => message as string);
+        const dropped = messages.find((message) => message.includes("project-scoped"));
+        expect(dropped).toContain("'env.CLAUDE_CODE_ENABLE_TELEMETRY'");
+        expect(dropped).toContain("'env.OTEL_LOG_ASSISTANT_RESPONSES'");
+        expect(dropped).toContain("'env.ProgramFiles(x86)'");
+        expect(dropped).toContain("'env.systemroot'");
+        expect(dropped).toContain("'env.CLAUDE_CODE_PROCESS_WRAPPER'");
+        expect(dropped).toContain("'env.OTEL_EXPORTER_OTLP_TRACES_CLIENT_KEY'");
+        // Names only: an env value is often a credential.
+        expect(messages.join("\n")).not.toContain("secret-token");
+      });
+
+      it("drops the v2.1.290 dialog-timer, attachment and file-mention variables at project scope", async () => {
+        const mockLogger = createMockLogger();
+        const warnSpy = vi.spyOn(mockLogger, "warn");
+        const ignored = {
+          CLAUDE_CODE_USER_DIALOG_TIMEOUT_MS: "60000",
+          CLAUDE_AFK_TIMEOUT_MS: "30000",
+          CLAUDE_AFK_COUNTDOWN_MS: "5000",
+          CLAUDE_CODE_DISABLE_ATTACHMENTS: "1",
+          CLAUDE_CODE_DISABLE_FILE_MENTIONS: "1",
+        };
+
+        const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: envCase({ ...ignored, MY_VAR: "1" }),
+          logger: mockLogger,
+        });
+
+        expect(JSON.parse(instance.getFileContent()).env).toEqual({ MY_VAR: "1" });
+        const dropped = warnSpy.mock.calls
+          .map(([message]) => message as string)
+          .find((message) => message.includes("project-scoped"));
+        for (const name of Object.keys(ignored)) {
+          expect(dropped).toContain(`'env.${name}'`);
+        }
+
+        const globalInstance = await ClaudecodePermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: envCase(ignored),
+          global: true,
+        });
+        expect(JSON.parse(globalInstance.getFileContent()).env).toEqual(ignored);
+      });
+
+      it.each([
+        ["1", false],
+        ["true", false],
+        ["0", true],
+        ["false", true],
+      ])(
+        "keeps CLAUDE_CODE_ENABLE_CFC=%s at project scope only when it turns Chrome off (kept: %s)",
+        async (value, kept) => {
+          const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+            outputRoot: testDir,
+            rulesyncPermissions: envCase({ CLAUDE_CODE_ENABLE_CFC: value }),
+          });
+
+          const content = JSON.parse(instance.getFileContent());
+          expect(content.env?.CLAUDE_CODE_ENABLE_CFC).toBe(kept ? value : undefined);
+
+          const globalInstance = await ClaudecodePermissions.fromRulesyncPermissions({
+            outputRoot: testDir,
+            rulesyncPermissions: envCase({ CLAUDE_CODE_ENABLE_CFC: value }),
+            global: true,
+          });
+          expect(JSON.parse(globalInstance.getFileContent()).env).toEqual({
+            CLAUDE_CODE_ENABLE_CFC: value,
+          });
+        },
+      );
+
+      it.each(["false", "Off", "no"])(
+        "keeps the content-variable off value %s at project scope",
+        async (offValue) => {
+          const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+            outputRoot: testDir,
+            rulesyncPermissions: envCase({ OTEL_LOG_USER_PROMPTS: offValue }),
+          });
+
+          const content = JSON.parse(instance.getFileContent());
+          expect(content.env).toEqual({ OTEL_LOG_USER_PROMPTS: offValue });
+        },
+      );
+
+      it("writes project-ignored variables under --global", async () => {
+        const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: envCase({
+            CLAUDE_CODE_ENABLE_TELEMETRY: "1",
+            OTEL_LOG_ASSISTANT_RESPONSES: "1",
+            XDG_CONFIG_HOME: "/tmp/xdg",
+          }),
+          global: true,
+        });
+
+        const content = JSON.parse(instance.getFileContent());
+        expect(content.env).toEqual({
+          CLAUDE_CODE_ENABLE_TELEMETRY: "1",
+          OTEL_LOG_ASSISTANT_RESPONSES: "1",
+          XDG_CONFIG_HOME: "/tmp/xdg",
+        });
+      });
+
+      it.each([false, true])(
+        "drops variables ignored in every file (global: %s)",
+        async (global) => {
+          const mockLogger = createMockLogger();
+          const warnSpy = vi.spyOn(mockLogger, "warn");
+
+          const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+            outputRoot: testDir,
+            rulesyncPermissions: envCase({
+              CLAUDE_CODE_REMOTE: "1",
+              CLAUDE_CODE_PROJECT_DIR_NAME: "repo",
+              MY_VAR: "1",
+            }),
+            global,
+            logger: mockLogger,
+          });
+
+          const content = JSON.parse(instance.getFileContent());
+          expect(content.env).toEqual({ MY_VAR: "1" });
+          expect(warnSpy).toHaveBeenCalledWith(
+            expect.stringContaining(
+              "'env.CLAUDE_CODE_REMOTE', 'env.CLAUDE_CODE_PROJECT_DIR_NAME' in every settings file",
+            ),
+          );
+        },
+      );
+
+      it("omits env and its trust warning when every variable is dropped, leaving the file's own values", async () => {
+        await ensureDir(join(testDir, ".claude"));
+        await writeFileContent(
+          join(testDir, ".claude", "settings.json"),
+          JSON.stringify({ env: { CLAUDE_CODE_ENABLE_TELEMETRY: "1" } }),
+        );
+        const mockLogger = createMockLogger();
+        const warnSpy = vi.spyOn(mockLogger, "warn");
+
+        const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: envCase({ OTEL_TRACES_EXPORTER: "otlp" }),
+          logger: mockLogger,
+        });
+
+        const content = JSON.parse(instance.getFileContent());
+        expect(content.env).toEqual({ CLAUDE_CODE_ENABLE_TELEMETRY: "1" });
+        expect(warnSpy).toHaveBeenCalledTimes(1);
+        expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("trust-affecting"));
+      });
+    });
+
     it("reports every trust-affecting setting in a single warning per file", async () => {
       const mockLogger = createMockLogger();
       const warnSpy = vi.spyOn(mockLogger, "warn");
@@ -1743,7 +2264,7 @@ describe("ClaudecodePermissions", () => {
       // "review this as you would a hook" advice per key buries them.
       expect(warnSpy).toHaveBeenCalledTimes(1);
       const [message] = warnSpy.mock.calls[0] as [string];
-      expect(message).toContain("writing 4 trust-affecting settings to settings.json");
+      expect(message).toContain("writing 4 trust-affecting settings to .claude/settings.json");
       expect(message).toContain(`'permissions.defaultMode: "acceptEdits"' —`);
       expect(message).toContain("'sandbox.enabled' —");
       expect(message).toContain("'sandbox.network.allowedDomains' —");
@@ -1770,8 +2291,34 @@ describe("ClaudecodePermissions", () => {
 
       expect(warnSpy).toHaveBeenCalledWith(
         expect.stringContaining(
-          "writing 1 trust-affecting setting to settings.json; review it as you would a hook",
+          "writing 1 trust-affecting setting to .claude/settings.json; review it as you would a hook",
         ),
+      );
+    });
+
+    it("names a sandbox container that is not the object its settings live in", async () => {
+      const mockLogger = createMockLogger();
+      const warnSpy = vi.spyOn(mockLogger, "warn");
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({
+          permission: { bash: { "git *": "allow" } },
+          // `network` holds the sandbox's host and proxy settings. Written as a
+          // string none of them can be read, and going quiet would claim the
+          // write cannot loosen anything.
+          claudecode: { sandbox: { network: "off" } },
+        }),
+      });
+
+      await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        logger: mockLogger,
+      });
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("'sandbox.network' — is not the object it has to be"),
       );
     });
 
@@ -2043,6 +2590,66 @@ describe("ClaudecodePermissions", () => {
     });
   });
 
+  describe("$schema", () => {
+    it("adds $schema as the first key when the settings file lacks it", async () => {
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(
+        join(testDir, ".claude", "settings.json"),
+        JSON.stringify({ model: "opus", permissions: { deny: ["Read(.env)"] } }, null, 2),
+      );
+
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: schemaCaseRulesyncPermissions(),
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      expect(Object.keys(content)).toEqual(["$schema", "model", "permissions"]);
+      expect(content.$schema).toBe(CLAUDECODE_SETTINGS_SCHEMA_URL);
+    });
+
+    it("adds $schema when the settings file does not exist yet", async () => {
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: schemaCaseRulesyncPermissions(),
+      });
+
+      expect(instance.getFileContent().startsWith(`{\n  "$schema": "`)).toBe(true);
+      expect(JSON.parse(instance.getFileContent())).toEqual({
+        $schema: CLAUDECODE_SETTINGS_SCHEMA_URL,
+        permissions: { allow: ["Bash(git *)"] },
+      });
+    });
+
+    it("adds $schema in global scope too", async () => {
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: schemaCaseRulesyncPermissions(),
+        global: true,
+      });
+
+      expect(JSON.parse(instance.getFileContent()).$schema).toBe(CLAUDECODE_SETTINGS_SCHEMA_URL);
+    });
+
+    it("keeps a $schema the file already states, whatever its value", async () => {
+      const pinned = "https://mirror.example.test/claude-code-settings.json";
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(
+        join(testDir, ".claude", "settings.json"),
+        JSON.stringify({ permissions: {}, $schema: pinned }, null, 2),
+      );
+
+      const instance = await ClaudecodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: schemaCaseRulesyncPermissions(),
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      expect(content.$schema).toBe(pinned);
+      expect(Object.keys(content)).toEqual(["permissions", "$schema"]);
+    });
+  });
+
   describe("toRulesyncPermissions", () => {
     it("should route the sandbox subtree back into the claudecode override", () => {
       const instance = new ClaudecodePermissions({
@@ -2062,6 +2669,25 @@ describe("ClaudecodePermissions", () => {
       expect(config.claudecode.permissions).toEqual({ defaultMode: "acceptEdits" });
       // A top-level settings key no other feature owns round-trips through the
       // same override block, so the next generate writes it back.
+      expect(config.claudecode.model).toBe("opus");
+    });
+
+    it("drops $schema from the claudecode override on import while other keys pass through", () => {
+      // Every generated settings file now carries `$schema`, so a regression
+      // here would copy the schemastore URL into every imported permissions file.
+      const instance = new ClaudecodePermissions({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          $schema: "https://json.schemastore.org/claude-code-settings.json",
+          permissions: { allow: ["Bash(git *)"] },
+          model: "opus",
+        }),
+      });
+
+      const config = JSON.parse(instance.toRulesyncPermissions().getFileContent());
+      expect(config.claudecode).not.toHaveProperty("$schema");
       expect(config.claudecode.model).toBe("opus");
     });
 

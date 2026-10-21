@@ -3,6 +3,7 @@ import { join } from "node:path";
 import * as smolToml from "smol-toml";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, readFileContentOrNull, writeFileContent } from "../../utils/file.js";
 import { RulesyncHooks } from "./rulesync-hooks.js";
@@ -186,6 +187,42 @@ describe("VibeHooks", () => {
       const configContent = await readFileContentOrNull(join(testDir, ".vibe", "config.toml"));
       expect(configContent).toBeNull();
     });
+
+    describe("backslash in command", () => {
+      // Vibe v2.25.1 to v2.25.4 skipped a hook whose command contained a
+      // backslash; v2.25.5 removed that skip and runs hook commands through
+      // the shell again, so the command is written verbatim without a warning.
+      it("should write a backslash command verbatim without warning", async () => {
+        const logger = createMockLogger();
+        const rulesyncHooks = new RulesyncHooks(
+          createMockAiFileParams({
+            fileContent: JSON.stringify({
+              hooks: {
+                preToolUse: [
+                  { name: "win-guard", command: "python C:\\tools\\guard.py", matcher: "bash" },
+                ],
+                stop: [{ command: "grep -q '\\.ts$' changed.txt" }],
+              },
+            }),
+          }),
+        );
+
+        const vibeHooks = await VibeHooks.fromRulesyncHooks({
+          outputRoot: testDir,
+          rulesyncHooks,
+          validate: true,
+          logger,
+        });
+
+        const parsed = smolToml.parse(vibeHooks.getFileContent()) as {
+          hooks: Array<Record<string, unknown>>;
+        };
+        expect(parsed.hooks).toHaveLength(2);
+        expect(parsed.hooks[0]?.command).toBe("python C:\\tools\\guard.py");
+        expect(parsed.hooks[1]?.command).toBe("grep -q '\\.ts$' changed.txt");
+        expect(logger.warn).not.toHaveBeenCalled();
+      });
+    });
   });
 
   describe("toRulesyncHooks (round-trip import)", () => {
@@ -280,6 +317,35 @@ describe("VibeHooks", () => {
       // stringified prototype member (e.g. "[object Object]").
       expect(Object.keys(parsed.hooks)).toEqual(["preToolUse"]);
       expect(parsed.vibe).toBeUndefined();
+    });
+
+    it("should carry an event type named toString through as a plain string key (#2757)", () => {
+      // `toString` is not a prototype-pollution key, so it reaches the event
+      // name lookup; the lookup must not resolve Object.prototype.toString.
+      const fileContent = smolToml.stringify({
+        hooks: [
+          { name: "ok", type: "pre_tool", match: "bash", command: "./guard" },
+          { name: "crafted", type: "toString", command: "./crafted" },
+        ],
+      });
+
+      const vibeHooks = new VibeHooks(
+        createMockAiFileParams({
+          relativeDirPath: ".vibe",
+          relativeFilePath: "hooks.toml",
+          fileContent,
+        }),
+      );
+
+      const parsed = vibeHooks.toRulesyncHooks().getJson();
+      expect(parsed.hooks.preToolUse?.[0]).toMatchObject({ command: "./guard", matcher: "bash" });
+      expect(Object.keys(parsed.hooks)).toEqual(["preToolUse"]);
+      // The unmapped name must fall through verbatim rather than resolving to
+      // Object.prototype.toString and landing under its stringified source.
+      const overrideHooks = (parsed as { vibe?: { hooks?: Record<string, unknown[]> } }).vibe
+        ?.hooks;
+      expect(Object.keys(overrideHooks ?? {})).toEqual(["toString"]);
+      expect(overrideHooks?.["toString"]?.[0]).toMatchObject({ command: "./crafted" });
     });
   });
 

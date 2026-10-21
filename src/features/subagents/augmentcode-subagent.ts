@@ -11,6 +11,7 @@ import { AiFileParams, ValidationResult } from "../../types/ai-file.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContent } from "../../utils/file.js";
 import { parseFrontmatter, stringifyFrontmatter } from "../../utils/frontmatter.js";
+import type { Logger } from "../../utils/logger.js";
 import { RulesyncSubagent, RulesyncSubagentFrontmatter } from "./rulesync-subagent.js";
 import {
   ToolSubagent,
@@ -19,6 +20,30 @@ import {
   ToolSubagentFromRulesyncSubagentParams,
   ToolSubagentSettablePaths,
 } from "./tool-subagent.js";
+
+// Auggie accepts a tool list either as a YAML list or as one comma-separated
+// string ("Example with comma-separated format: `tools: view,
+// codebase-retrieval`" — https://docs.augmentcode.com/cli/subagents). Both are
+// accepted on import; rulesync always emits the list form.
+const AugmentcodeToolListSchema = z.union([z.array(z.string()), z.string()]);
+
+/**
+ * Normalize a documented tool-list value to the list form: a string is split on
+ * commas, trimmed, and emptied of blank entries; a list is returned as is. A
+ * string that names no tool (`""`, `", ,"`) is treated as unset rather than as
+ * an empty allowlist — the author left the value blank, not the tool set — so
+ * it yields `undefined`; an authored empty list is kept as written.
+ */
+function normalizeAugmentcodeToolList(value: string[] | string): string[] | undefined {
+  if (Array.isArray(value)) {
+    return value;
+  }
+  const tools = value
+    .split(",")
+    .map((tool) => tool.trim())
+    .filter((tool) => tool.length > 0);
+  return tools.length > 0 ? tools : undefined;
+}
 
 // AugmentCode (Auggie CLI) subagents are Markdown files with YAML frontmatter.
 // `name` is required; `description`, `color` (ANSI color name), `model`,
@@ -30,11 +55,11 @@ const AugmentcodeSubagentFrontmatterSchema = z.looseObject({
   description: z.optional(z.string()),
   color: z.optional(z.string()),
   model: z.optional(z.string()),
-  tools: z.optional(z.array(z.string())),
-  disabled_tools: z.optional(z.array(z.string())),
+  tools: z.optional(AugmentcodeToolListSchema),
+  disabled_tools: z.optional(AugmentcodeToolListSchema),
 });
 
-type AugmentcodeSubagentFrontmatter = z.infer<typeof AugmentcodeSubagentFrontmatterSchema>;
+export type AugmentcodeSubagentFrontmatter = z.infer<typeof AugmentcodeSubagentFrontmatterSchema>;
 
 type AugmentcodeSubagentParams = {
   frontmatter: AugmentcodeSubagentFrontmatter;
@@ -92,7 +117,17 @@ export class AugmentcodeSubagent extends ToolSubagent {
   }
 
   toRulesyncSubagent(): RulesyncSubagent {
-    const { name, description, ...rest } = this.frontmatter;
+    const { name, description, tools, disabled_tools, ...rest } = this.frontmatter;
+    // The comma-separated string form is normalized here so the round-trip
+    // re-emits the list form Auggie also accepts.
+    const normalizedTools = tools === undefined ? undefined : normalizeAugmentcodeToolList(tools);
+    const normalizedDisabledTools =
+      disabled_tools === undefined ? undefined : normalizeAugmentcodeToolList(disabled_tools);
+    const toolLists = {
+      ...(normalizedTools !== undefined && { tools: normalizedTools }),
+      ...(normalizedDisabledTools !== undefined && { disabled_tools: normalizedDisabledTools }),
+    };
+    const augmentcodeSection = { ...rest, ...toolLists };
 
     const rulesyncFrontmatter: RulesyncSubagentFrontmatter = {
       targets: ["*"] as const,
@@ -100,7 +135,7 @@ export class AugmentcodeSubagent extends ToolSubagent {
       description,
       // Round-trip tool-specific fields (color/model/tools/disabled_tools and
       // any future keys) through a dedicated augmentcode section.
-      ...(Object.keys(rest).length > 0 && { augmentcode: rest }),
+      ...(Object.keys(augmentcodeSection).length > 0 && { augmentcode: augmentcodeSection }),
     };
 
     return new RulesyncSubagent({
@@ -118,15 +153,20 @@ export class AugmentcodeSubagent extends ToolSubagent {
     rulesyncSubagent,
     validate = true,
     global = false,
+    logger,
   }: ToolSubagentFromRulesyncSubagentParams): ToolSubagent {
     const rulesyncFrontmatter = rulesyncSubagent.getFrontmatter();
     const augmentcodeSection = rulesyncFrontmatter.augmentcode ?? {};
 
-    const augmentcodeFrontmatter: AugmentcodeSubagentFrontmatter = {
-      name: rulesyncFrontmatter.name,
-      description: rulesyncFrontmatter.description,
-      ...augmentcodeSection,
-    };
+    const augmentcodeFrontmatter = this.sanitizeFrontmatter({
+      frontmatter: {
+        name: rulesyncFrontmatter.name,
+        description: rulesyncFrontmatter.description,
+        ...augmentcodeSection,
+      },
+      relativeFilePath: rulesyncSubagent.getRelativeFilePath(),
+      logger,
+    });
 
     const body = rulesyncSubagent.getBody();
     const fileContent = stringifyFrontmatter(body, augmentcodeFrontmatter, {
@@ -144,6 +184,21 @@ export class AugmentcodeSubagent extends ToolSubagent {
       validate,
       global,
     });
+  }
+
+  /**
+   * Hook for subclasses whose destination honors fewer frontmatter fields.
+   * The `.augment/agents/` loader reads every documented field, so this is the
+   * identity here.
+   */
+  protected static sanitizeFrontmatter({
+    frontmatter,
+  }: {
+    frontmatter: AugmentcodeSubagentFrontmatter;
+    relativeFilePath: string;
+    logger?: Logger;
+  }): AugmentcodeSubagentFrontmatter {
+    return frontmatter;
   }
 
   validate(): ValidationResult {

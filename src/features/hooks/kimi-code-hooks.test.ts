@@ -75,6 +75,44 @@ describe("KimiCodeHooks", () => {
       }
     });
 
+    it("emits commands verbatim when runFromSourceDirectory is false", () => {
+      const hooks = KimiCodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks: makeRulesyncHooks({
+          version: 1,
+          hooks: {
+            preToolUse: [{ type: "command", command: "$HOME/hooks/guard.py", matcher: "Bash" }],
+          },
+          "kimi-code": {
+            runFromSourceDirectory: false,
+            hooks: { SessionHeartbeat: [{ command: "./beat.sh" }] },
+          },
+        }),
+      });
+
+      const entries = readEntries(hooks.getFileContent());
+      expect(entries).toEqual([
+        { event: "PreToolUse", command: "$HOME/hooks/guard.py", matcher: "Bash" },
+        { event: "SessionHeartbeat", command: "./beat.sh" },
+      ]);
+    });
+
+    it("keeps wrapping commands when runFromSourceDirectory is true", () => {
+      const hooks = KimiCodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks: makeRulesyncHooks({
+          version: 1,
+          hooks: { stop: [{ type: "command", command: "./stop.sh" }] },
+          "kimi-code": { runFromSourceDirectory: true },
+        }),
+      });
+
+      const [entry] = readEntries(hooks.getFileContent());
+      expect(entry?.command).toContain("RULESYNC_KIMI_HOOK_CWD=1");
+      expect(entry?.command).toContain(testDir);
+      expect(entry?.command.endsWith("./stop.sh")).toBe(true);
+    });
+
     it("drops matchers on the events whose matcher is documented as an empty string", () => {
       const logger = createMockLogger();
       const hooks = KimiCodeHooks.fromRulesyncHooks({
@@ -181,6 +219,33 @@ describe("KimiCodeHooks", () => {
         { type: "command", command: "./task.sh", matcher: "process" },
       ]);
       expect(config["kimi-code"].hooks.SessionHeartbeat).toHaveLength(1);
+    });
+
+    it("carries an event named toString through as a plain string key (#2757)", () => {
+      const hooks = new KimiCodeHooks({
+        outputRoot: testDir,
+        fileContent: [
+          "[[hooks]]",
+          'event = "SessionStart"',
+          'command = "./start.sh"',
+          "",
+          "[[hooks]]",
+          'event = "toString"',
+          'command = "./crafted.sh"',
+          "",
+        ].join("\n"),
+        validate: false,
+      });
+
+      const config = JSON.parse(hooks.toRulesyncHooks().getFileContent());
+      expect(config.hooks.sessionStart).toEqual([{ type: "command", command: "./start.sh" }]);
+      expect(Object.keys(config.hooks)).toEqual(["sessionStart"]);
+      // The unmapped name must fall through verbatim rather than resolving to
+      // Object.prototype.toString and landing under its stringified source.
+      expect(Object.keys(config["kimi-code"].hooks)).toEqual(["toString"]);
+      expect(config["kimi-code"].hooks["toString"]).toEqual([
+        { type: "command", command: "./crafted.sh" },
+      ]);
     });
 
     it("preserves a matcher on the matcher-less events, unlike generate", () => {

@@ -1,10 +1,17 @@
+import { symlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import { describe, expect, it } from "vitest";
 
 import { RULESYNC_COMMANDS_RELATIVE_DIR_PATH } from "../constants/rulesync-paths.js";
 import { CommandsProcessor } from "../features/commands/commands-processor.js";
-import { fileExists, readFileContent, removeFile, writeFileContent } from "../utils/file.js";
+import {
+  ensureDir,
+  fileExists,
+  readFileContent,
+  removeFile,
+  writeFileContent,
+} from "../utils/file.js";
 import { getHermesagentGlobalDir } from "../utils/hermesagent.js";
 import {
   assertGenerateMatrixCoversTargets,
@@ -17,19 +24,38 @@ import {
 const commandsGenerateTargets = [
   { target: "claudecode", outputPath: join(".claude", "commands", "review-pr.md") },
   { target: "claudecode-plugin", outputPath: join("commands", "review-pr.md") },
+  { target: "augmentcode-plugin", outputPath: join("commands", "review-pr.md") },
+  { target: "zcode-plugin", outputPath: join("commands", "review-pr.md") },
+  { target: "kimi-code-plugin", outputPath: join("commands", "review-pr.md") },
   { target: "cursor", outputPath: join(".cursor", "commands", "review-pr.md") },
   { target: "augmentcode", outputPath: join(".augment", "commands", "review-pr.md") },
+  { target: "bob", outputPath: join(".bob", "commands", "review-pr.md") },
   { target: "copilot", outputPath: join(".github", "prompts", "review-pr.prompt.md") },
+  { target: "mimocode", outputPath: join(".mimocode", "commands", "review-pr.md") },
+  { target: "omp", outputPath: join(".omp", "commands", "review-pr.md") },
   { target: "opencode", outputPath: join(".opencode", "commands", "review-pr.md") },
   { target: "cline", outputPath: join(".clinerules", "workflows", "review-pr.md") },
+  { target: "codebuddy", outputPath: join(".codebuddy", "commands", "review-pr.md") },
+  { target: "codewhale", outputPath: join(".codewhale", "commands", "review-pr.md") },
   { target: "kilo", outputPath: join(".kilo", "commands", "review-pr.md") },
+  { target: "tabnine", outputPath: join(".tabnine", "agent", "commands", "review-pr.toml") },
+  { target: "continue", outputPath: join(".continue", "prompts", "review-pr.md") },
+  { target: "commandcode", outputPath: join(".commandcode", "commands", "review-pr.md") },
+  { target: "qoder", outputPath: join(".qoder", "commands", "review-pr.md") },
+  { target: "trae", outputPath: join(".trae", "commands", "review-pr.md") },
   { target: "roo", outputPath: join(".roo", "commands", "review-pr.md") },
   { target: "zoocode", outputPath: join(".roo", "commands", "review-pr.md") },
   { target: "kiro", outputPath: join(".kiro", "prompts", "review-pr.md") },
   { target: "kiro-cli", outputPath: join(".kiro", "prompts", "review-pr.md") },
   { target: "kiro-ide", outputPath: join(".kiro", "prompts", "review-pr.md") },
-  { target: "antigravity-ide", outputPath: join(".agents", "workflows", "review-pr.md") },
-  { target: "antigravity-cli", outputPath: join(".agents", "workflows", "review-pr.md") },
+  {
+    target: "antigravity-ide",
+    outputPath: join(".agents", "skills", "review-pr", "SKILL.md"),
+  },
+  {
+    target: "antigravity-cli",
+    outputPath: join(".agents", "skills", "review-pr", "SKILL.md"),
+  },
   { target: "junie", outputPath: join(".junie", "commands", "review-pr.md") },
   { target: "takt", outputPath: join(".takt", "facets", "instructions", "review-pr.md") },
   { target: "pi", outputPath: join(".pi", "prompts", "review-pr.md") },
@@ -37,31 +63,47 @@ const commandsGenerateTargets = [
   { target: "devin", outputPath: join(".devin", "skills", "review-pr", "SKILL.md") },
   // Warp's custom slash-command surface is skills, too.
   { target: "warp", outputPath: join(".warp", "skills", "review-pr", "SKILL.md") },
+  // Kimi Code registers every Skill as a slash command, too.
+  { target: "kimi-code", outputPath: join(".kimi-code", "skills", "review-pr", "SKILL.md") },
   { target: "factorydroid", outputPath: join(".factory", "commands", "review-pr.md") },
+  { target: "firebender", outputPath: join(".firebender", "commands", "review-pr.mdc") },
   { target: "goose", outputPath: join(".goose", "recipes", "review-pr.yaml") },
+  { target: "gitlabduo", outputPath: join(".agents", "commands", "review-pr.md") },
   { target: "grokcli", outputPath: join(".grok", "commands", "review-pr.md") },
   { target: "qwencode", outputPath: join(".qwen", "commands", "review-pr.md") },
+  { target: "lettacode", outputPath: join(".commands", "review-pr.md") },
   { target: "reasonix", outputPath: join(".reasonix", "commands", "review-pr.md") },
   { target: "rovodev", outputPath: join(".rovodev", "prompts", "review-pr.md") },
+  { target: "zcode", outputPath: join(".zcode", "commands", "review-pr.md") },
 ] as const;
 
 const commandsGlobalTargets = [
   { target: "claudecode", outputPath: join(".claude", "commands", "review-pr.md") },
   { target: "cursor", outputPath: join(".cursor", "commands", "review-pr.md") },
   { target: "augmentcode", outputPath: join(".augment", "commands", "review-pr.md") },
+  { target: "bob", outputPath: join(".bob", "commands", "review-pr.md") },
+  { target: "tabnine", outputPath: join(".tabnine", "agent", "commands", "review-pr.toml") },
+  { target: "continue", outputPath: join(".continue", "prompts", "review-pr.md") },
+  { target: "commandcode", outputPath: join(".commandcode", "commands", "review-pr.md") },
+  { target: "qoder", outputPath: join(".qoder", "commands", "review-pr.md") },
+  { target: "trae", outputPath: join(".trae", "commands", "review-pr.md") },
+  { target: "mimocode", outputPath: join(".config", "mimocode", "commands", "review-pr.md") },
+  { target: "omp", outputPath: join(".omp", "agent", "commands", "review-pr.md") },
   { target: "opencode", outputPath: join(".config", "opencode", "commands", "review-pr.md") },
   { target: "codexcli", outputPath: join(".codex", "prompts", "review-pr.md") },
   { target: "cline", outputPath: join("Documents", "Cline", "Workflows", "review-pr.md") },
+  { target: "codebuddy", outputPath: join(".codebuddy", "commands", "review-pr.md") },
+  { target: "codewhale", outputPath: join(".codewhale", "commands", "review-pr.md") },
   { target: "kilo", outputPath: join(".config", "kilo", "commands", "review-pr.md") },
   { target: "junie", outputPath: join(".junie", "commands", "review-pr.md") },
   { target: "kiro-cli", outputPath: join(".kiro", "prompts", "review-pr.md") },
   {
     target: "antigravity-ide",
-    outputPath: join(".gemini", "antigravity", "global_workflows", "review-pr.md"),
+    outputPath: join(".gemini", "config", "skills", "review-pr", "SKILL.md"),
   },
   {
     target: "antigravity-cli",
-    outputPath: join(".gemini", "antigravity-cli", "global_workflows", "review-pr.md"),
+    outputPath: join(".gemini", "antigravity-cli", "skills", "review-pr", "SKILL.md"),
   },
   {
     target: "takt",
@@ -73,8 +115,11 @@ const commandsGlobalTargets = [
     outputPath: join(".config", "devin", "skills", "review-pr", "SKILL.md"),
   },
   { target: "warp", outputPath: join(".warp", "skills", "review-pr", "SKILL.md") },
+  { target: "kimi-code", outputPath: join(".kimi-code", "skills", "review-pr", "SKILL.md") },
   { target: "factorydroid", outputPath: join(".factory", "commands", "review-pr.md") },
+  { target: "firebender", outputPath: join(".firebender", "commands", "review-pr.mdc") },
   { target: "goose", outputPath: join(".config", "goose", "recipes", "review-pr.yaml") },
+  { target: "gitlabduo", outputPath: join(".gitlab", "duo", "commands", "review-pr.md") },
   { target: "grokcli", outputPath: join(".grok", "commands", "review-pr.md") },
   { target: "qwencode", outputPath: join(".qwen", "commands", "review-pr.md") },
   { target: "roo", outputPath: join(".roo", "commands", "review-pr.md") },
@@ -84,8 +129,10 @@ const commandsGlobalTargets = [
     target: "hermesagent",
     outputPath: join(getHermesagentGlobalDir(), "rulesync", "commands", "review-pr.json"),
   },
+  { target: "lettacode", outputPath: join(".letta", "commands", "review-pr.md") },
   { target: "reasonix", outputPath: join(".reasonix", "commands", "review-pr.md") },
   { target: "rovodev", outputPath: join(".rovodev", "prompts", "review-pr.md") },
+  { target: "zcode", outputPath: join(".zcode", "commands", "review-pr.md") },
 ] as const;
 
 describe("E2E: commands", () => {
@@ -175,9 +222,19 @@ Check the PR diff and provide feedback.
     { target: "claudecode", orphanPath: join(".claude", "commands", "orphan.md") },
     { target: "cursor", orphanPath: join(".cursor", "commands", "orphan.md") },
     { target: "augmentcode", orphanPath: join(".augment", "commands", "orphan.md") },
+    { target: "bob", orphanPath: join(".bob", "commands", "orphan.md") },
+    { target: "tabnine", orphanPath: join(".tabnine", "agent", "commands", "orphan.toml") },
+    { target: "continue", orphanPath: join(".continue", "prompts", "orphan.md") },
+    { target: "commandcode", orphanPath: join(".commandcode", "commands", "orphan.md") },
+    { target: "qoder", orphanPath: join(".qoder", "commands", "orphan.md") },
+    { target: "trae", orphanPath: join(".trae", "commands", "orphan.md") },
     { target: "copilot", orphanPath: join(".github", "prompts", "orphan.prompt.md") },
+    { target: "mimocode", orphanPath: join(".mimocode", "commands", "orphan.md") },
+    { target: "omp", orphanPath: join(".omp", "commands", "orphan.md") },
     { target: "opencode", orphanPath: join(".opencode", "commands", "orphan.md") },
     { target: "cline", orphanPath: join(".clinerules", "workflows", "orphan.md") },
+    { target: "codebuddy", orphanPath: join(".codebuddy", "commands", "orphan.md") },
+    { target: "codewhale", orphanPath: join(".codewhale", "commands", "orphan.md") },
     { target: "kilo", orphanPath: join(".kilo", "commands", "orphan.md") },
     { target: "roo", orphanPath: join(".roo", "commands", "orphan.md") },
     { target: "kiro", orphanPath: join(".kiro", "prompts", "orphan.md") },
@@ -186,7 +243,9 @@ Check the PR diff and provide feedback.
     { target: "junie", orphanPath: join(".junie", "commands", "orphan.md") },
     { target: "pi", orphanPath: join(".pi", "prompts", "orphan.md") },
     { target: "factorydroid", orphanPath: join(".factory", "commands", "orphan.md") },
+    { target: "firebender", orphanPath: join(".firebender", "commands", "orphan.mdc") },
     { target: "goose", orphanPath: join(".goose", "recipes", "orphan.yaml") },
+    { target: "gitlabduo", orphanPath: join(".agents", "commands", "orphan.md") },
     { target: "grokcli", orphanPath: join(".grok", "commands", "orphan.md") },
     { target: "rovodev", orphanPath: join(".rovodev", "prompts", "orphan.md") },
   ])(
@@ -215,14 +274,111 @@ Check the PR diff and provide feedback.
       expect(await readFileContent(join(testDir, orphanPath))).toBe("# orphan\n");
     },
   );
+
+  it.skipIf(process.platform === "win32")(
+    "should keep both targets' commands when one commands directory is a link to the other",
+    async () => {
+      // `.cursor/commands -> .claude/commands` is one directory under two
+      // spellings, so the cursor sweep must not read the claudecode-only
+      // command as its orphan.
+      const testDir = getTestDir();
+      const stalePath = join(testDir, ".claude", "commands", "left-over.md");
+      await writeFileContent(
+        join(testDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "claude-only.md"),
+        [
+          "---",
+          'targets: ["claudecode"]',
+          'description: "Claude only"',
+          "---",
+          "Claude body.",
+        ].join("\n"),
+      );
+      await writeFileContent(stalePath, "# left over\n");
+      await ensureDir(join(testDir, ".cursor"));
+      await symlink(join(testDir, ".claude", "commands"), join(testDir, ".cursor", "commands"));
+
+      await runGenerate({ target: "claudecode,cursor", features: "commands", deleteFiles: true });
+
+      expect(
+        await readFileContent(join(testDir, ".claude", "commands", "claude-only.md")),
+      ).toContain("Claude body.");
+      expect(await fileExists(stalePath)).toBe(false);
+      await expect(
+        runGenerate({
+          target: "claudecode,cursor",
+          features: "commands",
+          deleteFiles: true,
+          check: true,
+          env: { NODE_ENV: "e2e" },
+        }),
+      ).resolves.toMatchObject({ stdout: expect.stringContaining("All files are up to date") });
+    },
+  );
 });
 
-describe("E2E: devin commands on the skills surface", () => {
+describe("E2E: commands on the skills surface", () => {
   const { getTestDir } = useTestDirectory();
 
-  it("should keep command outputs when skills --delete removes orphan skills", async () => {
-    const testDir = getTestDir();
+  it.each([
+    { target: "devin", skillsDir: join(".devin", "skills") },
+    { target: "kimi-code", skillsDir: join(".kimi-code", "skills") },
+  ])(
+    "should keep $target command outputs when skills --delete removes orphan skills",
+    async ({ target, skillsDir }) => {
+      const testDir = getTestDir();
 
+      await writeFileContent(
+        join(testDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "my-command.md"),
+        `---
+description: "My command"
+targets: ["*"]
+---
+Do the thing.
+`,
+      );
+      await writeFileContent(
+        join(testDir, ".rulesync", "skills", "my-skill", "SKILL.md"),
+        `---
+name: my-skill
+description: "My skill"
+targets: ["*"]
+---
+Skill body.
+`,
+      );
+      // An orphan skill dir no rulesync source produces anymore.
+      await writeFileContent(
+        join(testDir, skillsDir, "orphan-skill", "SKILL.md"),
+        "---\nname: orphan-skill\ndescription: stale\n---\nold\n",
+      );
+
+      await runGenerate({
+        target,
+        features: "commands,skills",
+        deleteFiles: true,
+        env: { NODE_ENV: "e2e" },
+      });
+
+      // The command-emitted SKILL.md survives the skills feature's orphan
+      // deletion (isDirOwned protection), the real skill is written, and the
+      // genuine orphan is cleaned up.
+      expect(await readFileContent(join(testDir, skillsDir, "my-command", "SKILL.md"))).toContain(
+        "Do the thing.",
+      );
+      expect(await readFileContent(join(testDir, skillsDir, "my-skill", "SKILL.md"))).toContain(
+        "Skill body.",
+      );
+      await expect(
+        readFileContent(join(testDir, skillsDir, "orphan-skill", "SKILL.md")),
+      ).rejects.toThrow();
+    },
+  );
+});
+
+describe("E2E: antigravity commands on the skills surface", () => {
+  const { getTestDir } = useTestDirectory();
+
+  const writeSources = async (testDir: string) => {
     await writeFileContent(
       join(testDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "my-command.md"),
       `---
@@ -232,41 +388,105 @@ targets: ["*"]
 Do the thing.
 `,
     );
+    // A command and a skill with the same name: the skill wins.
     await writeFileContent(
-      join(testDir, ".rulesync", "skills", "my-skill", "SKILL.md"),
+      join(testDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "shared-name.md"),
       `---
-name: my-skill
-description: "My skill"
+description: "Shadowed command"
+targets: ["*"]
+---
+Command body.
+`,
+    );
+    await writeFileContent(
+      join(testDir, ".rulesync", "skills", "shared-name", "SKILL.md"),
+      `---
+name: shared-name
+description: "Real skill"
 targets: ["*"]
 ---
 Skill body.
 `,
     );
-    // An orphan skill dir no rulesync source produces anymore.
+  };
+
+  it("should migrate generated workflows to skills and keep them through every shared-root sweep", async () => {
+    const testDir = getTestDir();
+    await writeSources(testDir);
+    // A workflow an earlier rulesync version generated, and an orphan skill.
     await writeFileContent(
-      join(testDir, ".devin", "skills", "orphan-skill", "SKILL.md"),
+      join(testDir, ".agents", "workflows", "my-command.md"),
+      "---\ndescription: My command\n---\nold\n",
+    );
+    await writeFileContent(
+      join(testDir, ".agents", "skills", "orphan-skill", "SKILL.md"),
       "---\nname: orphan-skill\ndescription: stale\n---\nold\n",
     );
 
+    // `codexcli` sweeps the same `.agents/skills/` root.
+    const target = "antigravity-ide,antigravity-cli,codexcli";
     await runGenerate({
-      target: "devin",
+      target,
       features: "commands,skills",
       deleteFiles: true,
       env: { NODE_ENV: "e2e" },
     });
 
-    // The command-emitted SKILL.md survives the skills feature's orphan
-    // deletion (isDirOwned protection), the real skill is written, and the
-    // genuine orphan is cleaned up.
+    const commandSkill = await readFileContent(
+      join(testDir, ".agents", "skills", "my-command", "SKILL.md"),
+    );
+    expect(commandSkill).toContain("name: my-command");
+    expect(commandSkill).toContain("Do the thing.");
     expect(
-      await readFileContent(join(testDir, ".devin", "skills", "my-command", "SKILL.md")),
-    ).toContain("Do the thing.");
-    expect(
-      await readFileContent(join(testDir, ".devin", "skills", "my-skill", "SKILL.md")),
+      await readFileContent(join(testDir, ".agents", "skills", "shared-name", "SKILL.md")),
     ).toContain("Skill body.");
+    expect(await fileExists(join(testDir, ".agents", "workflows", "my-command.md"))).toBe(false);
+    expect(await fileExists(join(testDir, ".agents", "skills", "orphan-skill"))).toBe(false);
+
     await expect(
-      readFileContent(join(testDir, ".devin", "skills", "orphan-skill", "SKILL.md")),
-    ).rejects.toThrow();
+      runGenerate({
+        target,
+        features: "commands,skills",
+        deleteFiles: true,
+        check: true,
+        env: { NODE_ENV: "e2e" },
+      }),
+    ).resolves.toMatchObject({ stdout: expect.stringContaining("All files are up to date") });
+  });
+
+  // `codexcli` shares the `.agents/skills/` tree without being an Antigravity
+  // target, so only the shared ownership check protects the command there.
+  it.each(["antigravity-ide", "codexcli"])(
+    "should keep command skills when a skills-only %s run deletes orphan skills",
+    async (skillsTarget) => {
+      const testDir = getTestDir();
+      await writeSources(testDir);
+
+      await runGenerate({ target: "antigravity-ide", features: "commands,skills" });
+      await runGenerate({
+        target: skillsTarget,
+        features: "skills",
+        deleteFiles: true,
+        env: { NODE_ENV: "e2e" },
+      });
+
+      expect(
+        await readFileContent(join(testDir, ".agents", "skills", "my-command", "SKILL.md")),
+      ).toContain("Do the thing.");
+    },
+  );
+
+  it("should not import command skills as rulesync skills", async () => {
+    const testDir = getTestDir();
+    await writeSources(testDir);
+
+    await runGenerate({ target: "antigravity-ide", features: "commands,skills" });
+    await runImport({ target: "codexcli", features: "skills" });
+
+    expect(await fileExists(join(testDir, ".rulesync", "skills", "my-command"))).toBe(false);
+    expect(
+      await readFileContent(join(testDir, ".rulesync", "skills", "shared-name", "SKILL.md")),
+    ).toContain("Skill body.");
   });
 });
 
@@ -277,9 +497,18 @@ describe("E2E: commands (import)", () => {
     { target: "claudecode", sourcePath: join(".claude", "commands", "review-pr.md") },
     { target: "cursor", sourcePath: join(".cursor", "commands", "review-pr.md") },
     { target: "augmentcode", sourcePath: join(".augment", "commands", "review-pr.md") },
+    { target: "bob", sourcePath: join(".bob", "commands", "review-pr.md") },
+    { target: "continue", sourcePath: join(".continue", "prompts", "review-pr.md") },
+    { target: "commandcode", sourcePath: join(".commandcode", "commands", "review-pr.md") },
+    { target: "qoder", sourcePath: join(".qoder", "commands", "review-pr.md") },
+    { target: "trae", sourcePath: join(".trae", "commands", "review-pr.md") },
     { target: "copilot", sourcePath: join(".github", "prompts", "review-pr.prompt.md") },
+    { target: "mimocode", sourcePath: join(".mimocode", "commands", "review-pr.md") },
+    { target: "omp", sourcePath: join(".omp", "commands", "review-pr.md") },
     { target: "opencode", sourcePath: join(".opencode", "commands", "review-pr.md") },
     { target: "cline", sourcePath: join(".clinerules", "workflows", "review-pr.md") },
+    { target: "codebuddy", sourcePath: join(".codebuddy", "commands", "review-pr.md") },
+    { target: "codewhale", sourcePath: join(".codewhale", "commands", "review-pr.md") },
     { target: "kilo", sourcePath: join(".kilo", "commands", "review-pr.md") },
     { target: "roo", sourcePath: join(".roo", "commands", "review-pr.md") },
     { target: "kiro", sourcePath: join(".kiro", "prompts", "review-pr.md") },
@@ -288,7 +517,10 @@ describe("E2E: commands (import)", () => {
     { target: "junie", sourcePath: join(".junie", "commands", "review-pr.md") },
     { target: "pi", sourcePath: join(".pi", "prompts", "review-pr.md") },
     { target: "factorydroid", sourcePath: join(".factory", "commands", "review-pr.md") },
+    { target: "firebender", sourcePath: join(".firebender", "commands", "review-pr.mdc") },
+    { target: "gitlabduo", sourcePath: join(".agents", "commands", "review-pr.md") },
     { target: "grokcli", sourcePath: join(".grok", "commands", "review-pr.md") },
+    { target: "lettacode", sourcePath: join(".commands", "review-pr.md") },
     { target: "reasonix", sourcePath: join(".reasonix", "commands", "review-pr.md") },
     { target: "rovodev", sourcePath: join(".rovodev", "prompts", "review-pr.md") },
   ])("should import $target commands", async ({ target, sourcePath }) => {
@@ -298,6 +530,28 @@ describe("E2E: commands (import)", () => {
     await writeFileContent(join(testDir, sourcePath), commandContent);
 
     await runImport({ target, features: "commands" });
+
+    const importedContent = await readFileContent(
+      join(testDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "review-pr.md"),
+    );
+    expect(importedContent).toContain("Review the PR diff and provide feedback.");
+  });
+
+  it("should import tabnine commands (TOML)", async () => {
+    const testDir = getTestDir();
+
+    const commandToml = [
+      'description = "Review a pull request"',
+      'prompt = """',
+      "Review the PR diff and provide feedback.",
+      '"""',
+    ].join("\n");
+    await writeFileContent(
+      join(testDir, ".tabnine", "agent", "commands", "review-pr.toml"),
+      commandToml,
+    );
+
+    await runImport({ target: "tabnine", features: "commands" });
 
     const importedContent = await readFileContent(
       join(testDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "review-pr.md"),
@@ -429,6 +683,67 @@ Check the PR diff and provide feedback.
       expect(generatedContent).toContain("Check the PR diff and provide feedback.");
     },
   );
+
+  it("should import antigravity-ide global workflows from the 2.0 and pre-2.0 directories", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+    await writeFileContent(
+      join(homeDir, ".gemini", "config", "workflows", "review-pr.md"),
+      "---\ndescription: Review a pull request\n---\nCurrent global workflow body\n",
+    );
+    await writeFileContent(
+      join(homeDir, ".gemini", "antigravity", "global_workflows", "review-pr.md"),
+      "---\ndescription: Old duplicate\n---\nShadowed workflow body\n",
+    );
+    await writeFileContent(
+      join(homeDir, ".gemini", "antigravity", "global_workflows", "deploy.md"),
+      "---\ndescription: Deploy\n---\nPre-2.0 global workflow body\n",
+    );
+
+    await runImport({
+      target: "antigravity-ide",
+      features: "commands",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const reviewPr = await readFileContent(
+      join(projectDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "review-pr.md"),
+    );
+    expect(reviewPr).toContain("Current global workflow body");
+    expect(reviewPr).not.toContain("Shadowed workflow body");
+    const deploy = await readFileContent(
+      join(projectDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "deploy.md"),
+    );
+    expect(deploy).toContain("Pre-2.0 global workflow body");
+  });
+
+  it("should sweep only the 2.0 antigravity-ide global workflows directory with --delete", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+    await writeFileContent(
+      join(projectDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "review-pr.md"),
+      '---\nroot: true\ndescription: "Review a pull request"\ntargets: ["*"]\n---\nReview it.\n',
+    );
+    const currentWorkflow = join(homeDir, ".gemini", "config", "workflows", "orphan.md");
+    const preV2Workflow = join(homeDir, ".gemini", "antigravity", "global_workflows", "orphan.md");
+    await writeFileContent(currentWorkflow, "---\ndescription: Orphan\n---\nOrphan\n");
+    await writeFileContent(preV2Workflow, "---\ndescription: Orphan\n---\nOrphan\n");
+
+    await runGenerate({
+      target: "antigravity-ide",
+      features: "commands",
+      global: true,
+      deleteFiles: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    expect(await fileExists(currentWorkflow)).toBe(false);
+    expect(await fileExists(preV2Workflow)).toBe(true);
+    expect(
+      await fileExists(join(homeDir, ".gemini", "config", "skills", "review-pr", "SKILL.md")),
+    ).toBe(true);
+  });
 
   it("should ignore non-root commands in global mode", async () => {
     const projectDir = getProjectDir();

@@ -30,7 +30,7 @@ describe("DeepagentsSkill", () => {
 
     it("should return the user-level path for global mode", () => {
       const paths = DeepagentsSkill.getSettablePaths({ global: true });
-      expect(paths.relativeDirPath).toBe(join(".deepagents", "deepagents", "skills"));
+      expect(paths.relativeDirPath).toBe(join(".deepagents", "agent", "skills"));
     });
   });
 
@@ -98,6 +98,39 @@ Do the thing.`;
 
       expect(skill.getFrontmatter().name).toBe("My Skill");
       expect(skill.getFrontmatter().description).toBe("A useful skill.");
+    });
+
+    it("should import the packaging metadata in the shapes YAML actually produces", async () => {
+      const skillDir = join(testDir, ".deepagents", "skills", "packaged-skill");
+      // dcode never hard-fails on these fields: it coerces with `str()`,
+      // truncates an overlong `compatibility`, and drops non-dict `metadata`
+      // with a warning, so none of them may fail the import of a SKILL.md it
+      // happily loads.
+      const skillContent = `---
+name: packaged-skill
+description: A skill shared through a catalog
+license: MIT
+compatibility:
+  - deepagents
+  - claude-code
+metadata: platform-team
+---
+
+Packaged body`;
+      await writeFileContent(join(skillDir, SKILL_FILE_NAME), skillContent);
+
+      const skill = await DeepagentsSkill.fromDir({
+        outputRoot: testDir,
+        dirName: "packaged-skill",
+        global: false,
+      });
+
+      const section = skill.toRulesyncSkill().getFrontmatter().deepagents;
+      expect(section).toEqual({
+        license: "MIT",
+        compatibility: ["deepagents", "claude-code"],
+        metadata: "platform-team",
+      });
     });
   });
 
@@ -176,6 +209,51 @@ Do the thing.`;
       expect(frontmatter.license).toBe("MIT");
       expect(frontmatter.compatibility).toEqual({ "deepagents-version": ">=0.1.0" });
       expect(frontmatter.metadata).toEqual({ author: "rulesync" });
+    });
+
+    it("should fall back to the root-level license/compatibility/metadata when the deepagents section omits them", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        dirName: "root-fields",
+        frontmatter: {
+          name: "root-fields",
+          description: "Root-level standard fields",
+          license: "MIT",
+          compatibility: "Requires git",
+          metadata: { author: "root" },
+        },
+        body: "Body",
+      });
+
+      const frontmatter = DeepagentsSkill.fromRulesyncSkill({ rulesyncSkill }).getFrontmatter();
+      expect(frontmatter.license).toBe("MIT");
+      expect(frontmatter.compatibility).toBe("Requires git");
+      expect(frontmatter.metadata).toEqual({ author: "root" });
+    });
+
+    it("should let the deepagents section override the root-level license/compatibility/metadata", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        dirName: "section-wins",
+        frontmatter: {
+          name: "section-wins",
+          description: "Section overrides the root-level fields",
+          license: "MIT",
+          compatibility: "Requires git",
+          metadata: { author: "root" },
+          deepagents: {
+            license: "Apache-2.0",
+            compatibility: "Requires jq",
+            metadata: { author: "section" },
+          },
+        },
+        body: "Body",
+      });
+
+      const frontmatter = DeepagentsSkill.fromRulesyncSkill({ rulesyncSkill }).getFrontmatter();
+      expect(frontmatter.license).toBe("Apache-2.0");
+      expect(frontmatter.compatibility).toBe("Requires jq");
+      expect(frontmatter.metadata).toEqual({ author: "section" });
     });
   });
 
@@ -340,5 +418,48 @@ Do the thing.`;
       expect(skill.getDirName()).toBe("my-skill");
       expect(skill.getBody()).toBe("");
     });
+  });
+});
+
+describe("DeepagentsSkill with DEEPAGENTS_HOME", () => {
+  const originalDeepagentsHome = process.env.DEEPAGENTS_HOME;
+  const originalHomeDir = process.env.HOME_DIR;
+
+  beforeEach(() => {
+    // `getDeepagentsHome` compares the override against the home directory,
+    // which the test environment refuses to resolve without `HOME_DIR`.
+    process.env.HOME_DIR = "/rulesync-home";
+  });
+
+  afterEach(() => {
+    if (originalDeepagentsHome === undefined) delete process.env.DEEPAGENTS_HOME;
+    else process.env.DEEPAGENTS_HOME = originalDeepagentsHome;
+    if (originalHomeDir === undefined) delete process.env.HOME_DIR;
+    else process.env.HOME_DIR = originalHomeDir;
+  });
+
+  it("drops the .deepagents prefix in global scope when DEEPAGENTS_HOME is set", () => {
+    process.env.DEEPAGENTS_HOME = "/custom-deepagents";
+    expect(DeepagentsSkill.getSettablePaths({ global: true })).toEqual({
+      relativeDirPath: join("agent", "skills"),
+    });
+    expect(DeepagentsSkill.getSettablePaths({ global: false })).toEqual({
+      relativeDirPath: join(".deepagents", "skills"),
+    });
+  });
+
+  it("imports back into the rulesync home rather than the profile root", () => {
+    process.env.HOME_DIR = "/rulesync-home";
+    process.env.DEEPAGENTS_HOME = "/custom-deepagents";
+    const skill = new DeepagentsSkill({
+      outputRoot: "/custom-deepagents",
+      relativeDirPath: join("agent", "skills"),
+      dirName: "my-skill",
+      frontmatter: { name: "My Skill", description: "Does something." },
+      body: "Instructions.",
+      global: true,
+    });
+
+    expect(skill.toRulesyncSkill().getOutputRoot()).toBe("/rulesync-home");
   });
 });

@@ -17,7 +17,13 @@ import {
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
 import { fallbackLogger, type Logger } from "../../utils/logger.js";
+import {
+  ANTIGRAVITY_COMMAND_ACTIONS,
+  importAntigravityCommandTarget,
+} from "./antigravity-command-patterns.js";
+import { buildAntigravityPermissionEntry } from "./antigravity-targets.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+import { honorAllToolsOnBash } from "./shell-command-categories.js";
 import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
@@ -77,7 +83,9 @@ function pickDocumentedValue({
  *
  * The CLI reuses the Claude-Code-style `permissions.allow/ask/deny` arrays of
  * `Tool(pattern)` entries rather than the Gemini-CLI TOML Policy Engine, so the
- * conversion logic mirrors {@link ClaudecodePermissions}.
+ * conversion logic mirrors {@link ClaudecodePermissions}. Only the syntax is
+ * shared: no target is a glob, so patterns are translated (see
+ * `antigravity-targets.ts`).
  */
 type AntigravityCliSettingsJson = {
   permissions?: {
@@ -92,7 +100,8 @@ type AntigravityCliSettingsJson = {
  * Deliberate mapping from rulesync canonical permission categories to the
  * Antigravity CLI Fine-Grained Permissions Engine action vocabulary
  * (`read_file`, `write_file`, `read_url`, `command`, `mcp`, plus `execute_url` /
- * `unsandboxed` which have no canonical equivalent and pass through). `edit` and
+ * `unsandboxed` which have no canonical equivalent and keep their names; their
+ * targets are translated like `read_url` / `command` ones). `edit` and
  * `write` both map to `write_file`, and `webfetch` / `websearch` both map to
  * `read_url`; on import those collapse to the canonical `write` / `webfetch`
  * form (a documented, lossy normalization). This shares the action vocabulary of
@@ -127,7 +136,7 @@ function toCanonicalToolName(cliName: string): string {
 }
 
 /**
- * Parse an Antigravity CLI permission entry like "command(npm run *)" into tool
+ * Parse an Antigravity CLI permission entry like "command(npm run)" into tool
  * name and pattern. The tool name is everything before the first "(" and the
  * pattern is everything up to the final ")", so patterns that themselves
  * contain parentheses (e.g. "command(echo (a))") round-trip correctly — this
@@ -147,17 +156,6 @@ function parsePermissionEntry(entry: string): { toolName: string; pattern: strin
   }
   const pattern = entry.slice(parenIndex + 1, -1);
   return { toolName, pattern: pattern || "*" };
-}
-
-/**
- * Build an Antigravity CLI permission entry like "command(npm run *)".
- * If the pattern is "*", returns just the tool name.
- */
-function buildPermissionEntry(toolName: string, pattern: string): string {
-  if (pattern === "*") {
-    return toolName;
-  }
-  return `${toolName}(${pattern})`;
 }
 
 /**
@@ -213,6 +211,7 @@ export class AntigravityCliPermissions extends ToolPermissions {
   static async fromRulesyncPermissions({
     outputRoot = process.cwd(),
     rulesyncPermissions,
+    logger = moduleLogger,
   }: ToolPermissionsFromRulesyncPermissionsParams): Promise<AntigravityCliPermissions> {
     const paths = AntigravityCliPermissions.getSettablePaths();
     const filePath = join(outputRoot, paths.relativeDirPath, paths.relativeFilePath);
@@ -228,7 +227,7 @@ export class AntigravityCliPermissions extends ToolPermissions {
     }
 
     const config = rulesyncPermissions.getJson();
-    const { allow, ask, deny } = convertRulesyncToAntigravityCliPermissions(config);
+    const { allow, ask, deny } = convertRulesyncToAntigravityCliPermissions({ config, logger });
 
     // Determine which tool names are managed by the permissions config
     const managedToolNames = new Set(
@@ -384,7 +383,13 @@ export class AntigravityCliPermissions extends ToolPermissions {
 /**
  * Convert rulesync permissions config to Antigravity CLI allow/ask/deny arrays.
  */
-function convertRulesyncToAntigravityCliPermissions(config: PermissionsConfig): {
+function convertRulesyncToAntigravityCliPermissions({
+  config,
+  logger,
+}: {
+  config: PermissionsConfig;
+  logger: Logger;
+}): {
   allow: string[];
   ask: string[];
   deny: string[];
@@ -393,10 +398,20 @@ function convertRulesyncToAntigravityCliPermissions(config: PermissionsConfig): 
   const ask: string[] = [];
   const deny: string[] = [];
 
-  for (const [category, rules] of Object.entries(config.permission)) {
+  for (const [category, rules] of Object.entries(honorAllToolsOnBash(config.permission))) {
     const cliToolName = toAntigravityCliToolName(category);
     for (const [pattern, action] of Object.entries(rules)) {
-      const entry = buildPermissionEntry(cliToolName, pattern);
+      const entry = buildAntigravityPermissionEntry({
+        action: cliToolName,
+        category,
+        pattern,
+        decision: action,
+        logger,
+        toolLabel: "Antigravity CLI",
+      });
+      if (entry === undefined) {
+        continue;
+      }
       switch (action) {
         case "allow":
           allow.push(entry);
@@ -411,7 +426,9 @@ function convertRulesyncToAntigravityCliPermissions(config: PermissionsConfig): 
     }
   }
 
-  return { allow, ask, deny };
+  // Two patterns can translate to the same entry (`npm run *` and
+  // `npm   run *`, or two denies widened to the same words), so drop repeats.
+  return { allow: [...new Set(allow)], ask: [...new Set(ask)], deny: [...new Set(deny)] };
 }
 
 /**
@@ -426,8 +443,17 @@ function convertAntigravityCliToRulesyncPermissions(params: {
 
   const processEntries = (entries: string[], action: PermissionAction) => {
     for (const entry of entries) {
-      const { toolName, pattern } = parsePermissionEntry(entry);
+      const { toolName, pattern: target } = parsePermissionEntry(entry);
       const canonical = toCanonicalToolName(toolName);
+      const pattern = ANTIGRAVITY_COMMAND_ACTIONS.has(toolName)
+        ? importAntigravityCommandTarget({
+            target,
+            entry,
+            decision: action,
+            logger: moduleLogger,
+            toolLabel: "Antigravity CLI",
+          })
+        : target;
       if (!permission[canonical]) {
         permission[canonical] = {};
       }

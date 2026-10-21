@@ -37,7 +37,7 @@ describe("CursorHooks", () => {
   });
 
   describe("fromRulesyncHooks", () => {
-    it("should filter shared hooks to Cursor-supported events only", () => {
+    it("should filter shared hooks to Cursor-supported events only", async () => {
       const config = {
         version: 1,
         hooks: {
@@ -54,7 +54,7 @@ describe("CursorHooks", () => {
         validate: false,
       });
 
-      const cursorHooks = CursorHooks.fromRulesyncHooks({
+      const cursorHooks = await CursorHooks.fromRulesyncHooks({
         outputRoot: testDir,
         rulesyncHooks,
         validate: false,
@@ -67,7 +67,7 @@ describe("CursorHooks", () => {
       expect(parsed.hooks.notification).toBeUndefined();
     });
 
-    it("should emit the workspaceOpen event and pass through failClosed", () => {
+    it("should emit the workspaceOpen event and pass through failClosed", async () => {
       const config = {
         version: 1,
         hooks: {
@@ -84,18 +84,57 @@ describe("CursorHooks", () => {
       });
 
       const parsed = JSON.parse(
-        CursorHooks.fromRulesyncHooks({
-          outputRoot: testDir,
-          rulesyncHooks,
-          validate: false,
-        }).getFileContent(),
+        (
+          await CursorHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks,
+            validate: false,
+          })
+        ).getFileContent(),
       );
       expect(parsed.hooks.workspaceOpen).toHaveLength(1);
       expect(parsed.hooks.workspaceOpen[0].command).toBe(".cursor/hooks/on-open.sh");
       expect(parsed.hooks.beforeShellExecution[0].failClosed).toBe(true);
     });
 
-    it("should merge config.cursor.hooks on top of shared hooks", () => {
+    it("should forward the prompt-hook model override and drop it from command hooks", async () => {
+      const config = {
+        version: 1,
+        hooks: {
+          beforeShellExecution: [
+            { type: "prompt", prompt: "Is this command safe?", model: "custom-model-name" },
+            { command: ".cursor/hooks/guard.sh", model: "ignored-on-command-hooks" },
+          ],
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const parsed = JSON.parse(
+        (
+          await CursorHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks,
+            validate: false,
+          })
+        ).getFileContent(),
+      );
+      expect(parsed.hooks.beforeShellExecution[0]).toEqual({
+        type: "prompt",
+        prompt: "Is this command safe?",
+        model: "custom-model-name",
+      });
+      expect(parsed.hooks.beforeShellExecution[1]).toEqual({
+        command: ".cursor/hooks/guard.sh",
+      });
+    });
+
+    it("should merge config.cursor.hooks on top of shared hooks", async () => {
       const config = {
         version: 1,
         hooks: {
@@ -116,7 +155,7 @@ describe("CursorHooks", () => {
         validate: false,
       });
 
-      const cursorHooks = CursorHooks.fromRulesyncHooks({
+      const cursorHooks = await CursorHooks.fromRulesyncHooks({
         outputRoot: testDir,
         rulesyncHooks,
         validate: false,
@@ -129,7 +168,7 @@ describe("CursorHooks", () => {
       expect(parsed.hooks.afterFileEdit[0].command).toBe(".cursor/hooks/format.sh");
     });
 
-    it("should preserve version from config", () => {
+    it("should preserve version from config", async () => {
       const config = { version: 2, hooks: { sessionStart: [] } };
       const rulesyncHooks = new RulesyncHooks({
         outputRoot: testDir,
@@ -139,7 +178,7 @@ describe("CursorHooks", () => {
         validate: false,
       });
 
-      const cursorHooks = CursorHooks.fromRulesyncHooks({
+      const cursorHooks = await CursorHooks.fromRulesyncHooks({
         outputRoot: testDir,
         rulesyncHooks,
         validate: false,
@@ -148,6 +187,83 @@ describe("CursorHooks", () => {
       const content = cursorHooks.getFileContent();
       const parsed = JSON.parse(content);
       expect(parsed.version).toBe(2);
+    });
+
+    it("should keep an existing third-party command on regenerate when preserveUnowned is set", async () => {
+      await ensureDir(join(testDir, ".cursor"));
+      await writeFileContent(
+        join(testDir, ".cursor", "hooks.json"),
+        JSON.stringify({
+          version: 1,
+          hooks: {
+            sessionStart: [{ command: "shared.sh" }, { command: "other-tool-hook cursor-hook" }],
+          },
+        }),
+      );
+
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: { sessionStart: [{ type: "command", command: "shared.sh" }] },
+        }),
+        validate: false,
+      });
+
+      const parsed = JSON.parse(
+        (
+          await CursorHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks,
+            preserveUnowned: true,
+            validate: false,
+          })
+        ).getFileContent(),
+      );
+      const commands = parsed.hooks.sessionStart.map(
+        (handler: { command: string }) => handler.command,
+      );
+      expect(commands).toEqual(["shared.sh", "other-tool-hook cursor-hook"]);
+    });
+
+    it("should replace existing third-party commands unless preserveUnowned is set", async () => {
+      await ensureDir(join(testDir, ".cursor"));
+      await writeFileContent(
+        join(testDir, ".cursor", "hooks.json"),
+        JSON.stringify({
+          version: 1,
+          hooks: {
+            sessionStart: [{ command: "shared.sh" }, { command: "other-tool-hook cursor-hook" }],
+          },
+        }),
+      );
+
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: { sessionStart: [{ type: "command", command: "shared.sh" }] },
+        }),
+        validate: false,
+      });
+
+      const parsed = JSON.parse(
+        (
+          await CursorHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks,
+            validate: false,
+          })
+        ).getFileContent(),
+      );
+      const commands = parsed.hooks.sessionStart.map(
+        (handler: { command: string }) => handler.command,
+      );
+      expect(commands).toEqual(["shared.sh"]);
     });
   });
 
@@ -173,6 +289,35 @@ describe("CursorHooks", () => {
       expect(json.hooks.afterFileEdit).toHaveLength(1);
       expect(json.version).toBe(1);
     });
+
+    it("should carry an event named toString through as a plain string key (#2757)", () => {
+      const cursorHooks = new CursorHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".cursor",
+        relativeFilePath: "hooks.json",
+        // JSON.parse yields an own enumerable `toString` key, unlike an object
+        // literal whose `toString` the lookup map would inherit from
+        // Object.prototype.
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: {
+            sessionStart: [{ type: "command", command: "echo start" }],
+            toString: [{ type: "command", command: "echo crafted" }],
+          },
+        }),
+        validate: false,
+      });
+
+      const json = cursorHooks.toRulesyncHooks().getJson();
+      expect(json.hooks.sessionStart?.[0]?.command).toBe("echo start");
+      expect(Object.keys(json.hooks)).toEqual(["sessionStart"]);
+      // The unmapped name must fall through verbatim rather than resolving to
+      // Object.prototype.toString and landing under its stringified source.
+      const overrideHooks = (json as { cursor?: { hooks?: Record<string, unknown[]> } }).cursor
+        ?.hooks;
+      expect(Object.keys(overrideHooks ?? {})).toEqual(["toString"]);
+      expect(overrideHooks?.["toString"]?.[0]).toMatchObject({ command: "echo crafted" });
+    });
   });
 
   describe("round-trip", () => {
@@ -192,7 +337,7 @@ describe("CursorHooks", () => {
         validate: false,
       });
 
-      const cursorHooks = CursorHooks.fromRulesyncHooks({
+      const cursorHooks = await CursorHooks.fromRulesyncHooks({
         outputRoot: testDir,
         rulesyncHooks,
         validate: false,

@@ -14,6 +14,7 @@ import { RulesyncIgnore } from "../features/ignore/rulesync-ignore.js";
 import { KiloMcp } from "../features/mcp/kilo-mcp.js";
 import { RulesyncMcp } from "../features/mcp/rulesync-mcp.js";
 import { ClaudecodePermissions } from "../features/permissions/claudecode-permissions.js";
+import { KiloPermissions } from "../features/permissions/kilo-permissions.js";
 import { ReasonixPermissions } from "../features/permissions/reasonix-permissions.js";
 import { RulesyncPermissions } from "../features/permissions/rulesync-permissions.js";
 import { setupTestDirectory } from "../test-utils/test-directories.js";
@@ -115,27 +116,27 @@ describe("shared output file data-loss regressions", () => {
         permissions?: { deny?: string[] };
       };
 
-    it("preserves ignore-written Read deny entries when permissions writes afterward", async () => {
+    it("preserves ignore-written read deny entries when permissions writes afterward", async () => {
       await writeIgnore();
       // "read" is NOT managed by this permissions config, so the ignore-written
-      // Read deny entries must survive alongside the Bash entry.
+      // read_file deny entries must survive alongside the Bash entry.
       await writePermissions({ bash: { "rm *": "deny" } });
 
       const config = await readConfig();
-      expect(config.permissions?.deny).toContain("Read(.env)");
-      expect(config.permissions?.deny).toContain("Read(secrets/**)");
+      expect(config.permissions?.deny).toContain("read_file(.env)");
+      expect(config.permissions?.deny).toContain("read_file(secrets/**)");
       expect(config.permissions?.deny).toContain("Bash(rm *)");
     });
 
-    it("lets permissions' explicit Read rules win over ignore-derived denies", async () => {
+    it("lets permissions' explicit read rules win over ignore-derived denies", async () => {
       await writeIgnore();
       // Documented cross-feature rule (same as .claude/settings.json): once the
       // permissions config manages the `read` category, its rules are
-      // authoritative and the ignore-derived Read denies are replaced.
+      // authoritative and the ignore-derived read_file denies are replaced.
       await writePermissions({ read: { "**/*.pem": "deny" } });
 
       const config = await readConfig();
-      expect(config.permissions?.deny).toEqual(["Read(**/*.pem)"]);
+      expect(config.permissions?.deny).toEqual(["read_file(**/*.pem)"]);
     });
 
     it("preserves the mcp plugins block written before either feature", async () => {
@@ -150,14 +151,14 @@ describe("shared output file data-loss regressions", () => {
         plugins?: unknown[];
       };
       expect(config.plugins).toEqual([{ name: "example", command: "node" }]);
-      expect(config.permissions?.deny).toContain("Read(.env)");
+      expect(config.permissions?.deny).toContain("read_file(.env)");
     });
   });
 
   describe("kilo.jsonc (mcp before rules)", () => {
-    it("preserves the mcp/tools block when rules registers instructions afterward", async () => {
-      // 1. mcp feature writes the `mcp` (and `tools`) block to kilo.jsonc.
-      //    `enabledTools` produces a top-level `tools` map so we can assert it is
+    it("preserves the mcp/permission block when rules registers instructions afterward", async () => {
+      // 1. mcp feature writes the `mcp` (and `permission`) block to kilo.jsonc.
+      //    `enabledTools` produces a `permission` key so we can assert it is
       //    preserved too, not just the `mcp` block.
       const rulesyncMcp = new RulesyncMcp({
         relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
@@ -184,14 +185,61 @@ describe("shared output file data-loss regressions", () => {
       if (rules === null) throw new Error("expected a registrar result");
       await writeFileContent(rules.getFilePath(), rules.getFileContent());
 
-      // 3. The on-disk file must contain BOTH the mcp/tools block and the
+      // 3. The on-disk file must contain BOTH the mcp/permission block and the
       //    instructions.
       const finalContent = await readFileContent(join(testDir, "kilo.jsonc"));
       const kilo = JSON.parse(finalContent);
       expect(kilo.mcp["test-server"]).toBeDefined();
       expect(kilo.mcp["test-server"].type).toBe("local");
-      expect(kilo.tools["test-server_search"]).toBe(true);
+      expect(kilo.permission["test-server_search"]).toBe("allow");
       expect(kilo.instructions).toContain(join(".kilo", "rules", "coding.md"));
+    });
+  });
+  describe("kilo.jsonc (mcp before permissions)", () => {
+    const writeMcp = async () => {
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({
+          mcpServers: {
+            github: { command: "gh-mcp", disabledTools: ["delete_repo"] },
+          },
+        }),
+      });
+      const mcp = await KiloMcp.fromRulesyncMcp({ outputRoot: testDir, rulesyncMcp });
+      await writeFileContent(mcp.getFilePath(), mcp.getFileContent());
+    };
+    const writePermissions = async () => {
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({
+          permission: { bash: { "rm *": "deny" }, "*": { "*": "allow" } },
+        }),
+      });
+      const permissions = await KiloPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+      });
+      await writeFileContent(permissions.getFilePath(), permissions.getFileContent());
+    };
+
+    it("keeps an MCP disabledTools deny after the permissions catch-all", async () => {
+      // Kilo evaluates `permission` last-match-wins in key order, so the
+      // catch-all the permissions feature appends must not end up after the deny.
+      await writeMcp();
+      await writePermissions();
+      // A regenerate must keep the order too.
+      await writeMcp();
+      await writePermissions();
+
+      const kilo = JSON.parse(await readFileContent(join(testDir, "kilo.jsonc")));
+      expect(kilo.permission).toEqual({
+        "*": { "*": "allow" },
+        github_delete_repo: "deny",
+        bash: { "rm *": "deny" },
+      });
+      expect(Object.keys(kilo.permission).at(-1)).toBe("github_delete_repo");
     });
   });
 });

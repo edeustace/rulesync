@@ -36,11 +36,11 @@ import {
 import type { OutputRoots } from "./config.js";
 
 /**
- * CLI-resolvable params exclude `sources` and `flattenedCommandNaming` — they
- * are config-file-only.
+ * CLI-resolvable params exclude `sources`, `flattenedCommandNaming`, and
+ * `language` — they are config-file-only.
  */
 export type ConfigResolverResolveParams = Partial<
-  Omit<ConfigParams, "sources" | "flattenedCommandNaming"> & {
+  Omit<ConfigParams, "sources" | "flattenedCommandNaming" | "language"> & {
     configPath: string;
   }
 >;
@@ -48,9 +48,11 @@ export type ConfigResolverResolveParams = Partial<
 // `inputRoot`/`inputRoots` are intentionally optional — omitting them means
 // "use CWD". All other fields are concrete defaults so callers (and the
 // resolver) can rely on `getDefaults().<field>` being populated.
-type ConfigDefaults = Omit<RequiredConfigParams, "inputRoot" | "inputRoots"> & {
+type ConfigDefaults = Omit<RequiredConfigParams, "inputRoot" | "inputRoots" | "language"> & {
   inputRoot?: string;
   inputRoots?: string[];
+  // `language` has no default on purpose: "unset" is the meaningful state.
+  language?: RequiredConfigParams["language"];
   configPath: string;
 };
 
@@ -66,6 +68,8 @@ const getDefaults = (): ConfigDefaults => ({
   simulateCommands: false,
   simulateSubagents: false,
   simulateSkills: false,
+  preserveUnownedHooks: false,
+  deriveSubprojectPathFromGlobs: false,
   flattenedCommandNaming: "basename",
   gitignoreTargetsOnly: true,
   gitignoreDestination: "gitignore",
@@ -142,7 +146,11 @@ const mergeConfigs = (
     simulateCommands: localConfig.simulateCommands ?? baseConfig.simulateCommands,
     simulateSubagents: localConfig.simulateSubagents ?? baseConfig.simulateSubagents,
     simulateSkills: localConfig.simulateSkills ?? baseConfig.simulateSkills,
+    preserveUnownedHooks: localConfig.preserveUnownedHooks ?? baseConfig.preserveUnownedHooks,
+    deriveSubprojectPathFromGlobs:
+      localConfig.deriveSubprojectPathFromGlobs ?? baseConfig.deriveSubprojectPathFromGlobs,
     flattenedCommandNaming: localConfig.flattenedCommandNaming ?? baseConfig.flattenedCommandNaming,
+    language: localConfig.language ?? baseConfig.language,
     gitignoreTargetsOnly: localConfig.gitignoreTargetsOnly ?? baseConfig.gitignoreTargetsOnly,
     gitignoreDestination: localConfig.gitignoreDestination ?? baseConfig.gitignoreDestination,
     dryRun: localConfig.dryRun ?? baseConfig.dryRun,
@@ -344,6 +352,72 @@ export function resolveEffectiveInputRoots({
   };
 }
 
+/**
+ * Retirement deletes files nothing regenerates afterwards, so everything about
+ * it has to be named on the command line rather than inferred:
+ * - It only runs over the configuration's full target list: a `--targets` run
+ *   skips configured targets, which then claim none of the files they share
+ *   with a retired one.
+ * - The features to retire must be listed explicitly. The retired tool is no
+ *   longer in the configuration, so nothing records which of its features
+ *   Rulesync generated, and sweeping every feature would delete hand-written
+ *   files (such as `.vscode/mcp.json`) it never owned.
+ */
+function assertRetireTargetsExplicit({
+  retireTargets,
+  targets,
+  features,
+}: {
+  retireTargets?: unknown[];
+  targets?: unknown;
+  features?: unknown;
+}): void {
+  if (retireTargets === undefined || retireTargets.length === 0) return;
+  if (targets !== undefined) {
+    throw new Error("--retire-targets cannot be combined with --targets.");
+  }
+  if (!Array.isArray(features) || features.length === 0 || features.includes("*")) {
+    throw new Error(
+      "--retire-targets requires --features listing the features Rulesync generated for the retired tool(s) ('*' is not allowed).",
+    );
+  }
+}
+
+/**
+ * The CLI `--features` of a retiring run names the features to retire. It also
+ * scopes the run as usual — except with object-form `targets`, where per-target
+ * features live in the configuration file and a CLI `features` list may not
+ * replace them, and when a retired tool is still configured (only some of its
+ * features are retired), where scoping the run to those features would
+ * generate exactly what is being retired. In both cases the run keeps the
+ * configured features. Only the file's `targets` decides: `--targets` cannot
+ * be combined with `--retire-targets` (see `assertRetireTargetsExplicit`).
+ */
+function splitRetireFeatures({
+  features,
+  retireTargets,
+  configByFile,
+}: {
+  features: ConfigResolverResolveParams["features"];
+  retireTargets: ConfigResolverResolveParams["retireTargets"];
+  configByFile: PartialConfigParams;
+}): {
+  runFeatures: ConfigResolverResolveParams["features"];
+  retireFeatures: ConfigResolverResolveParams["features"];
+} {
+  if (retireTargets === undefined || retireTargets.length === 0) {
+    return { runFeatures: features, retireFeatures: undefined };
+  }
+  const targetsIsObject =
+    configByFile.targets !== undefined && !Array.isArray(configByFile.targets);
+  const configuredTargets = new Set(extractConfigFileTargets(configByFile.targets));
+  const retiresConfiguredTarget = retireTargets.some((target) => configuredTargets.has(target));
+  return {
+    runFeatures: targetsIsObject || retiresConfiguredTarget ? undefined : features,
+    retireFeatures: features,
+  };
+}
+
 // oxlint-disable-next-line no-extraneous-class
 export class ConfigResolver {
   public static async resolve(
@@ -359,9 +433,11 @@ export class ConfigResolver {
       simulateCommands,
       simulateSubagents,
       simulateSkills,
+      deriveSubprojectPathFromGlobs,
       gitignoreTargetsOnly,
       dryRun,
       check,
+      retireTargets,
       gitignoreDestination,
       inputRoot,
       inputRoots,
@@ -379,6 +455,7 @@ export class ConfigResolver {
     // `inputRoots` winning (see `resolveEffectiveInputRoots`).
     assertInputRootFieldsExclusive({ inputRoot, inputRoots });
     assertInputRootsNonEmpty({ inputRoots });
+    assertRetireTargetsExplicit({ retireTargets, targets, features });
 
     // Validate configPath to prevent path traversal attacks.
     //
@@ -452,10 +529,11 @@ export class ConfigResolver {
     // still win via `pick`. Only re-configure when the caller threaded a
     // logger through — those call sites pass their CLI flags in the params, so
     // precedence stays intact. The shared `fallbackLogger` is kept in sync for
-    // paths that have no logger threaded through. Note: `fallbackLogger` is
-    // process-global state — do not call `resolve` with a logger from a
-    // long-lived process (e.g. the MCP server) where one repository's config
-    // would leak into unrelated later operations.
+    // paths that have no logger threaded through: its `configure` reaches the
+    // console it falls back to when no operation has adopted a logger, which is
+    // what an unattended path writes to. That console is process-wide, so do
+    // not call `resolve` with a logger from a long-lived process (e.g. the MCP
+    // server), where one repository's `silent` would outlive its own run.
     const resolvedVerbose = pick({
       cli: verbose,
       file: configByFile.verbose,
@@ -501,8 +579,13 @@ export class ConfigResolver {
       validatedConfigPath,
     });
 
-    const { resolvedFeatures, resolvedTargets } = resolveFeaturesAndTargets({
+    const { runFeatures, retireFeatures } = splitRetireFeatures({
       features,
+      retireTargets,
+      configByFile,
+    });
+    const { resolvedFeatures, resolvedTargets } = resolveFeaturesAndTargets({
+      features: runFeatures,
       targets,
       configByFile,
     });
@@ -537,6 +620,18 @@ export class ConfigResolver {
         file: configByFile.simulateSkills,
         fallback: getDefaults().simulateSkills,
       }),
+      // Config-file only: preserving is a property of the destination files a
+      // project shares with other tools, not of a single run.
+      preserveUnownedHooks: pick({
+        cli: undefined,
+        file: configByFile.preserveUnownedHooks,
+        fallback: getDefaults().preserveUnownedHooks,
+      }),
+      deriveSubprojectPathFromGlobs: pick({
+        cli: deriveSubprojectPathFromGlobs,
+        file: configByFile.deriveSubprojectPathFromGlobs,
+        fallback: getDefaults().deriveSubprojectPathFromGlobs,
+      }),
       gitignoreTargetsOnly: pick({
         cli: gitignoreTargetsOnly,
         file: configByFile.gitignoreTargetsOnly,
@@ -549,6 +644,8 @@ export class ConfigResolver {
       }),
       dryRun: pick({ cli: dryRun, file: configByFile.dryRun, fallback: getDefaults().dryRun }),
       check: pick({ cli: check, file: configByFile.check, fallback: getDefaults().check }),
+      retireTargets,
+      retireFeatures,
       // Pass the fully-resolved absolute list so `Config.getInputRoots()` is
       // pure and never re-reads `process.cwd()` after construction. When
       // neither CLI nor config file supplied a root, the list is `[cwd]`.
@@ -560,7 +657,21 @@ export class ConfigResolver {
       sources: configByFile.sources ?? getDefaults().sources,
       flattenedCommandNaming:
         configByFile.flattenedCommandNaming ?? getDefaults().flattenedCommandNaming,
+      language: configByFile.language,
       configFileTargets: extractConfigFileTargets(configByFile.targets),
+      configFileSelection:
+        configByFile.targets === undefined
+          ? undefined
+          : {
+              targets: configByFile.targets,
+              // CLI --features still applies: this is the selection a run
+              // without --targets would use.
+              features: resolveFeaturesAndTargets({
+                features: runFeatures,
+                targets: undefined,
+                configByFile,
+              }).resolvedFeatures,
+            },
     };
     const config = new Config(configParams);
     return config;

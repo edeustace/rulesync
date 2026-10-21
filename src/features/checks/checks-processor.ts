@@ -4,6 +4,10 @@ import { z } from "zod/mini";
 
 import { AUGMENTCODE_CODE_REVIEW_GUIDELINES_FILE_NAME } from "../../constants/augmentcode-paths.js";
 import { CURSOR_BUGBOT_FILE_NAME } from "../../constants/cursor-paths.js";
+import { SKILL_FILE_NAME } from "../../constants/general.js";
+import { GITLABDUO_MR_REVIEW_INSTRUCTIONS_FILE_NAME } from "../../constants/gitlabduo-paths.js";
+import { KILO_REVIEW_FILE_NAME } from "../../constants/kilo-paths.js";
+import { QWENCODE_REVIEW_RULES_FILE_NAME } from "../../constants/qwencode-paths.js";
 import { ROVODEV_REVIEW_AGENT_FILE_NAME } from "../../constants/rovodev-paths.js";
 import { CHECKS_FEATURE_SUBDIR } from "../../constants/rulesync-paths.js";
 import { TAKT_CONFIG_FILE_NAME } from "../../constants/takt-paths.js";
@@ -17,13 +21,18 @@ import {
   directoryExistsStrict,
   findFilesByGlobs,
   isFileSystemError,
-  listDirectoryFiles,
+  listDirectoryEntryNames,
 } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
 import { AmpCheck } from "./amp-check.js";
 import { AugmentcodeCheck } from "./augmentcode-check.js";
 import { CursorCheck } from "./cursor-check.js";
+import { FactorydroidCheck } from "./factorydroid-check.js";
+import { GitlabduoCheck } from "./gitlabduo-check.js";
+import { GooseCheck } from "./goose-check.js";
 import { HermesagentCheck } from "./hermesagent-check.js";
+import { KiloCheck } from "./kilo-check.js";
+import { QwencodeCheck } from "./qwencode-check.js";
 import { RovodevCheck } from "./rovodev-check.js";
 import { RulesyncCheck } from "./rulesync-check.js";
 import { TaktCheck } from "./takt-check.js";
@@ -59,6 +68,12 @@ type ToolCheckFactory = {
   meta: {
     /** Whether the tool supports global (user-level) checks */
     supportsGlobal: boolean;
+    /**
+     * Whether the tool supports project checks. Defaults to `true`; a target
+     * whose project location another target already writes (Goose's
+     * `.agents/checks/`, written by `amp`) sets `false` and is global-only.
+     */
+    supportsProject?: boolean;
     /** File pattern for import (e.g., "*.md") */
     filePattern: string;
     /**
@@ -66,8 +81,7 @@ type ToolCheckFactory = {
      * repository (Cursor Bugbot, Rovo Dev's code reviewer). The gitignore
      * derivation skips such outputs — ignoring them would disable the very
      * feature the adapter generates. Future checks adapters whose upstream
-     * reads from the committed tree (e.g. Goose `.agents/checks/`) should set
-     * this too.
+     * reads from the committed tree should set this too.
      */
     committedOutput?: boolean;
   };
@@ -91,8 +105,9 @@ export const toolCheckFactories = new Map<ChecksProcessorToolTarget, ToolCheckFa
     "amp",
     {
       // Amp reads code review checks from `.agents/checks/` (project) and
-      // `~/.config/amp/checks/` (global) as Markdown files with YAML frontmatter.
-      // https://ampcode.com/manual
+      // `~/.config/amp/checks/` (global) as Markdown files with YAML frontmatter,
+      // run by the official `@amp/review-checks` plugin.
+      // https://ampcode.com/docs/review
       class: AmpCheck,
       meta: { supportsGlobal: true, filePattern: "*.md" },
     },
@@ -127,10 +142,80 @@ export const toolCheckFactories = new Map<ChecksProcessorToolTarget, ToolCheckFa
     },
   ],
   [
+    "factorydroid",
+    {
+      // Factory's automated code review has no dedicated instruction file: it
+      // reads a skill named `review-guidelines`, so every check targeting
+      // Factory Droid collapses into
+      // `.factory/skills/review-guidelines/SKILL.md`.
+      // https://docs.factory.ai/software-factory/code-review-ci
+      class: FactorydroidCheck,
+      // `committedOutput`: Droid reads the skill from the checked-out
+      // repository, so the derived .gitignore must not ignore it — including
+      // via the `**/.factory/skills/` entry the skills feature contributes.
+      meta: { supportsGlobal: false, filePattern: SKILL_FILE_NAME, committedOutput: true },
+    },
+  ],
+  [
+    "gitlabduo",
+    {
+      // GitLab Duo Code Review Flow reads one YAML list of instruction groups,
+      // so every check targeting GitLab Duo collapses into
+      // `.gitlab/duo/mr-review-instructions.yaml`.
+      // https://docs.gitlab.com/user/duo_agent_platform/customize/review_instructions/
+      class: GitlabduoCheck,
+      // `committedOutput`: the review reads the file from the repository, so
+      // the derived .gitignore must not ignore it.
+      meta: {
+        supportsGlobal: false,
+        filePattern: GITLABDUO_MR_REVIEW_INSTRUCTIONS_FILE_NAME,
+        committedOutput: true,
+      },
+    },
+  ],
+  [
+    "goose",
+    {
+      // `goose review` reads `~/.config/goose/checks/*.md` globally. Its
+      // project directory is the cross-tool `.agents/checks/` that the `amp`
+      // target writes, so Goose is global-only here.
+      class: GooseCheck,
+      meta: { supportsGlobal: true, supportsProject: false, filePattern: "*.md" },
+    },
+  ],
+  [
     "hermesagent",
     {
       class: HermesagentCheck,
       meta: { supportsGlobal: false, filePattern: "*.json" },
+    },
+  ],
+  [
+    "kilo",
+    {
+      // Kilo Code Reviews reads one plain-Markdown guidance file, so every
+      // check targeting Kilo collapses into the repository-root `REVIEW.md`.
+      // https://kilo.ai/docs/automate/code-reviews
+      class: KiloCheck,
+      // `committedOutput`: the reviewer reads REVIEW.md from the PR/MR base
+      // branch, so the derived .gitignore must not ignore it.
+      meta: { supportsGlobal: false, filePattern: KILO_REVIEW_FILE_NAME, committedOutput: true },
+    },
+  ],
+  [
+    "qwencode",
+    {
+      // Qwen Code's `/review` reads one plain-Markdown rules file, so every
+      // check targeting Qwen Code collapses into `.qwen/review-rules.md`.
+      // https://qwenlm.github.io/qwen-code-docs/en/users/features/code-review/
+      class: QwencodeCheck,
+      // `committedOutput`: PR reviews read the rules from the base branch, so
+      // the derived .gitignore must not ignore the file.
+      meta: {
+        supportsGlobal: false,
+        filePattern: QWENCODE_REVIEW_RULES_FILE_NAME,
+        committedOutput: true,
+      },
     },
   ],
   [
@@ -179,7 +264,10 @@ const defaultGetFactory: GetFactory = (target) => {
 // Derive tool target arrays from factory metadata
 const allToolTargetKeys = [...toolCheckFactories.keys()];
 
-export const checksProcessorToolTargets: ToolTarget[] = allToolTargetKeys;
+export const checksProcessorToolTargets: ToolTarget[] = allToolTargetKeys.filter((target) => {
+  const factory = toolCheckFactories.get(target);
+  return factory?.meta.supportsProject !== false;
+});
 
 const checksProcessorToolTargetsGlobal: ToolTarget[] = allToolTargetKeys.filter((target) => {
   const factory = toolCheckFactories.get(target);
@@ -281,7 +369,7 @@ export class ChecksProcessor extends FeatureProcessor {
       return [];
     }
 
-    const entries = await listDirectoryFiles(checksDir);
+    const entries = await listDirectoryEntryNames(checksDir);
     const mdFiles = entries.filter((file) => file.endsWith(".md"));
 
     if (mdFiles.length === 0) {
@@ -363,7 +451,10 @@ export class ChecksProcessor extends FeatureProcessor {
     const paths = factory.class.getSettablePaths({ global: this.global });
 
     const baseDir = join(this.outputRoot, paths.relativeDirPath);
-    const checkFilePaths = await findFilesByGlobs(join(baseDir, factory.meta.filePattern));
+    const checkFilePaths = await findFilesByGlobs(factory.meta.filePattern, {
+      cwd: baseDir,
+      followSymbolicLinks: !forDeletion,
+    });
 
     const toRelativeFilePath = (path: string): string => relative(baseDir, path);
 

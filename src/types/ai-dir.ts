@@ -14,6 +14,26 @@ import {
   toPosixPath,
 } from "../utils/file.js";
 import { warnOnceWithFallback } from "../utils/logger.js";
+import { recordIncompleteCarriedFiles } from "../utils/warned-once.js";
+
+/**
+ * Whether `name` is a path rather than a single name.
+ *
+ * Both separators are rejected on every platform, which is why neither
+ * `path.sep` nor the platform is consulted: a backslash is a legal character in
+ * a POSIX name, but a name carrying one is a path the moment it reaches
+ * Windows, and `AiDir` names travel between the two — most tools take one
+ * straight from a skill's frontmatter.
+ *
+ * Exported because the checks that run *before* a name reaches `AiDir` — so
+ * that an unusable name is reported and skipped rather than thrown over — have
+ * to reject exactly the set this guard does. Two spellings of one rule drift
+ * apart the moment either is tightened, and the pre-filter drifting narrower
+ * turns a reported name back into a failed run.
+ */
+export function containsPathSeparator(name: string): boolean {
+  return name.includes("/") || name.includes("\\");
+}
 
 export type ValidationResult =
   | {
@@ -24,6 +44,24 @@ export type ValidationResult =
       success: false;
       error: Error;
     };
+
+/**
+ * The permission bits worth carrying from a source file: only an executable
+ * one has a mode the copy must keep, and only its read and execute bits plus
+ * the owner's write bit are kept. Group and world write bits are dropped the
+ * way a umask would drop them, so a source sitting on a mount that reports
+ * everything as 0777 does not turn the generated copy world-writable; setuid,
+ * setgid and sticky are never carried. Windows reports no executable bit, so
+ * nothing is carried there and the copy takes the platform default, as it
+ * always has.
+ */
+export function carriedFileMode(mode: number): { fileMode?: number } {
+  const permissionBits = mode & 0o755;
+  if ((permissionBits & 0o111) === 0) {
+    return {};
+  }
+  return { fileMode: permissionBits };
+}
 
 export type AiDirFile = {
   relativeFilePathToDirPath: string;
@@ -36,6 +74,13 @@ export type AiDirFile = {
    * always written — byte for byte.
    */
   composed?: boolean;
+  /**
+   * The source file's permission bits, set only when the source carries an
+   * executable bit. A skill's `scripts/*.sh` is copied so that the agent can
+   * run it the way the skill says (`./scripts/foo.sh`); a plain data file is
+   * left to the platform's default mode, exactly as before.
+   */
+  fileMode?: number;
 };
 
 /** Why an entry is never carried, which decides whether its exclusion is reported. */
@@ -724,7 +769,7 @@ export abstract class AiDir {
     global = false,
   }: AiDirParams) {
     // Security check: ensure dirName doesn't contain path separators
-    if (dirName.includes(path.sep) || dirName.includes("/") || dirName.includes("\\")) {
+    if (containsPathSeparator(dirName)) {
       throw new Error(`Directory name cannot contain path separators: dirName="${dirName}"`);
     }
 
@@ -814,7 +859,7 @@ export abstract class AiDir {
     // Both separators, on every platform — a backslash is a legal character in
     // a POSIX name, but a name carrying one is a path once it reaches Windows.
     const name = mainFile.name;
-    if (name === "" || name === "." || name === ".." || name.includes("/") || name.includes("\\")) {
+    if (name === "" || name === "." || name === ".." || containsPathSeparator(name)) {
       return undefined;
     }
     return path.join(this.getDirPath(), name);
@@ -1097,6 +1142,12 @@ export abstract class AiDir {
     truncations: Set<CarriedWalkTruncation>;
     unreadablePaths: string[];
   }): void {
+    // Every branch below describes files the run wanted and did not get, which
+    // is what makes this run's picture of the source incomplete. Recorded here
+    // rather than in each branch so a bound added later cannot forget it.
+    if (truncations.size > 0 || unreadablePaths.length > 0) {
+      recordIncompleteCarriedFiles();
+    }
     if (truncations.has("depth")) {
       warnOnceWithFallback(
         undefined,
@@ -1298,6 +1349,7 @@ export abstract class AiDir {
         // a link only if one was put there since.
         fileHandle = await open(classifiedPath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
       } catch (error) {
+        recordIncompleteCarriedFiles();
         warnOnceWithFallback(
           undefined,
           `Not carrying ${stripControlCharacters(toPosixPath(filePath))}: ${stripControlCharacters(formatError(error))}.`,
@@ -1305,8 +1357,10 @@ export abstract class AiDir {
         continue;
       }
       try {
-        const fileSize = (await fileHandle.stat()).size;
+        const fileStats = await fileHandle.stat();
+        const fileSize = fileStats.size;
         if (carriedBytes + fileSize > MAX_CARRIED_BYTES) {
+          recordIncompleteCarriedFiles();
           warnOnceWithFallback(
             undefined,
             `Not carrying ${filteredPaths.length - index} of the ${filteredPaths.length} entries under ${reportedDirPath}: a directory may carry at most ${MAX_CARRIED_BYTES / 1024 / 1024}MB. A symbolic link that reaches a large tree is the usual cause.`,
@@ -1318,11 +1372,13 @@ export abstract class AiDir {
         files.push({
           relativeFilePathToDirPath: relative(dirPath, filePath),
           fileBuffer,
+          ...carriedFileMode(fileStats.mode),
         });
       } catch (error) {
         // A file that opened but would not read -- a permission dropped in
         // between, or a device that refuses a plain read -- is skipped rather
         // than allowed to abort the whole directory.
+        recordIncompleteCarriedFiles();
         warnOnceWithFallback(
           undefined,
           `Not carrying ${stripControlCharacters(toPosixPath(filePath))}: ${stripControlCharacters(formatError(error))}.`,

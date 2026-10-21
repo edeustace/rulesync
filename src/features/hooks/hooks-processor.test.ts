@@ -10,7 +10,11 @@ import { ensureDir, writeFileContent } from "../../utils/file.js";
 import { ClaudecodeHooks } from "./claudecode-hooks.js";
 import { CodexcliConfigToml, CodexcliHooks } from "./codexcli-hooks.js";
 import { CursorHooks } from "./cursor-hooks.js";
-import { HooksProcessor } from "./hooks-processor.js";
+import {
+  HOOKS_OVERRIDE_KEY_ALIASES,
+  HooksProcessor,
+  toolHooksFactories,
+} from "./hooks-processor.js";
 import { KiroIdeHooks } from "./kiro-ide-hooks.js";
 import { RulesyncHooks } from "./rulesync-hooks.js";
 import { ToolHooks } from "./tool-hooks.js";
@@ -385,6 +389,82 @@ describe("HooksProcessor", () => {
       );
     });
 
+    it("should not report a shared-block event as unsupported when only the override block is unknown", async () => {
+      const config = {
+        version: 1,
+        hooks: {
+          sessionStart: [{ command: "echo" }],
+        },
+        cursor: {
+          hooks: {
+            zzzNativeEvent: [{ command: "echo" }],
+          },
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const processor = new HooksProcessor({ logger, outputRoot: testDir, toolTarget: "cursor" });
+      const toolFiles = await processor.convertRulesyncFilesToToolFiles([rulesyncHooks]);
+
+      // Cursor emits override-block keys verbatim, so the key must be in the
+      // output and the generic "not supported" warning must stay silent.
+      expect(toolFiles.some((f) => f.getFileContent().includes("zzzNativeEvent"))).toBe(true);
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("(not supported)"));
+    });
+
+    // Every target either emits an unknown override-block key verbatim or
+    // drops it; the generic "not supported" warning must fire exactly when the
+    // key is dropped without the adapter reporting the drop itself. This pins
+    // `dropsUnknownOverrideEvents` to what each adapter really does.
+    it.each([...toolHooksFactories])(
+      "should warn about an unknown override-block event for %s only when it is dropped",
+      async (toolTarget, factory) => {
+        const nativeEvent = "zzzNativeEvent";
+        const overrideKey = HOOKS_OVERRIDE_KEY_ALIASES[toolTarget] ?? toolTarget;
+        const config = {
+          version: 1,
+          hooks: {},
+          [overrideKey]: { hooks: { [nativeEvent]: [{ command: "echo" }] } },
+        };
+        const rulesyncHooks = new RulesyncHooks({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+          relativeFilePath: "hooks.json",
+          fileContent: JSON.stringify(config),
+          validate: false,
+        });
+
+        const processor = new HooksProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget,
+          global: !factory.meta.supportsProject,
+        });
+        const toolFiles = await processor.convertRulesyncFilesToToolFiles([rulesyncHooks]);
+
+        const emitted = toolFiles.some((f) => f.getFileContent().includes(nativeEvent));
+        const warnings = logger.warn.mock.calls.map(([message]) => String(message));
+        const genericWarning = warnings.some((m) => m.includes(`(not supported): ${nativeEvent}`));
+        const adapterWarning = warnings.some(
+          (m) => m.includes(nativeEvent) && !m.includes(`(not supported): ${nativeEvent}`),
+        );
+
+        if (emitted) {
+          expect(genericWarning).toBe(false);
+        } else {
+          expect(genericWarning || adapterWarning).toBe(true);
+          // An adapter that reports its own drops must not be echoed.
+          expect(genericWarning && adapterWarning).toBe(false);
+        }
+      },
+    );
+
     it("should log warning when prompt-type hooks exist and target does not support them", async () => {
       const config = {
         version: 1,
@@ -442,6 +522,74 @@ describe("HooksProcessor", () => {
       expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("prompt-type"));
     });
 
+    it("should not log http-type warning for bob, which writes them as https handlers (issue #3074)", async () => {
+      const config = {
+        version: 1,
+        hooks: {
+          preToolUse: [{ type: "http", url: "https://hooks.example.com/pre", matcher: "Bash" }],
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const processor = new HooksProcessor({ logger, outputRoot: testDir, toolTarget: "bob" });
+      const toolFiles = await processor.convertRulesyncFilesToToolFiles([rulesyncHooks]);
+
+      expect(toolFiles).toHaveLength(1);
+      expect(toolFiles[0]?.getFileContent()).toContain('"type": "https"');
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("http-type"));
+    });
+
+    it("should warn that a confirm prompt is dropped outside kiro-cli / kiro-ide", async () => {
+      const config = {
+        version: 1,
+        hooks: {
+          stop: [
+            {
+              type: "command",
+              command: "npm test",
+              confirm: { question: "Run tests?", options: [{ id: "y", label: "Yes", run: true }] },
+            },
+          ],
+          preToolUse: [
+            {
+              type: "command",
+              command: "lint.sh",
+              confirm: {
+                question: "Lint?",
+                confirmCommand: "gate.sh",
+                options: [{ id: "y", label: "Yes", run: true }],
+              },
+            },
+          ],
+          postToolUse: [{ type: "command", command: "fmt.sh" }],
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const claude = new HooksProcessor({ logger, outputRoot: testDir, toolTarget: "claudecode" });
+      await claude.convertRulesyncFilesToToolFiles([rulesyncHooks]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        'Emitting hook(s) without their "confirm" prompt for claudecode (only the kiro-cli / kiro-ide hooks formats support it): stop, preToolUse',
+      );
+
+      logger.warn.mockClear();
+      const kiro = new HooksProcessor({ logger, outputRoot: testDir, toolTarget: "kiro-ide" });
+      await kiro.convertRulesyncFilesToToolFiles([rulesyncHooks]);
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining('"confirm" prompt'));
+    });
+
     it("should warn that a disabled hook is emitted as active outside kiro-ide", async () => {
       const config = {
         version: 1,
@@ -468,7 +616,7 @@ describe("HooksProcessor", () => {
       // The event list must be part of the same message, and must name only the
       // events that actually carry a disabled hook.
       expect(logger.warn).toHaveBeenCalledWith(
-        'Emitting "enabled: false" hook(s) as active for claudecode (only the kiro-cli / kiro-ide standalone hooks format supports the flag): preToolUse',
+        'Emitting "enabled: false" hook(s) as active for claudecode (only the kiro-cli / kiro-ide / zcode hooks formats support the flag): preToolUse',
       );
     });
 
@@ -495,7 +643,7 @@ describe("HooksProcessor", () => {
       );
     });
 
-    it.each(["kiro-ide", "kiro-cli"] as const)(
+    it.each(["kiro-ide", "kiro-cli", "zcode"] as const)(
       "should not warn about a disabled hook for %s, which honors the flag",
       async (toolTarget) => {
         const config = {
@@ -619,6 +767,34 @@ describe("HooksProcessor", () => {
       expect(toolFile?.getFileContent()).not.toContain("filtered.sh");
       expect(toolFile?.getFileContent()).toContain("guard.sh");
     });
+
+    it("should accept the Amp-only changes.prompt event in the amp override block", async () => {
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          hooks: {},
+          amp: {
+            hooks: {
+              "changes.prompt": [{ command: "ship-notes.sh" }],
+              "changes.unknown": [{ command: "unknown.sh" }],
+            },
+          },
+        }),
+        validate: false,
+      });
+
+      const processor = new HooksProcessor({ logger, outputRoot: testDir, toolTarget: "amp" });
+      const [toolFile] = await processor.convertRulesyncFilesToToolFiles([rulesyncHooks]);
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        "Skipped hook event(s) for amp (not supported): changes.unknown",
+      );
+      expect(toolFile?.getFileContent()).toContain('amp.on("changes.prompt"');
+      expect(toolFile?.getFileContent()).toContain("ship-notes.sh");
+      expect(toolFile?.getFileContent()).not.toContain("unknown.sh");
+    });
   });
 
   describe("convertToolFilesToRulesyncFiles", () => {
@@ -660,14 +836,20 @@ describe("HooksProcessor", () => {
         "antigravity-ide",
         "antigravity-plugin",
         "cursor",
+        "firebender",
         "claudecode",
         "claudecode-plugin",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
         "copilot",
         "copilotcli",
         "kilo",
+        "mimocode",
         "opencode",
         "pi",
+        "omp",
         "factorydroid",
         "cline",
         "goose",
@@ -675,12 +857,26 @@ describe("HooksProcessor", () => {
         "kiro",
         "kiro-cli",
         "kiro-ide",
+        "lettacode",
         "devin",
+        "devin-plugin",
         "augmentcode",
+        "augmentcode-plugin",
+        "bob",
+        "continue",
+        "cortexcode",
+        "gitlabduo",
+        "tabnine",
         "vibe",
+        "vibe-plugin",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "grokcli",
+        "crush",
+        "zcode",
+        "zcode-plugin",
       ]);
     });
 
@@ -691,13 +887,19 @@ describe("HooksProcessor", () => {
         "antigravity-cli",
         "antigravity-ide",
         "cursor",
+        "firebender",
         "claudecode",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
         "copilot",
         "copilotcli",
         "kilo",
+        "mimocode",
         "opencode",
         "pi",
+        "omp",
         "factorydroid",
         "cline",
         "goose",
@@ -706,13 +908,23 @@ describe("HooksProcessor", () => {
         "deepagents",
         "kiro-cli",
         "kiro-ide",
+        "lettacode",
         "devin",
         "augmentcode",
+        "bob",
+        "continue",
+        "cortexcode",
         "junie",
+        "gitlabduo",
+        "tabnine",
         "vibe",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "grokcli",
+        "crush",
+        "zcode",
       ]);
     });
 
@@ -727,9 +939,7 @@ describe("HooksProcessor", () => {
 
       const files = await processor.loadToolFiles({ forDeletion: true });
 
-      expect(files.map((file) => file.getRelativePathFromCwd())).toEqual([
-        join(".codex", "hooks.json"),
-      ]);
+      expect(files.map((file) => file.getRelativePathFromCwd())).toEqual([".codex/hooks.json"]);
     });
 
     it("should exclude non-importable targets when importOnly is true", () => {
@@ -739,9 +949,13 @@ describe("HooksProcessor", () => {
         "antigravity-ide",
         "antigravity-plugin",
         "cursor",
+        "firebender",
         "claudecode",
         "claudecode-plugin",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
         "copilot",
         "copilotcli",
         "factorydroid",
@@ -750,12 +964,26 @@ describe("HooksProcessor", () => {
         "kiro",
         "kiro-cli",
         "kiro-ide",
+        "lettacode",
         "devin",
+        "devin-plugin",
         "augmentcode",
+        "augmentcode-plugin",
+        "bob",
+        "continue",
+        "cortexcode",
+        "gitlabduo",
+        "tabnine",
         "vibe",
+        "vibe-plugin",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "grokcli",
+        "crush",
+        "zcode",
+        "zcode-plugin",
       ]);
     });
 
@@ -765,8 +993,12 @@ describe("HooksProcessor", () => {
         "antigravity-cli",
         "antigravity-ide",
         "cursor",
+        "firebender",
         "claudecode",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
         "copilot",
         "copilotcli",
         "factorydroid",
@@ -776,13 +1008,23 @@ describe("HooksProcessor", () => {
         "deepagents",
         "kiro-cli",
         "kiro-ide",
+        "lettacode",
         "devin",
         "augmentcode",
+        "bob",
+        "continue",
+        "cortexcode",
         "junie",
+        "gitlabduo",
+        "tabnine",
         "vibe",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "grokcli",
+        "crush",
+        "zcode",
       ]);
     });
   });

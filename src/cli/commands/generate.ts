@@ -1,3 +1,5 @@
+import { sep } from "node:path";
+
 import { ConfigResolver, type ConfigResolverResolveParams } from "../../config/config-resolver.js";
 import type { Config } from "../../config/config.js";
 import {
@@ -6,6 +8,7 @@ import {
   inspectInputRoots,
   type GenerateResult,
 } from "../../lib/generate.js";
+import type { DeletedPath, KeyOperation } from "../../lib/orphan-sweep.js";
 import {
   buildConfigFilePaths,
   buildWatchTargets,
@@ -30,10 +33,90 @@ export type GenerateOptions = ConfigResolverResolveParams & {
  * watcher should stay up for that correction.
  */
 export class SourceLoadFailedError extends CLIError {
-  constructor({ message, features }: { message: string; features: readonly string[] }) {
-    super(message, ErrorCodes.GENERATION_FAILED, 1, { sourceLoadFailedFeatures: [...features] });
+  constructor({
+    message,
+    features,
+    plan,
+  }: {
+    message: string;
+    features: readonly string[];
+    /** What the rest of the run wrote and deleted, which a failing JSON document would otherwise drop. */
+    plan?: GeneratePlan;
+  }) {
+    super(message, ErrorCodes.GENERATION_FAILED, 1, {
+      sourceLoadFailedFeatures: [...features],
+      ...(plan === undefined ? {} : { plan }),
+    });
     this.name = "SourceLoadFailedError";
   }
+}
+
+/**
+ * Version of the `plan` document `generate --json` emits. Bump it whenever an
+ * existing field changes meaning or a new `action`/`kind` value is added, so a
+ * consumer that authorizes operations can refuse a plan it does not understand.
+ *
+ * - 1: `file`/`directory` writes and deletes.
+ * - 2: adds `kind: "key"`, a top-level key of a shared config file.
+ */
+export const GENERATE_PLAN_VERSION = 2;
+
+type GeneratePlanOperationBase = {
+  action: "write" | "delete";
+  feature: string;
+  /** Relative to the output root, with `/` separators. */
+  path: string;
+};
+
+export type GeneratePlanOperation =
+  | (GeneratePlanOperationBase & { kind: "file" | "directory" })
+  | (GeneratePlanOperationBase & {
+      kind: "key";
+      /**
+       * A top-level key Rulesync owns outright in the shared config file at
+       * `path`, which the same feature's `file` write operation rewrites.
+       */
+      key: string;
+    });
+
+export type GeneratePlan = {
+  version: typeof GENERATE_PLAN_VERSION;
+  operations: GeneratePlanOperation[];
+};
+
+/**
+ * Flatten the per-feature results into one ordered list of operations:
+ * features in the order the summary lists them, and within a feature its file
+ * writes, then its shared-config key operations, then its deletions — paths
+ * sorted within each, and keys within a path — so repeated previews of the
+ * same tree produce identical plans and a preview can be compared with the
+ * run it previews.
+ */
+export function buildGeneratePlan({
+  featureResults,
+  deletedPathsByFeature,
+  keyOperationsByFeature,
+}: {
+  featureResults: Record<string, { paths: readonly string[] }>;
+  deletedPathsByFeature: Readonly<Record<string, readonly DeletedPath[] | undefined>>;
+  keyOperationsByFeature: Readonly<Record<string, readonly KeyOperation[] | undefined>>;
+}): GeneratePlan {
+  const toPlanPath = (path: string): string => path.split(sep).join("/");
+  const operations: GeneratePlanOperation[] = [];
+
+  for (const [feature, { paths }] of Object.entries(featureResults)) {
+    for (const path of [...new Set(paths.map(toPlanPath))].toSorted()) {
+      operations.push({ action: "write", kind: "file", feature, path });
+    }
+    for (const { action, path, key } of keyOperationsByFeature[feature] ?? []) {
+      operations.push({ action, kind: "key", feature, path: toPlanPath(path), key });
+    }
+    for (const { path, kind } of deletedPathsByFeature[feature] ?? []) {
+      operations.push({ action: "delete", kind, feature, path: toPlanPath(path) });
+    }
+  }
+
+  return { version: GENERATE_PLAN_VERSION, operations };
 }
 
 /**
@@ -111,6 +194,7 @@ function buildSummaryParts(result: GenerateResult): string[] {
     { count: result.permissionsCount, label: "permissions" },
     { count: result.checksCount, label: "checks" },
     { count: result.activationCount, label: "Hermes activation files" },
+    { count: result.pluginManifestCount, label: "plugin manifests" },
   ];
 
   const parts: string[] = [];
@@ -178,6 +262,7 @@ async function generateOnce(
     checks: { count: result.checksCount, paths: result.checksPaths },
     rules: { count: result.rulesCount, paths: result.rulesPaths },
     activation: { count: result.activationCount, paths: result.activationPaths },
+    pluginManifest: { count: result.pluginManifestCount, paths: result.pluginManifestPaths },
   };
 
   // Map feature keys to human-readable labels with pluralization
@@ -192,6 +277,7 @@ async function generateOnce(
     permissions: (count) => `${count === 1 ? "permissions file" : "permissions files"}`,
     checks: (count) => `${count === 1 ? "check" : "checks"}`,
     activation: (count) => `${count === 1 ? "Hermes activation file" : "Hermes activation files"}`,
+    pluginManifest: (count) => `${count === 1 ? "plugin manifest" : "plugin manifests"}`,
   };
 
   for (const [feature, data] of Object.entries(featureResults)) {
@@ -204,12 +290,19 @@ async function generateOnce(
     });
   }
 
+  const plan = buildGeneratePlan({
+    featureResults,
+    deletedPathsByFeature: result.deletedPathsByFeature,
+    keyOperationsByFeature: result.keyOperationsByFeature,
+  });
+
   // Capture JSON data if in JSON mode
   if (logger.jsonMode) {
     logger.captureData("features", featureResults);
     logger.captureData("totalFiles", totalGenerated);
     logger.captureData("hasDiff", result.hasDiff);
     logger.captureData("skills", result.skills ?? []);
+    logger.captureData("plan", plan);
   }
 
   // A source file that failed to load was already reported as an error, but
@@ -221,15 +314,20 @@ async function generateOnce(
     throw new SourceLoadFailedError({
       message: sourceLoadFailureMessage,
       features: result.sourceLoadFailedFeatures,
+      plan,
     });
   }
 
   // Check mode must fail even when the change is delete-only and no files are written.
   if (check) {
     if (result.hasDiff) {
+      // A failing command's JSON document carries no `data`, so the plan rides
+      // on `error.details` — exactly the run a consumer most needs it for.
       throw new CLIError(
         "Files are not up to date. Run 'rulesync generate' to update.",
         ErrorCodes.GENERATION_FAILED,
+        1,
+        { plan },
       );
     }
 
@@ -256,21 +354,26 @@ async function generateOnce(
  * Rejects flag combinations that contradict a long-running watch: `--check`
  * and `--dry-run` are one-shot verification modes (the former is meant to exit
  * non-zero), and `--json` buffers a single result document until the command
- * returns, which never happens while watching.
+ * returns, which never happens while watching. `--retire-targets` is a one-off
+ * migration step: repeated on every change, it would keep deleting whatever
+ * reappears at the retired tool's paths.
  */
 export function assertWatchModeCompatible({
   isCheck,
   isDryRun,
   isJsonMode,
+  isRetiring = false,
 }: {
   isCheck: boolean;
   isDryRun: boolean;
   isJsonMode: boolean;
+  isRetiring?: boolean;
 }): void {
   const conflicts = [
     isCheck ? "--check" : undefined,
     isDryRun ? "--dry-run" : undefined,
     isJsonMode ? "--json" : undefined,
+    isRetiring ? "--retire-targets" : undefined,
   ].filter((flag): flag is string => flag !== undefined);
 
   if (conflicts.length > 0) {
@@ -289,6 +392,7 @@ async function generateWatchCommand(logger: Logger, options: GenerateOptions): P
     isCheck: config.getCheck(),
     isDryRun: config.getDryRun(),
     isJsonMode: logger.jsonMode,
+    isRetiring: config.getRetireTargets().length > 0,
   });
 
   const inputRoots = config.getInputRoots();
@@ -343,6 +447,7 @@ async function generateWatchCommand(logger: Logger, options: GenerateOptions): P
       logger.error(`Watch error on ${directory}: ${formatError(error)}`);
     },
   });
+  await handle.ready;
 
   logger.info(
     `\nWatching for changes in:\n${targets.map((target) => `    ${target.directory}`).join("\n")}`,

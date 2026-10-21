@@ -21,7 +21,7 @@ import { resolveGitignoreTargets } from "./commands/resolve-gitignore-targets.js
 import { updateCommand, UpdateCommandOptions } from "./commands/update.js";
 import { wrapCommand as _wrapCommand } from "./wrap-command.js";
 
-const getVersion = () => "16.17.0";
+const getVersion = () => "38.0.0";
 const FEATURES_HELP = `${ALL_FEATURES.join(",")}; ignore is deprecated, use permissions`;
 
 function wrapCommand(
@@ -252,6 +252,10 @@ export function createProgram(): Command {
       "--frozen",
       "Fail if lockfile is missing or out of sync (for CI); fetches missing skills using locked refs",
     )
+    .option(
+      "--outdated",
+      "Report sources whose lockfile entry is behind the remote without writing anything (exit 1 if any is behind or not locked, 2 if a source cannot be resolved)",
+    )
     .option("--token <token>", "GitHub token for private repos")
     .option("-c, --config <path>", "Path to configuration file")
     .option("-V, --verbose", "Verbose output")
@@ -264,6 +268,7 @@ export function createProgram(): Command {
           mode,
           update: (options as { update?: boolean }).update,
           frozen: (options as { frozen?: boolean }).frozen,
+          outdated: (options as { outdated?: boolean }).outdated,
           token: (options as { token?: string }).token,
           configPath: (options as { config?: string }).config,
           verbose: (options as { verbose?: boolean }).verbose,
@@ -286,6 +291,11 @@ export function createProgram(): Command {
       parseCommaSeparatedList,
     )
     .option("--delete", "Delete all existing files in output directories before generating")
+    .option(
+      "--retire-targets <tools>",
+      "Comma-separated list of tools the project no longer uses (or no longer uses --features for); deletes the outputs rulesync manages for them (requires --features; not with --targets or --watch)",
+      parseCommaSeparatedList,
+    )
     .option(
       "-o, --output-roots <paths>",
       "Output root directories to generate files into (comma-separated for multiple paths)",
@@ -323,7 +333,12 @@ export function createProgram(): Command {
     )
     .action(
       wrapCommand("generate", "GENERATION_FAILED", async (logger, options) => {
-        await generateCommand(logger, options as GenerateOptions);
+        // Commander stores `-c, --config <path>` as `config`, but the resolver
+        // reads `configPath`; map it explicitly like `add` and `install` do.
+        const { config, ...generateOptions } = options as Omit<GenerateOptions, "configPath"> & {
+          config?: string;
+        };
+        await generateCommand(logger, { ...generateOptions, configPath: config });
       }),
     );
 

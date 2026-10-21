@@ -22,10 +22,13 @@ const logger = createMockLogger();
 // only into a user-owned shared settings file that rulesync must not gitignore.
 // Note: `amp` now has a `skills` entry (`.agents/skills/`); its MCP output still
 // lands in the user-owned `.amp/settings.{json,jsonc}`, which is not gitignored.
+// `warpcli` is global-only: its MCP and permissions files live in the Warp
+// Agent CLI's config root under the home directory, never in a project.
 const TARGETS_WITHOUT_GITIGNORE_ENTRIES = new Set([
   "agentsskills",
   "augmentcode-legacy",
   "claudecode-legacy",
+  "warpcli",
 ]);
 
 describe("GITIGNORE_ENTRY_REGISTRY", () => {
@@ -103,12 +106,58 @@ describe("registry derivation", () => {
       // Preferred over `opencode.json` when neither file exists yet, so it is
       // chosen at write time rather than declared by getSettablePaths.
       "**/opencode.jsonc",
+      // Same write-time preference for MiMo Code's `.mimocode/mimocode.jsonc`.
+      "**/.mimocode/mimocode.jsonc",
+      // Runtime twin of `crush.json`: written instead of it when the project
+      // already keeps a `.crush.json`, so getSettablePaths never declares it.
+      "**/.crush.json",
+      // Crush user config: emitted in GLOBAL scope only (project scope writes
+      // `crush.json` instead), so project derivation never yields it.
+      "**/.config/crush/crush.json",
       // Copilot CLI user settings: emitted in GLOBAL scope only (project scope
       // writes `.github/copilot/settings.json` instead), so project derivation
       // never yields it. It stays listed as a shared user-managed config so a
       // global generate with nothing to contribute does not create `{}` in the
       // user's home directory.
       "**/.copilot/settings.json",
+      // ZCode user config: emitted in GLOBAL scope only (project scope writes
+      // `.zcode/config.json` instead), so project derivation never yields it.
+      "**/.zcode/cli/config.json",
+      // Pool user settings: emitted in GLOBAL scope only (project scope writes
+      // `.poolside/settings.yaml` instead), so project derivation never yields
+      // it. It stays listed as a shared user-managed config so a global
+      // generate with nothing to contribute does not create a bare
+      // `mcp_servers: {}` in the user's home directory.
+      "**/.config/poolside/settings.yaml",
+      // oh-my-pi user config: emitted in GLOBAL scope only (project scope
+      // writes `.omp/config.yml` instead), so project derivation never yields it.
+      "**/.omp/agent/config.yml",
+      // IBM Bob user settings: emitted in GLOBAL scope only (project scope
+      // writes `.bob/settings.json` instead), so project derivation never
+      // yields it.
+      "**/.bob/settings/settings.json",
+      // Snowflake Cortex Code user hooks: emitted in GLOBAL scope only (project
+      // scope writes `.cortex/settings.json` instead), so project derivation
+      // never yields it.
+      "**/.snowflake/cortex/hooks.json",
+      // DeepSeek Harness home patch layer: the dsh MCP target is GLOBAL-only,
+      // so project derivation never yields it. It stays listed as a shared
+      // user-managed config so a global generate with no servers does not
+      // create an empty `[]` patch file in the user's home directory.
+      "**/.dsh/cordis.patch.yml",
+      // Codewhale config: the hooks writer emits it in GLOBAL scope only
+      // (project scope writes hooks to `.codewhale/hooks.toml`), and project
+      // permissions only set `allow_shell` in the user-managed overlay, so it
+      // stays committable.
+      "**/.codewhale/config.toml",
+      // Qoder user settings: the MCP writer emits it in GLOBAL scope only
+      // (project scope writes `.mcp.json` instead), so project derivation never
+      // yields it.
+      "**/.qoder/settings.json",
+      // Firebender personal config: emitted in GLOBAL scope only (project
+      // scope writes the project-root `firebender.json` instead), so project
+      // derivation never yields it.
+      "**/.firebender/firebender.json",
     ]);
     const rawEntries = new Set(deriveAllGitignoreEntriesUnfiltered().map((tag) => tag.entry));
     const stale = [...DERIVED_PATHS_NOT_GITIGNORED].filter(
@@ -125,6 +174,7 @@ describe("registry derivation", () => {
       "**/.grok/config.toml",
       "**/.vibe/config.toml",
       "**/reasonix.toml",
+      "**/.codewhale/config.toml",
     ]) {
       expect(ALL_GITIGNORE_ENTRIES).not.toContain(entry);
     }
@@ -152,24 +202,62 @@ describe("registry derivation", () => {
       // but never committable (issue #2507).
       "qwencode::rules::**/.qwen/QWEN.local.md",
       "claudecode::rules::**/.claude/CLAUDE.local.md",
+      // CodeBuddy Code's personal project memory file, mirroring Claude
+      // Code's CLAUDE.local.md convention (issue #2760).
+      "codebuddy::rules::**/CODEBUDDY.local.md",
+      "codebuddy::rules::**/.codebuddy/CODEBUDDY.local.md",
+      // Crush's personal project context file: Crush reads `CRUSH.local.md`
+      // but, unlike CodeBuddy Code, does not gitignore it itself (issue #2954).
+      "crush::rules::**/CRUSH.local.md",
+      // Reasonix loads `REASONIX.local.md` beside each `REASONIX.md` in the
+      // workspace chain as the personal, uncommitted variant.
+      "reasonix::rules::**/REASONIX.local.md",
       "claudecode::general::**/.claude/*.lock",
       "claudecode::general::**/.claude/settings.local.json",
       "claudecode::general::**/.claude/memories/",
+      // Memory of a `memory: local` subagent (issue #2664).
+      "claudecode::general::**/.claude/agent-memory-local/",
       "opencode::general::**/.opencode/package-lock.json",
       "rovodev::general::**/.rovodev/.rulesync/",
+      // Qwen Code's `/review` cache, reports and scratch worktrees, and its
+      // fixed worktree root (issue #2668).
+      "qwencode::general::**/.qwen/review-cache/",
+      "qwencode::general::**/.qwen/reviews/",
+      "qwencode::general::**/.qwen/tmp/",
+      "qwencode::general::**/.qwen/worktrees/",
       "takt::general::**/.takt/runs/",
       "takt::general::**/.takt/tasks/",
       "takt::general::**/.takt/.cache/",
+      // `takt make` run artifacts, never removed by Takt (issue #2421).
+      "takt::general::**/.takt/make/",
       "takt::general::**/.takt/config.yaml",
       // Muse Code's `--subagent-worktree-isolation` worktrees, which the
       // runtime removes only when they are clean (issue #2727).
       "musecode::general::**/.muse/worktrees/",
+      // Vibe Code's plugin data root: knowledge documents and vendored
+      // `libraries/` dependencies that a project plugin under `.vibe/plugins/`
+      // materializes at session open (issue #2958).
+      "vibe::general::**/.vibe/plugin-data/",
       // Legacy/aggregate/ghost outputs not produced via getSettablePaths.
       "augmentcode::rules::**/.augment-guidelines",
       "devin::commands::**/.devin/workflows/",
+      // Antigravity commands are emitted as skills while their settable paths
+      // still name the retired workflows directory (issue #2666).
+      "antigravity-ide::commands::**/.agents/skills/",
+      "antigravity-cli::commands::**/.agents/skills/",
       // Devin's personal MCP override, documented as gitignored and never
       // emitted by rulesync (issue #2510).
       "devin::mcp::**/.devin/mcp_config.local.json",
+      // Factory Droid's personal settings overlay: read on import, documented
+      // upstream as machine-local, never written by rulesync (issue #2765).
+      "factorydroid::general::**/.factory/settings.local.json",
+      "augmentcode::general::**/.augment/settings.local.json",
+      // Command Code's personal settings overlay, documented as gitignored
+      // and never written by rulesync (issue #3075).
+      "commandcode::general::**/.commandcode/settings.local.json",
+      // Letta Code's personal project settings, documented as gitignored and
+      // never written by rulesync (issue #3175).
+      "lettacode::general::**/.letta/settings.local.json",
       "junie::rules::**/.junie/memories/",
       // Legacy outputs of earlier versions (issue #2404): the retired
       // .gooseignore and the inert sub-recipe subagents directory.
@@ -190,6 +278,8 @@ describe("registry derivation", () => {
       "cline::hooks::**/.clinerules/hooks/PreToolUse.ps1",
       "cline::hooks::**/.clinerules/hooks/SessionShutdown",
       "cline::hooks::**/.clinerules/hooks/SessionShutdown.ps1",
+      "cline::hooks::**/.clinerules/hooks/TaskCancel",
+      "cline::hooks::**/.clinerules/hooks/TaskCancel.ps1",
       "cline::hooks::**/.clinerules/hooks/TaskComplete",
       "cline::hooks::**/.clinerules/hooks/TaskComplete.ps1",
       "cline::hooks::**/.clinerules/hooks/TaskError",
@@ -357,6 +447,10 @@ describe("filterGitignoreEntries", () => {
         logger,
         targets: ["antigravity-plugin"],
       });
+      const augmentcodePlugin = filterGitignoreEntries({
+        logger,
+        targets: ["augmentcode-plugin"],
+      });
       const wildcardAndClaudePlugin = filterGitignoreEntries({
         logger,
         targets: ["*", "claudecode-plugin"],
@@ -368,6 +462,8 @@ describe("filterGitignoreEntries", () => {
       expect(wildcard).not.toContain("**/rules/");
       expect(claudePlugin).toContain("**/commands/");
       expect(antigravityPlugin).toContain("**/rules/");
+      expect(augmentcodePlugin).toContain("**/rules/");
+      expect(augmentcodePlugin).toContain("**/commands/");
       expect(wildcardAndClaudePlugin).toContain("**/commands/");
       expect(wildcardAndClaudePlugin).not.toContain("**/rules/");
     });
@@ -429,6 +525,8 @@ describe("filterGitignoreEntries", () => {
 
       // claudecode general (always included for selected target)
       expect(result).toContain("**/.claude/memories/");
+      expect(result).toContain("**/.claude/agent-memory-local/");
+      expect(result).not.toContain("**/.claude/agent-memory/");
 
       // claudecode non-rules features should NOT be included
       expect(result).not.toContain("**/.claude/commands/");
@@ -514,6 +612,74 @@ describe("committedOutput check outputs", () => {
     // ignoring them would disable the checks feature (#2487).
     expect(entries).not.toContain("**/.cursor/BUGBOT.md");
     expect(entries).not.toContain("**/.rovodev/.review-agent.md");
+    expect(entries).not.toContain("**/.qwen/review-rules.md");
+    expect(entries).not.toContain("**/.gitlab/duo/mr-review-instructions.yaml");
+  });
+
+  it("never ignores Letta Code's committed root .commands directory", () => {
+    const entries = deriveAllGitignoreEntries()
+      .filter((tag) => tag.target === "lettacode")
+      .map((tag) => tag.entry);
+    // Letta Code reads project commands from the repository-root `.commands/`,
+    // a generic directory whose prompts belong in version control.
+    expect(entries).not.toContain("**/.commands/");
+    expect(filterGitignoreEntries()).not.toContain("**/.commands/");
+  });
+
+  it("keeps the committedOutput flag meaningful for commands (lettacode sets it)", async () => {
+    const { toolCommandFactories } = await import("../../features/commands/commands-processor.js");
+    expect(toolCommandFactories.get("lettacode")?.meta.committedOutput).toBe(true);
+  });
+
+  it("never ignores GitLab Duo's import-only root skills directory", () => {
+    const entries = deriveAllGitignoreEntries()
+      .filter((tag) => tag.target === "gitlabduo")
+      .map((tag) => tag.entry);
+    // GitLab Duo also reads project skills from the repository-root `skills/`,
+    // which rulesync only imports from; a recursive entry for it would swallow
+    // unrelated `skills` directories such as rulesync's own distributed skills.
+    // Its checks file is committed too, so only the shared `.agents/` trees and
+    // its local-only files remain.
+    expect(entries.toSorted()).toEqual([
+      "**/.agents/commands/",
+      "**/.agents/skills/",
+      "**/.gitlab/duo/chat-rules.md",
+      "**/.gitlab/duo/hooks.json",
+      "**/.gitlab/duo/mcp.json",
+    ]);
+    expect(filterGitignoreEntries()).not.toContain("**/skills/");
+  });
+
+  it("re-includes a committed output nested inside another feature's ignored directory", () => {
+    const entries = deriveAllGitignoreEntries().map((tag) => tag.entry);
+    // The skills feature ignores `**/.factory/skills/`, but Factory Droid reads
+    // its review guidelines out of that tree and only sees them when committed
+    // (#2765). git cannot un-ignore a path inside an ignored directory, so the
+    // directory entry is widened to `/**` and the file re-included after it.
+    expect(entries).not.toContain("**/.factory/skills/");
+    const dirIndex = entries.indexOf("**/.factory/skills/**");
+    expect(dirIndex).toBeGreaterThanOrEqual(0);
+    // Last match wins, so both negations must follow the widened entry.
+    expect(entries.indexOf("!**/.factory/skills/review-guidelines/")).toBeGreaterThan(dirIndex);
+    expect(entries.indexOf("!**/.factory/skills/review-guidelines/SKILL.md")).toBeGreaterThan(
+      dirIndex,
+    );
+  });
+
+  it("derives no entry for an import-only extra file such as Factory Droid's output styles", () => {
+    const entries = deriveAllGitignoreEntries().map((tag) => tag.entry);
+    // `.factory/output-styles/` also holds hand-written styles a team commits,
+    // so it is neither a deletion target nor gitignored; the fixed channel
+    // files next to it still are.
+    expect(entries.some((entry) => entry.includes(".factory/output-styles"))).toBe(false);
+    expect(entries).toContain("**/.factory/threat-model.md");
+  });
+
+  it("derives no rules entry for a global-only target such as Codebuff's ~/.AGENTS.md", () => {
+    const entries = deriveAllGitignoreEntries().filter(
+      (tag) => tag.feature === "rules" && tag.target === "codebuff",
+    );
+    expect(entries).toEqual([]);
   });
 
   it("keeps the committedOutput flag meaningful (at least one checks factory sets it)", async () => {

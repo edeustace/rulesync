@@ -1,10 +1,6 @@
 import { join } from "node:path";
 
 import { KIMI_CODE_CONFIG_FILE_NAME } from "../../constants/kimi-code-paths.js";
-import {
-  RULESYNC_PERMISSIONS_FILE_NAME,
-  RULESYNC_RELATIVE_DIR_PATH,
-} from "../../constants/rulesync-paths.js";
 import type { SharedWritePath } from "../../lib/shared-file-derive.js";
 import type { AiFileParams, ValidationResult } from "../../types/ai-file.js";
 import type { PermissionAction, PermissionsConfig } from "../../types/permissions.js";
@@ -24,7 +20,7 @@ import {
   parseSharedConfig,
   stringifySharedConfig,
 } from "../shared/shared-config-gateway.js";
-import { RulesyncPermissions, withoutBlankPermissionPatterns } from "./rulesync-permissions.js";
+import { RulesyncPermissions } from "./rulesync-permissions.js";
 import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
@@ -100,6 +96,38 @@ function mergeKimiCodeToolsSection({
   }
   warnAboutMistypedToolLists(merged);
   return merged;
+}
+
+/**
+ * Carry the existing `[permission]` siblings of `rules` over onto the generated
+ * table. The gateway replaces the owned `permission` key wholesale and rulesync
+ * only ever authors `rules`, so a hand-written sibling such as
+ * `dangerous_command_guard = false` (Kimi Code 0.40.0) would otherwise be
+ * deleted on every generate. Unmodeled keys pass through verbatim; `rules`
+ * always comes from the patch, and so does `dangerous_command_guard` when the
+ * `kimi-code.dangerousCommandGuard` override sets it. Leaving the override out
+ * keeps whatever the file already has.
+ *
+ * @see https://moonshotai.github.io/kimi-code/en/configuration/config-files.html#permission
+ */
+function mergeKimiCodePermissionSection({
+  existingContent,
+  patch,
+}: {
+  existingContent: string;
+  patch: Record<string, unknown>;
+}): Record<string, unknown> {
+  let existing: unknown;
+  try {
+    existing = parseSharedConfig({ format: "toml", fileContent: existingContent }).permission;
+  } catch {
+    existing = undefined;
+  }
+  const { rules: _existingRules, ...siblings } = isRecord(existing) ? existing : {};
+  return {
+    ...siblings,
+    ...(isRecord(patch.permission) ? patch.permission : {}),
+  };
 }
 
 /**
@@ -269,6 +297,24 @@ function sortKimiCodeRulesFailClosed(rules: KimiCodePermissionRule[]): KimiCodeP
     .map(({ rule }) => rule);
 }
 
+/**
+ * Read a `[[permission.rules]]` entry's pattern the way Kimi does. Besides the
+ * `pattern = "Tool(arg)"` form Rulesync writes, Kimi accepts entries naming the
+ * tool separately (`tool = "Bash"` plus `match` or `pattern` for the argument)
+ * and folds them into `Tool(arg)`, or the bare tool name when no argument
+ * pattern is given; `match` wins over `pattern`.
+ *
+ * @see https://github.com/MoonshotAI/kimi-code/blob/%40moonshot-ai/kimi-code%402.1.1/packages/agent-core-v2/src/agent/permissionRules/configSection.ts
+ */
+function readKimiCodeRulePattern(raw: Record<string, unknown>): string | undefined {
+  const { tool, match, pattern } = raw;
+  if (typeof tool !== "string") {
+    return typeof pattern === "string" ? pattern : undefined;
+  }
+  const argument = typeof match === "string" ? match : pattern;
+  return typeof argument === "string" ? `${tool}(${argument})` : tool;
+}
+
 function preserveKimiCodeRules(rules: unknown): {
   permission: PermissionsConfig["permission"];
   nativeRules: KimiCodePermissionRule[];
@@ -284,7 +330,7 @@ function preserveKimiCodeRules(rules: unknown): {
       continue;
     }
     const decision = raw.decision;
-    const pattern = raw.pattern;
+    const pattern = readKimiCodeRulePattern(raw);
     if (
       (decision !== "allow" && decision !== "ask" && decision !== "deny") ||
       typeof pattern !== "string"
@@ -351,11 +397,20 @@ export class KimiCodePermissions extends ToolPermissions {
     // it is recomputed from the existing file: authoring only `enabled` must
     // not delete a hand-written `disabled` list.
     const mergedTools = mergeKimiCodeToolsSection({ existingContent: fileContent, patch });
+    // Likewise `permission` is a table of which rulesync authors only `rules`.
+    const mergedPermission = mergeKimiCodePermissionSection({
+      existingContent: fileContent,
+      patch,
+    });
     this.fileContent = applySharedConfigPatch({
       fileKey: getKimiCodeConfigSharedFileKey({ global: this.global }),
       feature: "permissions",
       existingContent: fileContent,
-      patch: { ...patch, ...(mergedTools && { tools: mergedTools }) },
+      patch: {
+        ...patch,
+        permission: mergedPermission,
+        ...(mergedTools && { tools: mergedTools }),
+      },
       filePath: join(paths.relativeDirPath, paths.relativeFilePath),
     });
   }
@@ -383,6 +438,7 @@ export class KimiCodePermissions extends ToolPermissions {
   }: ToolPermissionsFromRulesyncPermissionsParams): KimiCodePermissions {
     const config = rulesyncPermissions.getJson();
     const defaultPermissionMode = config["kimi-code"]?.defaultPermissionMode;
+    const dangerousCommandGuard = config["kimi-code"]?.dangerousCommandGuard;
     const tools = buildKimiCodeToolsSection(config["kimi-code"]?.tools);
     const document = {
       ...(defaultPermissionMode && {
@@ -390,6 +446,9 @@ export class KimiCodePermissions extends ToolPermissions {
       }),
       ...(tools && { tools }),
       permission: {
+        ...(typeof dangerousCommandGuard === "boolean" && {
+          dangerous_command_guard: dangerousCommandGuard,
+        }),
         rules: canonicalToKimiCodeRules({ config, logger }),
       },
     };
@@ -422,6 +481,7 @@ export class KimiCodePermissions extends ToolPermissions {
     const permissionConfig = isRecord(config.permission) ? config.permission : {};
     const { permission, nativeRules } = preserveKimiCodeRules(permissionConfig.rules);
     const defaultPermissionMode = config.default_permission_mode;
+    const dangerousCommandGuard = permissionConfig.dangerous_command_guard;
     const tools = buildKimiCodeToolsSection(config.tools);
     const toolOverride = {
       ...(defaultPermissionMode === "manual" ||
@@ -429,28 +489,26 @@ export class KimiCodePermissions extends ToolPermissions {
       defaultPermissionMode === "auto"
         ? { defaultPermissionMode }
         : {}),
+      ...(typeof dangerousCommandGuard === "boolean" && { dangerousCommandGuard }),
       ...(nativeRules.length > 0 && { rules: nativeRules }),
       ...(tools && { tools }),
     };
-    return new RulesyncPermissions({
+    return RulesyncPermissions.fromImportedFileContent({
       outputRoot: getKimiCodeRulesyncOutputRoot({
         nativeOutputRoot: this.outputRoot,
         global: this.global,
       }),
-      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
-      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
-      fileContent: withoutBlankPermissionPatterns({
-        fileContent: JSON.stringify(
-          {
-            permission,
-            ...(Object.keys(toolOverride).length > 0 && {
-              "kimi-code": toolOverride,
-            }),
-          },
-          null,
-          2,
-        ),
-      }),
+      sourcePath: this.getRelativePathFromCwd(),
+      fileContent: JSON.stringify(
+        {
+          permission,
+          ...(Object.keys(toolOverride).length > 0 && {
+            "kimi-code": toolOverride,
+          }),
+        },
+        null,
+        2,
+      ),
     });
   }
 

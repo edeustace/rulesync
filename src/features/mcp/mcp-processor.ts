@@ -15,15 +15,28 @@ import { AntigravityCliMcp } from "./antigravity-cli-mcp.js";
 import { AntigravityIdeMcp } from "./antigravity-ide-mcp.js";
 import { AntigravityPluginMcp } from "./antigravity-plugin-mcp.js";
 import { AugmentcodeMcp } from "./augmentcode-mcp.js";
+import { BobMcp } from "./bob-mcp.js";
 import { ClaudecodeMcp } from "./claudecode-mcp.js";
+import { ClaudecodePluginMcp } from "./claudecode-plugin-mcp.js";
 import { ClineMcp } from "./cline-mcp.js";
+import { CodebuddyMcp } from "./codebuddy-mcp.js";
+import { CodebuffMcp } from "./codebuff-mcp.js";
+import { CodewhaleMcp } from "./codewhale-mcp.js";
 import { CodexcliMcp } from "./codexcli-mcp.js";
+import { CommandcodeMcp } from "./commandcode-mcp.js";
+import { ContinueMcp } from "./continue-mcp.js";
 import { CopilotMcp } from "./copilot-mcp.js";
 import { CopilotcliMcp } from "./copilotcli-mcp.js";
+import { CortexcodeMcp } from "./cortexcode-mcp.js";
+import { CrushMcp } from "./crush-mcp.js";
 import { CursorMcp } from "./cursor-mcp.js";
 import { DeepagentsMcp } from "./deepagents-mcp.js";
 import { DevinMcp } from "./devin-mcp.js";
+import { DevinPluginMcp } from "./devin-plugin-mcp.js";
+import { DshMcp } from "./dsh-mcp.js";
 import { FactorydroidMcp } from "./factorydroid-mcp.js";
+import { FirebenderMcp } from "./firebender-mcp.js";
+import { GitlabduoMcp } from "./gitlabduo-mcp.js";
 import { GooseMcp } from "./goose-mcp.js";
 import { GrokcliMcp } from "./grokcli-mcp.js";
 import { HermesagentMcp } from "./hermesagent-mcp.js";
@@ -31,13 +44,20 @@ import { JunieMcp } from "./junie-mcp.js";
 import { KiloMcp } from "./kilo-mcp.js";
 import { KimiCodeMcp } from "./kimi-code-mcp.js";
 import { KiroMcp } from "./kiro-mcp.js";
+import { MimocodeMcp } from "./mimocode-mcp.js";
 import { MusecodeMcp } from "./musecode-mcp.js";
+import { OmpMcp } from "./omp-mcp.js";
+import { OpenclawMcp } from "./openclaw-mcp.js";
 import { OpencodeMcp } from "./opencode-mcp.js";
+import { PiMcp } from "./pi-mcp.js";
+import { PoolMcp } from "./pool-mcp.js";
+import { QoderMcp } from "./qoder-mcp.js";
 import { QwencodeMcp } from "./qwencode-mcp.js";
 import { ReasonixMcp } from "./reasonix-mcp.js";
 import { RooMcp } from "./roo-mcp.js";
 import { RovodevMcp } from "./rovodev-mcp.js";
 import { RulesyncMcp } from "./rulesync-mcp.js";
+import { TabnineMcp } from "./tabnine-mcp.js";
 import { TaktMcp } from "./takt-mcp.js";
 import {
   ToolMcp,
@@ -46,8 +66,14 @@ import {
   ToolMcpFromRulesyncMcpParams,
   ToolMcpSettablePaths,
 } from "./tool-mcp.js";
+import { TraeMcp } from "./trae-mcp.js";
 import { VibeMcp } from "./vibe-mcp.js";
+import { VibePluginMcp } from "./vibe-plugin-mcp.js";
 import { WarpMcp } from "./warp-mcp.js";
+import { WarpcliMcp } from "./warpcli-mcp.js";
+import { XumMcp } from "./xum-mcp.js";
+import { ZcodeMcp } from "./zcode-mcp.js";
+import { ZcodePluginMcp } from "./zcode-plugin-mcp.js";
 import { ZedMcp } from "./zed-mcp.js";
 
 /**
@@ -109,7 +135,8 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
       // `.ai/mcp/mcp.json` and global (user-level) config from
       // `~/.ai/mcp/mcp.json`. The relative path is identical for both scopes;
       // the base directory changes (cwd for project, home dir for global).
-      // https://www.jetbrains.com/help/ai-assistant/mcp.html
+      // Both are the plugin's registry-key defaults; see the note in
+      // `src/constants/aiassistant-paths.ts`.
       class: AiassistantMcp,
       meta: {
         supportsProject: true,
@@ -184,6 +211,37 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     },
   ],
   [
+    "augmentcode-plugin",
+    {
+      // An Auggie plugin declares its servers in a Claude-style `.mcp.json`
+      // (`mcpServers`) at the plugin root. https://docs.augmentcode.com/cli/plugins
+      class: ClaudecodeMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: false,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "bob",
+    {
+      // IBM Bob reads `mcpServers` from the dedicated `<project>/.bob/mcp.json`
+      // (project) and `~/.bob/settings/mcp.json` (global). Bob has `alwaysAllow` for
+      // auto-approval, not a per-server tool filter, so the enabled/disabled
+      // tool lists are not emitted.
+      // https://bob.ibm.com/docs/ide/configuration/mcp/mcp-in-bob
+      class: BobMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
     "claudecode",
     {
       class: ClaudecodeMcp,
@@ -198,7 +256,7 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
   [
     "claudecode-plugin",
     {
-      class: ClaudecodeMcp,
+      class: ClaudecodePluginMcp,
       meta: {
         supportsProject: true,
         supportsGlobal: false,
@@ -236,6 +294,54 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     },
   ],
   [
+    "codebuddy",
+    {
+      // CodeBuddy Code reads the project `.mcp.json` at the repository root and
+      // the user `~/.codebuddy/.mcp.json`; it has no per-server tool
+      // allow/deny lists.
+      // https://www.codebuddy.ai/docs/cli/mcp
+      class: CodebuddyMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "codebuff",
+    {
+      // Codebuff (Freebuff) reads `.agents/mcp.json` in the project and
+      // `~/.agents/mcp.json` in the home directory; its server schema has no
+      // per-server tool allow/deny lists.
+      // https://www.codebuff.com/docs/tips/mcp-servers
+      class: CodebuffMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "codewhale",
+    {
+      // Codewhale reads `.codewhale/mcp.json` in a trusted workspace and
+      // `~/.codewhale/mcp.json` for the user; servers carry
+      // `enabled_tools` / `disabled_tools` filters.
+      // https://github.com/Hmbown/Codewhale/blob/main/docs/MCP.md
+      class: CodewhaleMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: true,
+        supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
     "codexcli",
     {
       class: CodexcliMcp,
@@ -244,6 +350,34 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
         supportsGlobal: true,
         supportsEnabledTools: true,
         supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
+    "commandcode",
+    {
+      // Command Code reads the project `.mcp.json` at the repository root and
+      // the user `~/.commandcode/mcp.json`; it has no per-server tool
+      // allow/deny lists.
+      // https://commandcode.ai/docs/mcp
+      class: CommandcodeMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "continue",
+    {
+      class: ContinueMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
       },
     },
   ],
@@ -270,6 +404,38 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
         // `disabledTools` counterpart upstream.
         supportsEnabledTools: true,
         supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "cortexcode",
+    {
+      // Cortex Code reads MCP servers only from the single GLOBAL file
+      // `~/.snowflake/cortex/mcp.json`; no project-scoped MCP location is
+      // documented.
+      // https://docs.snowflake.com/en/user-guide/cortex-code/extensibility#mcp-configuration
+      class: CortexcodeMcp,
+      meta: {
+        supportsProject: false,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "crush",
+    {
+      // Crush reads the `mcp` key of `<project>/crush.json` (or `.crush.json`)
+      // and `~/.config/crush/crush.json`; each server carries its own
+      // `enabled_tools` / `disabled_tools` filters.
+      // https://github.com/charmbracelet/crush/blob/main/docs/config/README.md
+      class: CrushMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: true,
+        supportsDisabledTools: true,
       },
     },
   ],
@@ -303,6 +469,22 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     },
   ],
   [
+    "dsh",
+    {
+      // DeepSeek Harness persists MCP servers as `@deepseek-ai/dsh-mcp-client`
+      // `insert` rows of the home-level Cordis patch layer
+      // `~/.dsh/cordis.patch.yml`; it has no project-scoped MCP file, and the
+      // client has no per-server tool allow/deny lists.
+      class: DshMcp,
+      meta: {
+        supportsProject: false,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
     "factorydroid",
     {
       class: FactorydroidMcp,
@@ -315,6 +497,22 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
         // https://docs.factory.ai/cli/configuration/mcp
         supportsEnabledTools: false,
         supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
+    "firebender",
+    {
+      // Firebender reads the `mcpServers` key of the project-root
+      // `firebender.json` and of `~/.firebender/firebender.json`. Per-server
+      // tool filters are not part of the documented entry shape.
+      // https://docs.firebender.com/api-reference/syntax
+      class: FirebenderMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
       },
     },
   ],
@@ -337,18 +535,37 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     },
   ],
   [
+    "gitlabduo",
+    {
+      // GitLab Duo CLI reads `.gitlab/duo/mcp.json` (workspace) and
+      // `~/.gitlab/duo/mcp.json` (user) in the `mcpServers` shape. Its only
+      // per-server tool field is `approvedTools` (auto-approval), not a filter.
+      // https://docs.gitlab.com/user/gitlab_duo/model_context_protocol/mcp_clients/
+      class: GitlabduoMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
     "grokcli",
     {
       // Grok Build stores MCP servers in `.grok/config.toml` (project) and
-      // `~/.grok/config.toml` (global) as `[mcp_servers.<name>]` tables. It has
-      // no per-server tool allow/deny lists.
+      // `~/.grok/config.toml` (global) as `[mcp_servers.<name>]` tables.
+      // `disabledTools` maps onto the user-config-only top-level
+      // `[disabled_mcp_tools]` table, so `GrokcliMcp` writes it in global
+      // mode and warns and drops it in project mode. There is no per-server
+      // tool allowlist, so `enabledTools` stays unsupported.
       // https://docs.x.ai/build/overview
       class: GrokcliMcp,
       meta: {
         supportsProject: true,
         supportsGlobal: true,
         supportsEnabledTools: false,
-        supportsDisabledTools: false,
+        supportsDisabledTools: true,
       },
     },
   ],
@@ -360,6 +577,22 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
       // no project-scoped MCP location. Per-server tool filtering uses
       // `tools.include` and `tools.exclude`.
       class: HermesagentMcp,
+      meta: {
+        supportsProject: false,
+        supportsGlobal: true,
+        supportsEnabledTools: true,
+        supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
+    "openclaw",
+    {
+      // OpenClaw reads MCP servers from `mcp.servers` of its global JSON5
+      // Gateway config `~/.openclaw/openclaw.json`; it has no project-scoped
+      // MCP location. Per-server tool filtering uses `toolFilter.include` and
+      // `toolFilter.exclude`.
+      class: OpenclawMcp,
       meta: {
         supportsProject: false,
         supportsGlobal: true,
@@ -455,6 +688,18 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     },
   ],
   [
+    "mimocode",
+    {
+      class: MimocodeMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: true,
+        supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
     "musecode",
     {
       // Muse Code reads MCP servers only from the `mcp_servers` block of the
@@ -466,6 +711,18 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
       class: MusecodeMcp,
       meta: {
         supportsProject: false,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "omp",
+    {
+      class: OmpMcp,
+      meta: {
+        supportsProject: true,
         supportsGlobal: true,
         supportsEnabledTools: false,
         supportsDisabledTools: false,
@@ -485,10 +742,56 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     },
   ],
   [
+    "pi",
+    {
+      // Pi 1.0+ reads `mcpServers` from `.pi/mcp.json` (project, once trusted)
+      // and `~/.pi/agent/mcp.json` (global); there are no per-server tool
+      // allow/deny lists (`toolExposure` is a different model).
+      // https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/mcp.md
+      class: PiMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "pool",
+    {
+      class: PoolMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: true,
+        supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
+    "qoder",
+    {
+      // Qoder reads the project `.mcp.json` (shared with Claude Code) and the
+      // `mcpServers` key of the user `~/.qoder/settings.json`. Per-server tool
+      // filters are not documented for these files.
+      // https://docs.qoder.com/en/cli/04-extending-qoder-cli/mcp-servers
+      class: QoderMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
     "qwencode",
     {
       // Qwen Code reads MCP servers from the `mcpServers` key of
       // `.qwen/settings.json` (project) / `~/.qwen/settings.json` (global).
+      // Project import also reads the Claude-parity root `.mcp.json` beneath
+      // settings (settings win); generation never writes it.
       // It supports per-server tool filtering via `includeTools` (allowlist)
       // and `excludeTools` (denylist), which the adapter maps to/from
       // rulesync's `enabledTools`/`disabledTools`.
@@ -506,14 +809,16 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     {
       // Reasonix reads MCP servers as `[[plugins]]` array-of-tables entries from
       // `./reasonix.toml` (project) / `~/.reasonix/config.toml` (global). Each
-      // entry carries a `name` plus the standard transport fields; it has no
-      // per-server tool allow/deny lists.
+      // entry carries a `name` plus the standard transport fields. The CLI v2
+      // line adds a per-server `disabled_tools` denylist of raw tool names, but
+      // no allowlist.
+      // https://github.com/esengine/DeepSeek-Reasonix/blob/v2.31.0/internal/contract/config/plugin_entry.go
       class: ReasonixMcp,
       meta: {
         supportsProject: true,
         supportsGlobal: true,
         supportsEnabledTools: false,
-        supportsDisabledTools: false,
+        supportsDisabledTools: true,
       },
     },
   ],
@@ -565,6 +870,22 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     },
   ],
   [
+    "tabnine",
+    {
+      // Tabnine CLI reads `mcpServers` from `<project>/.tabnine/agent/settings.json`
+      // (project) and `~/.tabnine/agent/settings.json` (user). Per-server
+      // `includeTools` / `excludeTools` carry the enabled/disabled tool lists.
+      // https://docs.tabnine.com/main/getting-started/tabnine-agent/mcp-intro-and-setup/mcp-server-config
+      class: TabnineMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: true,
+        supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
     "takt",
     {
       // Takt has no project/global registry of MCP server *definitions* — those
@@ -578,6 +899,22 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
       meta: {
         supportsProject: true,
         supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "trae",
+    {
+      // Trae reads project MCP servers from `.trae/mcp.json` (`mcpServers`);
+      // user-level servers are managed in the IDE UI with no documented file,
+      // and the per-server schema has no tool allow/deny list.
+      // https://docs.trae.ai/ide/add-mcp-servers?_lang=en
+      class: TraeMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: false,
         supportsEnabledTools: false,
         supportsDisabledTools: false,
       },
@@ -601,6 +938,21 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
     },
   ],
   [
+    "vibe-plugin",
+    {
+      // A Vibe plugin declares its servers in an Agent Plugins `mcp.json` at
+      // the plugin root, which has no tool filters.
+      // https://github.com/mistralai/mistral-vibe/blob/v2.25.8/vibe/core/plugins/_native.py
+      class: VibePluginMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: false,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
     "warp",
     {
       class: WarpMcp,
@@ -608,6 +960,40 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
         supportsProject: true,
         supportsGlobal: true,
         supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "warpcli",
+    {
+      // The standalone Warp Agent CLI reads MCP servers only from its own
+      // global `.mcp.json` ("Project-scoped MCP config files in repositories
+      // are not detected"); the path differs per platform, resolved in
+      // WarpcliMcp.getSettablePaths.
+      // https://docs.warp.dev/agents/cli/configuration/
+      class: WarpcliMcp,
+      meta: {
+        supportsProject: false,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "xum",
+    {
+      // Xum reads `~/.xum/mcp.jsonc` (user) and the repo override
+      // `.xum/mcp.jsonc` (project): a `servers` map of stdio command strings
+      // or `{ transport, url, headers }` remote entries. `toolAllowlist` maps
+      // the canonical `enabledTools`; there is no per-server deny list.
+      // https://xum.cdr.dev/config/mcp-servers
+      class: XumMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: true,
         supportsDisabledTools: false,
       },
     },
@@ -626,6 +1012,52 @@ export const toolMcpFactories = new Map<McpProcessorToolTarget, ToolMcpFactory>(
         supportsGlobal: true,
         supportsEnabledTools: false,
         supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
+    "devin-plugin",
+    {
+      // A Devin plugin declares its servers in a root `.mcp.json`, read with
+      // the same server shape (including `disabledTools`) as
+      // `.devin/mcp_config.json`.
+      // https://docs.devin.ai/cli/extensibility/plugins/overview
+      class: DevinPluginMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: false,
+        supportsEnabledTools: false,
+        supportsDisabledTools: true,
+      },
+    },
+  ],
+  [
+    "zcode",
+    {
+      class: ZcodeMcp,
+      meta: {
+        // ZCode reads `mcp.servers` from `<project>/.zcode/config.json` and
+        // `~/.zcode/cli/config.json`. Per-server tool filters are not part of
+        // the documented entry shape.
+        // https://zcode.z.ai/en/docs/mcp-services
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
+      },
+    },
+  ],
+  [
+    "zcode-plugin",
+    {
+      // A ZCode plugin declares its servers in `.mcp.json` (`mcpServers`) at
+      // the plugin root. https://zcode.z.ai/en/docs/plugin
+      class: ZcodePluginMcp,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: false,
+        supportsEnabledTools: false,
+        supportsDisabledTools: false,
       },
     },
   ],
@@ -832,6 +1264,7 @@ export class McpProcessor extends FeatureProcessor {
         // deprecated per-server `targets` filter for this target.
         const targetedRulesyncMcp = mcp.forTarget({
           toolTarget: this.toolTarget,
+          global: this.global,
           logger: this.logger,
         });
         // Strip MCP server fields unsupported by the target tool

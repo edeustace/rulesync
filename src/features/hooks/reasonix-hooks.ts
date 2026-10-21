@@ -12,8 +12,9 @@ import {
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
 import type { RulesyncHooks } from "./rulesync-hooks.js";
-import { buildImportedHooksConfig } from "./tool-hooks-converter.js";
+import { buildImportedHooksConfig, isSafeEnvEntry } from "./tool-hooks-converter.js";
 import {
   ToolHooks,
   type ToolHooksForDeletionParams,
@@ -33,13 +34,21 @@ type ReasonixHookEntry = {
   command: string;
   description?: string;
   timeout?: number;
+  cwd?: string;
+  env?: Record<string, string>;
 };
 
 /**
- * Only PreToolUse/PostToolUse honor the `match` field (an anchored regex
- * against the tool name); it is ignored on every other event.
+ * Only the tool-scoped events honor the `match` field (an anchored regex
+ * against the tool name); it is ignored on every other event. Mirrors
+ * `UsesToolMatcher` in upstream `internal/hook/inspect.go`.
  */
-const REASONIX_MATCHER_EVENTS: ReadonlySet<string> = new Set(["PreToolUse", "PostToolUse"]);
+const REASONIX_MATCHER_EVENTS: ReadonlySet<string> = new Set([
+  "PreToolUse",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "PermissionRequest",
+]);
 
 const SUPPORTED_REASONIX_EVENTS: ReadonlySet<string> = new Set(REASONIX_HOOK_EVENTS);
 
@@ -70,7 +79,8 @@ function canonicalToReasonixHooks({
     if (!SUPPORTED_REASONIX_EVENTS.has(event)) {
       continue;
     }
-    const reasonixEvent = CANONICAL_TO_REASONIX_EVENT_NAMES[event] ?? event;
+    const reasonixEvent =
+      lookupOwn({ record: CANONICAL_TO_REASONIX_EVENT_NAMES, key: event }) ?? event;
     const isMatcherEvent = REASONIX_MATCHER_EVENTS.has(reasonixEvent);
     const entries: ReasonixHookEntry[] = [];
     for (const def of defs) {
@@ -100,13 +110,78 @@ function canonicalToReasonixHooks({
         // while Reasonix's `timeout` field is milliseconds, so convert.
         entry.timeout = Math.round(def.timeout * 1000);
       }
-      entries.push(entry);
+      entries.push({ ...entry, ...toReasonixInvocationContext({ def, logger }) });
     }
     if (entries.length > 0) {
-      result[reasonixEvent] = [...(result[reasonixEvent] ?? []), ...entries];
+      result[reasonixEvent] = [
+        ...(lookupOwn({ record: result, key: reasonixEvent }) ?? []),
+        ...entries,
+      ];
     }
   }
   return result;
+}
+
+/**
+ * The per-hook `cwd` / `env` pair (upstream `HookConfig.Cwd` / `HookConfig.Env`).
+ * `env` is a canonical field; `cwd` is not a canonical schema key, so — as with
+ * Copilot's hooks — it rides on the loose canonical definition as a
+ * passthrough field.
+ */
+function toReasonixInvocationContext({
+  def,
+  logger,
+}: {
+  def: HookDefinition;
+  logger?: Logger;
+}): Pick<ReasonixHookEntry, "cwd" | "env"> {
+  const cwd: unknown = def["cwd"];
+  const env = sanitizeEnv({ env: def.env, warn: (message) => logger?.warn(message) });
+  return {
+    ...(typeof cwd === "string" && cwd !== "" && { cwd }),
+    ...(env !== undefined && { env }),
+  };
+}
+
+function fromReasonixInvocationContext(
+  entry: Record<string, unknown>,
+): Pick<HookDefinition, "env"> & { cwd?: string } {
+  const env = sanitizeEnv({ env: entry.env });
+  return {
+    ...(typeof entry.cwd === "string" && entry.cwd !== "" && { cwd: entry.cwd }),
+    ...(env !== undefined && { env }),
+  };
+}
+
+/**
+ * Environment block safe to hand Reasonix for a hook. As with Tabnine, the
+ * per-entry rule of the shared converter (`isSafeEnvEntry`: a key holding `=`,
+ * a control character or nothing at all names a different variable than it
+ * appears to; a value may not hold a control character) is applied entry by
+ * entry and the bad ones are dropped in both directions, with a warning on
+ * export, where the value came from an authored `.rulesync/hooks.*`.
+ */
+function sanitizeEnv({
+  env,
+  warn,
+}: {
+  env: unknown;
+  warn?: (message: string) => void;
+}): Record<string, string> | undefined {
+  if (env === null || typeof env !== "object" || Array.isArray(env)) {
+    return undefined;
+  }
+  const result: Record<string, string> = {};
+  for (const [key, value] of Object.entries(env)) {
+    if (!isSafeEnvEntry({ key, value })) {
+      warn?.(
+        `Reasonix hook env entry ${JSON.stringify(key)} is not a safe KEY=VALUE pair; skipping it.`,
+      );
+      continue;
+    }
+    result[key] = value;
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
 }
 
 /**
@@ -122,7 +197,8 @@ function reasonixHooksToCanonical(hooks: unknown): HooksConfig["hooks"] {
     if (!Array.isArray(rawEntries)) {
       continue;
     }
-    const canonicalEvent = REASONIX_TO_CANONICAL_EVENT_NAMES[reasonixEvent] ?? reasonixEvent;
+    const canonicalEvent =
+      lookupOwn({ record: REASONIX_TO_CANONICAL_EVENT_NAMES, key: reasonixEvent }) ?? reasonixEvent;
     const defs: HookDefinition[] = [];
     for (const rawEntry of rawEntries) {
       if (rawEntry === null || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
@@ -142,10 +218,13 @@ function reasonixHooksToCanonical(hooks: unknown): HooksConfig["hooks"] {
       if (typeof entry.timeout === "number") {
         def.timeout = entry.timeout / 1000;
       }
-      defs.push(def);
+      defs.push({ ...def, ...fromReasonixInvocationContext(entry) });
     }
     if (defs.length > 0) {
-      canonical[canonicalEvent] = [...(canonical[canonicalEvent] ?? []), ...defs];
+      canonical[canonicalEvent] = [
+        ...(lookupOwn({ record: canonical, key: canonicalEvent }) ?? []),
+        ...defs,
+      ];
     }
   }
   return canonical;
@@ -157,9 +236,11 @@ function reasonixHooksToCanonical(hooks: unknown): HooksConfig["hooks"] {
  * Reasonix hooks live in a Claude-Code-style but standalone JSON file —
  * `.reasonix/settings.json` (project) or `~/.reasonix/settings.json`
  * (global) — separate from the `[permissions]`/`[[plugins]]` TOML config.
- * All ten upstream events have a clean canonical equivalent and are mapped:
- * PreToolUse/PostToolUse/UserPromptSubmit/Stop plus SessionStart/SessionEnd/
- * SubagentStop/PostLLMCall/Notification/PreCompact (see REASONIX_HOOK_EVENTS).
+ * All thirteen upstream events have a clean canonical equivalent and are mapped:
+ * PreToolUse/PostToolUse/PostToolUseFailure/PermissionRequest/UserPromptSubmit/
+ * Stop/StopFailure plus SessionStart/SessionEnd/SubagentStop/PostLLMCall/
+ * Notification/PreCompact (see REASONIX_HOOK_EVENTS).
+ * @see https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/internal/hook/hook.go
  * @see https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/docs/DESKTOP_HOOKS.zh-CN.md
  */
 export class ReasonixHooks extends ToolHooks {

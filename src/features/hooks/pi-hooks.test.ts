@@ -6,7 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { RULESYNC_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
-import { ensureDir, writeFileContent } from "../../utils/file.js";
+import { ensureDir, fileExists, writeFileContent } from "../../utils/file.js";
 import { PiHooks } from "./pi-hooks.js";
 import { RulesyncHooks } from "./rulesync-hooks.js";
 
@@ -78,6 +78,19 @@ function userPrompt({ source = "interactive" }: { source?: string } = {}) {
   return { text: "hi", source };
 }
 
+function settleEvent({
+  entries = [],
+  outcome = "completed",
+}: { entries?: unknown[]; outcome?: string } = {}) {
+  return {
+    type: "agent_before_settle",
+    entries,
+    continue: false,
+    context: { canContinue: false },
+    outcome,
+  };
+}
+
 function uiContext({
   notify,
   hasUI = true,
@@ -133,10 +146,11 @@ describe("PiHooks", () => {
           postModelInvocation: [{ command: "post-model.sh" }],
           preCompact: [{ command: "pre-compact.sh" }],
           postCompact: [{ command: "post-compact.sh" }],
-          // notification has no Pi extension event equivalent
           notification: [{ command: "notify.sh" }],
           // afterFileEdit has no Pi extension event equivalent
           afterFileEdit: [{ command: "format.sh" }],
+          // subagentStart has no Pi extension event equivalent
+          subagentStart: [{ command: "spawn.sh" }],
         },
       };
       const piHooks = PiHooks.fromRulesyncHooks({
@@ -150,7 +164,14 @@ describe("PiHooks", () => {
       expect(content).toContain(".rulesync/hooks/session-start.sh");
       expect(content).toContain('pi.on("session_shutdown", async () => {');
       expect(content).toContain("teardown.sh");
-      expect(content).toContain('pi.on("agent_end", async () => {');
+      // `stop` maps to Pi's actionable settle boundary (v0.87.0), so the
+      // handler reads the event, and `agent_settled` resets its loop guard.
+      expect(content).toContain('pi.on("agent_before_settle", async (event) => {');
+      expect(content).toContain('pi.on("agent_settled", async () => {');
+      expect(content).not.toContain('"agent_end"');
+      expect(content).toContain(
+        'import type { AgentBeforeSettleEvent, AgentBeforeSettleEventResult, ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";',
+      );
       expect(content).toContain(".rulesync/hooks/audit.sh");
       // `input` gates prompt submission, so the handler takes `ctx` for the
       // notify channel and returns an explicit `continue` on success.
@@ -171,10 +192,48 @@ describe("PiHooks", () => {
       // losing the subscription again.
       expect(content).toContain('pi.on("session_compact", async () => {');
       expect(content).toContain("post-compact.sh");
+      // `ui_prompt_start` is Pi's "waiting for user" signal (v0.84.4); it is
+      // notification-only, so the handler observes and takes no payload.
+      expect(content).toContain('pi.on("ui_prompt_start", async () => {');
+      expect(content).toContain("notify.sh");
+      expect(content).not.toContain("ui_prompt_end");
 
       // Unsupported events should not appear
-      expect(content).not.toContain("notify.sh");
       expect(content).not.toContain("format.sh");
+      expect(content).not.toContain("spawn.sh");
+    });
+
+    it("should gate postToolUseFailure handlers on event.isError within tool_result", () => {
+      const config = {
+        version: 1,
+        hooks: {
+          postToolUse: [{ type: "command", command: "post-tool.sh" }],
+          postToolUseFailure: [
+            { type: "command", command: "on-failure.sh" },
+            { type: "command", command: "on-bash-failure.sh", matcher: "Bash" },
+          ],
+        },
+      };
+      const piHooks = PiHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks: buildRulesyncHooks({ testDir, config }),
+        validate: false,
+      });
+
+      const content = piHooks.getFileContent();
+      // Both canonical events share Pi's `tool_result`, so there is exactly one
+      // subscription, and it takes the event because the failure gate reads it.
+      expect(content.match(/pi\.on\("tool_result"/g)).toHaveLength(1);
+      expect(content).toContain('pi.on("tool_result", async (event) => {');
+      // `postToolUse` is not gated: Pi fires `tool_result` for failed calls
+      // too, and that is what the mapping has always meant.
+      expect(content).toContain('    await run("post-tool.sh");');
+      expect(content).toContain("    if (event.isError) {");
+      expect(content).toContain('      await run("on-failure.sh");');
+      expect(content).toContain(
+        '    if (event.isError && new RegExp("Bash").test(event.toolName)) {',
+      );
+      expect(content).toContain('      await run("on-bash-failure.sh");');
     });
 
     it("should generate tool event handlers honoring matchers against event.toolName", () => {
@@ -484,8 +543,110 @@ describe("PiHooks", () => {
         },
       });
 
-      expect(registeredEvents).toEqual(["session_start", "tool_call", "agent_end"]);
+      expect(registeredEvents).toEqual([
+        "session_start",
+        "tool_call",
+        "agent_before_settle",
+        "agent_settled",
+      ]);
       expect(handlerFor("session_start")).toBeTypeOf("function");
+    });
+
+    it("should ask the agent to continue once when a stop hook command exits with 2", async () => {
+      const { handlerFor } = await loadPiExtension({
+        testDir,
+        config: {
+          version: 1,
+          hooks: { stop: [{ command: "echo tests are failing >&2; exit 2" }] },
+        },
+      });
+      const settle = handlerFor("agent_before_settle");
+      const settled = handlerFor("agent_settled");
+      const earlier = { type: "custom", customType: "other-extension" };
+
+      // Drafts proposed by earlier extensions are kept ahead of the reason.
+      expect(await settle(settleEvent({ entries: [earlier] }))).toEqual({
+        entries: [
+          earlier,
+          {
+            type: "custom_message",
+            customType: "rulesync-stop-hook",
+            content: "Stop hook feedback:\ntests are failing",
+            display: true,
+          },
+        ],
+        continue: true,
+      });
+      // The continuation settles again; a second failure must not loop, and is
+      // left for Pi to report instead.
+      await expect(settle(settleEvent())).rejects.toMatchObject({ code: 2 });
+
+      // `agent_settled` ends the run, so the next prompt may continue again.
+      await settled();
+      expect(await settle(settleEvent())).toMatchObject({ continue: true });
+    });
+
+    it("should not continue an aborted or errored run from a stop hook", async () => {
+      const { handlerFor } = await loadPiExtension({
+        testDir,
+        config: { version: 1, hooks: { stop: [{ command: "exit 2" }] } },
+      });
+      const settle = handlerFor("agent_before_settle");
+
+      await expect(settle(settleEvent({ outcome: "aborted" }))).rejects.toMatchObject({ code: 2 });
+      await expect(settle(settleEvent({ outcome: "error" }))).rejects.toMatchObject({ code: 2 });
+      // Neither spent the guard.
+      expect(await settle(settleEvent())).toMatchObject({ continue: true });
+    });
+
+    it("should not continue for a stop hook that fails with an exit code other than 2", async () => {
+      // Claude Code's `Stop` blocks on exit code 2 only; any other failure,
+      // including a command that cannot be found, must not buy an extra request.
+      const { handlerFor } = await loadPiExtension({
+        testDir,
+        config: {
+          version: 1,
+          hooks: { stop: [{ command: "exit 1" }, { command: "rulesync-missing-command-3178" }] },
+        },
+      });
+
+      // Rethrown so Pi reports the broken hook instead of it failing silently.
+      await expect(handlerFor("agent_before_settle")(settleEvent())).rejects.toMatchObject({
+        code: 1,
+      });
+    });
+
+    it("should run every stop command and combine their feedback", async () => {
+      const marker = join(testDir, "second-ran");
+      const { handlerFor } = await loadPiExtension({
+        testDir,
+        config: {
+          version: 1,
+          hooks: {
+            stop: [
+              { command: "echo first >&2; exit 2" },
+              { command: `touch "${marker}"` },
+              { command: "echo third >&2; exit 2" },
+            ],
+          },
+        },
+      });
+
+      expect(await handlerFor("agent_before_settle")(settleEvent())).toMatchObject({
+        entries: [{ content: "Stop hook feedback:\nfirst\n\nthird" }],
+        continue: true,
+      });
+      expect(await fileExists(marker)).toBe(true);
+    });
+
+    it("should leave the settle boundary alone when every stop hook passes", async () => {
+      const { handlerFor } = await loadPiExtension({
+        testDir,
+        config: { version: 1, hooks: { stop: [{ command: "exit 0" }, { command: "exit 0" }] } },
+      });
+
+      // Returning nothing keeps another extension's `continue` decision.
+      expect(await handlerFor("agent_before_settle")(settleEvent())).toBeUndefined();
     });
 
     it("should generate an input handler that skips the agent when the command fails", async () => {
@@ -681,6 +842,25 @@ describe("PiHooks", () => {
       await gate(userPrompt(), uiContext({ notify }));
       const [reason] = notify.mock.calls[0] ?? [];
       expect(reason).toBe(`${"a".repeat(1999)}...`);
+    });
+
+    it("should run postToolUseFailure commands only for failed tool results", async () => {
+      const { registeredEvents, handlerFor } = await loadPiExtension({
+        testDir,
+        config: {
+          version: 1,
+          // An observe-only handler propagates its command's failure, so a
+          // command that always exits non-zero shows whether it ran.
+          hooks: { postToolUseFailure: [{ type: "command", command: "exit 3" }] },
+        },
+      });
+      expect(registeredEvents).toEqual(["tool_result"]);
+      const handler = handlerFor("tool_result");
+
+      await expect(handler({ toolName: "bash", isError: false })).resolves.toBeUndefined();
+      await expect(handler({ toolName: "bash", isError: true })).rejects.toMatchObject({
+        code: 3,
+      });
     });
 
     it("should generate an input handler that continues when the command succeeds", async () => {

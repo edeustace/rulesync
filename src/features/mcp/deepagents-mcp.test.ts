@@ -141,6 +141,54 @@ describe("DeepagentsMcp", () => {
       expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("socket"));
     });
 
+    it.each([false, true])(
+      "should normalize httpUrl, array commands and disabled for FastMCP 4 (global: %s)",
+      async (global) => {
+        const logger = createMockLogger();
+        const rulesyncMcp = new RulesyncMcp({
+          outputRoot: testDir,
+          relativeDirPath: ".rulesync",
+          relativeFilePath: "mcp.json",
+          fileContent: JSON.stringify({
+            mcpServers: {
+              "http-url-only": { httpUrl: "https://example.com/mcp" },
+              "http-url-typed": { type: "http", httpUrl: "https://example.com/mcp" },
+              "url-wins": { url: "https://example.com/a", httpUrl: "https://example.com/b" },
+              "array-command": { command: ["npx", "-y", "pkg"], args: ["--flag"] },
+              "array-command-only": { command: ["server"] },
+              "empty-command": { command: [] },
+              "remote-empty-command": { url: "https://example.com/r", command: [] },
+              "sse-http-url": { transport: "sse", httpUrl: "https://example.com/sse" },
+              off: { command: "npx", disabled: true },
+              on: { command: "npx", disabled: false },
+            },
+          }),
+        });
+
+        const mcp = await DeepagentsMcp.fromRulesyncMcp({
+          outputRoot: testDir,
+          rulesyncMcp,
+          logger,
+          global,
+        });
+
+        expect(mcp.getJson().mcpServers).toEqual({
+          "http-url-only": { type: "http", url: "https://example.com/mcp" },
+          "http-url-typed": { type: "http", url: "https://example.com/mcp" },
+          "url-wins": { url: "https://example.com/a" },
+          "array-command": { command: "npx", args: ["-y", "pkg", "--flag"] },
+          "array-command-only": { command: "server" },
+          "remote-empty-command": { url: "https://example.com/r" },
+          "sse-http-url": { transport: "sse", url: "https://example.com/sse" },
+          on: { command: "npx" },
+        });
+        expect(mcp.getRelativeFilePath()).toBe(".mcp.json");
+        expect(mcp.isDeletable()).toBe(!global);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("empty-command"));
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("disabled: true"));
+      },
+    );
+
     it("should translate enabledTools to allowedTools and keep disabledTools", async () => {
       const rulesyncMcp = new RulesyncMcp({
         outputRoot: testDir,
@@ -267,5 +315,51 @@ describe("DeepagentsMcp", () => {
       expect(mcp.getRelativeFilePath()).toBe(".mcp.json");
       expect(mcp.getFileContent()).toBe("{}");
     });
+  });
+});
+
+describe("DeepagentsMcp with DEEPAGENTS_HOME", () => {
+  const originalDeepagentsHome = process.env.DEEPAGENTS_HOME;
+  const originalHomeDir = process.env.HOME_DIR;
+
+  beforeEach(() => {
+    // `getDeepagentsHome` compares the override against the home directory,
+    // which the test environment refuses to resolve without `HOME_DIR`.
+    process.env.HOME_DIR = "/rulesync-home";
+  });
+
+  afterEach(() => {
+    if (originalDeepagentsHome === undefined) delete process.env.DEEPAGENTS_HOME;
+    else process.env.DEEPAGENTS_HOME = originalDeepagentsHome;
+    if (originalHomeDir === undefined) delete process.env.HOME_DIR;
+    else process.env.HOME_DIR = originalHomeDir;
+  });
+
+  it("drops the .deepagents prefix in global scope when DEEPAGENTS_HOME is set", () => {
+    process.env.DEEPAGENTS_HOME = "/custom-deepagents";
+    expect(DeepagentsMcp.getSettablePaths({ global: true })).toEqual({
+      relativeDirPath: ".",
+      relativeFilePath: ".mcp.json",
+    });
+    expect(DeepagentsMcp.getSettablePaths({ global: false })).toEqual({
+      relativeDirPath: ".deepagents",
+      relativeFilePath: ".mcp.json",
+    });
+  });
+
+  it("imports back into the rulesync home rather than the profile root", () => {
+    // The profile root is where dcode reads `.mcp.json`; the `.rulesync/`
+    // sources produced from it still belong under the user's home.
+    process.env.HOME_DIR = "/rulesync-home";
+    process.env.DEEPAGENTS_HOME = "/custom-deepagents";
+    const mcp = new DeepagentsMcp({
+      outputRoot: "/custom-deepagents",
+      relativeDirPath: ".",
+      relativeFilePath: ".mcp.json",
+      fileContent: JSON.stringify({ mcpServers: { srv: { command: "npx" } } }),
+      global: true,
+    });
+
+    expect(mcp.toRulesyncMcp().getOutputRoot()).toBe("/rulesync-home");
   });
 });

@@ -83,9 +83,13 @@ describe("PermissionsProcessor", () => {
         "augmentcode",
         "claudecode",
         "cline",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
         "copilot",
         "copilotcli",
+        "crush",
         "cursor",
         "devin",
         "factorydroid",
@@ -94,15 +98,20 @@ describe("PermissionsProcessor", () => {
         "kiro",
         "kiro-cli",
         "kiro-ide",
+        "lettacode",
+        "mimocode",
+        "omp",
         "opencode",
         "pi",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "roo",
         "rovodev",
+        "tabnine",
         "takt",
         "vibe",
-        "zed",
         "zoocode",
       ]);
     });
@@ -113,10 +122,17 @@ describe("PermissionsProcessor", () => {
         "amp",
         "antigravity-cli",
         "augmentcode",
+        "bob",
         "claudecode",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
+        "continue",
         "copilotcli",
+        "crush",
         "cursor",
+        "deepagents",
         "devin",
         "factorydroid",
         "goose",
@@ -125,15 +141,25 @@ describe("PermissionsProcessor", () => {
         "kimi-code",
         "junie",
         "kilo",
+        "kiro-cli",
+        "kiro-ide",
+        "lettacode",
+        "mimocode",
+        "omp",
         "opencode",
         "pi",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "rovodev",
+        "tabnine",
         "takt",
         "vibe",
         "warp",
+        "warpcli",
         "zed",
+        "trae",
       ]);
     });
 
@@ -145,9 +171,13 @@ describe("PermissionsProcessor", () => {
         "augmentcode",
         "claudecode",
         "cline",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
         "copilot",
         "copilotcli",
+        "crush",
         "cursor",
         "devin",
         "factorydroid",
@@ -156,15 +186,20 @@ describe("PermissionsProcessor", () => {
         "kiro",
         "kiro-cli",
         "kiro-ide",
+        "lettacode",
+        "mimocode",
+        "omp",
         "opencode",
         "pi",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "roo",
         "rovodev",
+        "tabnine",
         "takt",
         "vibe",
-        "zed",
         "zoocode",
       ]);
     });
@@ -472,6 +507,63 @@ default_permissions = "rulesync"
       await expect(processor.convertRulesyncFilesToToolFiles([])).rejects.toThrow(
         "No .rulesync/permissions.jsonc found.",
       );
+    });
+
+    it("should add .codewhale/config.toml for Codewhale project scope only when every shell command is denied", async () => {
+      const toRulesync = (permission: Record<string, unknown>) =>
+        new RulesyncPermissions({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+          relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+          fileContent: JSON.stringify({ permission }),
+        });
+
+      const projectFiles = await new PermissionsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codewhale",
+      }).convertRulesyncFilesToToolFiles([toRulesync({ bash: { "*": "deny" } })]);
+      expect(projectFiles.map((file) => file.getRelativeFilePath())).toEqual([
+        "constitution.json",
+        "config.toml",
+      ]);
+      expect(projectFiles[1]?.getFileContent()).toContain("allow_shell = false");
+
+      const otherFiles = await new PermissionsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codewhale",
+      }).convertRulesyncFilesToToolFiles([toRulesync({ bash: { "rm *": "deny" } })]);
+      expect(otherFiles.map((file) => file.getRelativeFilePath())).toEqual(["constitution.json"]);
+
+      // A deny authored in the tool-scoped `codewhale.permission` block counts too.
+      const overrideFiles = await new PermissionsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codewhale",
+      }).convertRulesyncFilesToToolFiles([
+        new RulesyncPermissions({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+          relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+          fileContent: JSON.stringify({
+            permission: {},
+            codewhale: { permission: { bash: { "*": "deny" } } },
+          }),
+        }),
+      ]);
+      expect(overrideFiles.map((file) => file.getRelativeFilePath())).toEqual([
+        "constitution.json",
+        "config.toml",
+      ]);
+
+      const globalFiles = await new PermissionsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codewhale",
+        global: true,
+      }).convertRulesyncFilesToToolFiles([toRulesync({ bash: { "*": "deny" } })]);
+      expect(globalFiles.map((file) => file.getRelativeFilePath())).toEqual(["permissions.toml"]);
     });
 
     it("should generate .codex/config.toml and .codex/rules/rulesync.rules for Codex CLI", async () => {

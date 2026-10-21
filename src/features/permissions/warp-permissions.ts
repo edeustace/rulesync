@@ -17,6 +17,11 @@ import type { Logger } from "../../utils/logger.js";
 import { isRecord, isStringArray } from "../../utils/type-guards.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
 import {
+  collectShellCommandRules,
+  partitionCommandRules,
+  warnAboutUnwrittenCommandRules,
+} from "./shell-command-categories.js";
+import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
   type ToolPermissionsFromFileParams,
@@ -42,10 +47,10 @@ const DENYLIST_KEY = "agent_mode_command_execution_denylist";
 // Profiles fill missing fields with defaults on load, so a partial record
 // stays valid.
 // https://github.com/warpdotdev/warp/blob/main/specs/file-backed-execution-profile-collection/TECH.md
-const EXECUTION_PROFILES_KEY = "execution_profiles";
-const DEFAULT_PROFILE_KEY = "default";
-const PROFILE_ALLOWLIST_KEY = "command_allowlist";
-const PROFILE_DENYLIST_KEY = "command_denylist";
+export const EXECUTION_PROFILES_KEY = "execution_profiles";
+export const DEFAULT_PROFILE_KEY = "default";
+export const PROFILE_ALLOWLIST_KEY = "command_allowlist";
+export const PROFILE_DENYLIST_KEY = "command_denylist";
 
 // File-read/read-only autonomy keys under `[agents.profiles]` that the `warp`
 // override authors and that round-trip back into it on import. rulesync still
@@ -62,7 +67,17 @@ const WARP_OVERRIDE_KEYS = [
 // `app/src/ai/execution_profiles/config.rs`). Profile-management keys (name,
 // model overrides, context window limit, plan sync, web search toggle) are
 // deliberately not lifted — they are not permissions.
-const WARP_EXECUTION_PROFILE_OVERRIDE_KEY = "execution_profile";
+export const WARP_EXECUTION_PROFILE_OVERRIDE_KEY = "execution_profile";
+
+// Whether auto-approve may run commands that match the command denylist. Warp
+// defaults it to `true`, so a rulesync-written denylist is bypassed under
+// auto-approve unless this is `false`. It is not an execution-profile field
+// but lives in the sibling `[agents.warp_agent.other]` table, read by both the
+// app and the Agent CLI.
+// https://docs.warp.dev/agents/cli/permissions-and-profiles/
+export const WARP_AUTO_APPROVE_BYPASS_KEY = "auto_approve_bypasses_command_denylist";
+const WARP_AGENT_KEY = "warp_agent";
+const WARP_AGENT_OTHER_KEY = "other";
 const WARP_EXECUTION_PROFILE_KEYS = [
   "read_files",
   "apply_code_diffs",
@@ -126,9 +141,13 @@ function warpSettingsDir(): string {
  * allowlist, `deny` → denylist). Warp matches commands with regular
  * expressions, so patterns are emitted verbatim — author canonical `bash`
  * patterns as regexes when targeting Warp (mirrors the Zed permissions
- * adapter). Warp has no per-command "ask" list, so `ask` rules are dropped; and
- * the command lists only model shell commands, so non-`bash` categories are
- * skipped (with a warning when they carry `deny` rules).
+ * adapter). Warp has no per-command "ask" list, so `ask` rules write nothing —
+ * they only withhold the allow rules they cover, since the stricter rule wins
+ * whatever its width. The all-tools `*` category is read for its restricting
+ * rules as well, but those only withhold allows too: writing any denylist
+ * **replaces** Warp's built-in default one, and a `*` pattern need not name a
+ * command at all. Categories other than `bash` and `*` are skipped (with a
+ * warning when they carry `deny` rules).
  *
  * Warp's `[agents.profiles]` table also exposes file-read/read-only autonomy
  * knobs that do not fit the canonical `allow | ask | deny` per-command model:
@@ -159,6 +178,20 @@ export class WarpPermissions extends ToolPermissions {
 
   override isDeletable(): boolean {
     return false;
+  }
+
+  /**
+   * `settings.toml` is Warp's file, not one rulesync owns: rulesync merges into
+   * it when it exists but has no business bringing it into existence to hold
+   * nothing. When no rule maps, both command lists are dropped and the payload
+   * is a bare `[agents.profiles]` table, which would otherwise be written as a
+   * fresh settings file that says nothing — an absent file and an empty table
+   * both mean "Warp's own defaults". An existing file is still rewritten as
+   * before, so user content is never dropped — the skip only applies when
+   * there is no file yet.
+   */
+  override shouldSkipCreationWhenPayloadEmpty(): boolean {
+    return true;
   }
 
   static getSettablePaths(_options?: { global?: boolean }): ToolPermissionsSettablePaths {
@@ -233,8 +266,11 @@ export class WarpPermissions extends ToolPermissions {
         ? override[WARP_EXECUTION_PROFILE_OVERRIDE_KEY]
         : undefined;
     if (isRecord(override)) {
-      const { [WARP_EXECUTION_PROFILE_OVERRIDE_KEY]: _executionProfile, ...legacyOverride } =
-        override;
+      const {
+        [WARP_EXECUTION_PROFILE_OVERRIDE_KEY]: _executionProfile,
+        [WARP_AUTO_APPROVE_BYPASS_KEY]: _autoApproveBypass,
+        ...legacyOverride
+      } = override;
       Object.assign(profiles, legacyOverride);
     }
 
@@ -253,14 +289,17 @@ export class WarpPermissions extends ToolPermissions {
 
     agents.profiles = profiles;
 
-    if (mergedDeny.length > 0 && logger) {
-      logger.warn(
-        `Warp's command_denylist replaces its built-in default denylist, which covers rm, curl, ` +
-          `wget, eval, ssh, shells, and other risky command patterns. The ${mergedDeny.length} ` +
-          `deny rule(s) from .rulesync/permissions.jsonc are now the whole denylist — add ` +
-          `equivalents for the built-in patterns you want to keep.`,
-      );
-    }
+    // An ordinary setting, not part of Warp's execution-profile migration, so
+    // it is written regardless of the collection-exists guard below.
+    applyAutoApproveBypassOverride({ agents, override });
+
+    warnAboutDenylistReplacement({
+      toolLabel: "Warp",
+      overrideKey: "warp",
+      denyCount: mergedDeny.length,
+      autoApproveBypassesDenylist: readAutoApproveBypass(agents),
+      logger,
+    });
 
     mergeIntoDefaultExecutionProfile({
       agents,
@@ -336,14 +375,16 @@ export class WarpPermissions extends ToolPermissions {
 
     // Lift the `default` execution profile's autonomy keys into the nested
     // `execution_profile` override so they round-trip on migrated installs.
-    if (defaultProfile) {
-      const executionProfileOverride: Record<string, unknown> = {};
-      for (const key of WARP_EXECUTION_PROFILE_KEYS) {
-        if (defaultProfile[key] !== undefined) executionProfileOverride[key] = defaultProfile[key];
-      }
-      if (Object.keys(executionProfileOverride).length > 0) {
-        warpOverride[WARP_EXECUTION_PROFILE_OVERRIDE_KEY] = executionProfileOverride;
-      }
+    const executionProfileOverride = defaultProfile
+      ? liftExecutionProfileOverride(defaultProfile)
+      : undefined;
+    if (executionProfileOverride) {
+      warpOverride[WARP_EXECUTION_PROFILE_OVERRIDE_KEY] = executionProfileOverride;
+    }
+
+    const autoApproveBypass = readAutoApproveBypass(agents);
+    if (autoApproveBypass !== undefined) {
+      warpOverride[WARP_AUTO_APPROVE_BYPASS_KEY] = autoApproveBypass;
     }
 
     const result: Record<string, unknown> = { ...config };
@@ -374,6 +415,81 @@ export class WarpPermissions extends ToolPermissions {
       global: true,
     });
   }
+}
+
+/**
+ * Writing `command_denylist` at all replaces Warp's built-in default denylist,
+ * so any non-empty list rulesync writes deserves a heads-up. Unless
+ * `auto_approve_bypasses_command_denylist` is `false`, auto-approve also runs
+ * commands that match the list, so the warning says so.
+ * https://docs.warp.dev/agents/cli/permissions-and-profiles/
+ */
+export function warnAboutDenylistReplacement({
+  toolLabel,
+  overrideKey,
+  denyCount,
+  autoApproveBypassesDenylist,
+  logger,
+}: {
+  toolLabel: string;
+  overrideKey: "warp" | "warpcli";
+  denyCount: number;
+  autoApproveBypassesDenylist: boolean | undefined;
+  logger?: Logger;
+}): void {
+  if (denyCount === 0 || !logger) {
+    return;
+  }
+  const bypassNote =
+    autoApproveBypassesDenylist === false
+      ? ""
+      : ` Auto-approve also runs commands that match the denylist unless ` +
+        `${overrideKey}.${WARP_AUTO_APPROVE_BYPASS_KEY} is set to false.`;
+  logger.warn(
+    `${toolLabel}'s command_denylist replaces its built-in default denylist, which covers rm, curl, ` +
+      `wget, eval, ssh, shells, and other risky command patterns. The ${denyCount} ` +
+      `deny rule(s) from .rulesync/permissions.jsonc are now the whole denylist — add ` +
+      `equivalents for the built-in patterns you want to keep.${bypassNote}`,
+  );
+}
+
+/**
+ * Write the override's `auto_approve_bypasses_command_denylist` into
+ * `[agents.warp_agent.other]`, keeping every sibling key of `agents.warp_agent`
+ * and of its `other` table. Nothing is written when the override omits it.
+ */
+export function applyAutoApproveBypassOverride({
+  agents,
+  override,
+}: {
+  agents: Record<string, unknown>;
+  override: unknown;
+}): void {
+  if (!isRecord(override)) {
+    return;
+  }
+  const value = override[WARP_AUTO_APPROVE_BYPASS_KEY];
+  if (typeof value !== "boolean") {
+    return;
+  }
+  const warpAgent = isRecord(agents[WARP_AGENT_KEY]) ? { ...agents[WARP_AGENT_KEY] } : {};
+  const other = isRecord(warpAgent[WARP_AGENT_OTHER_KEY])
+    ? { ...warpAgent[WARP_AGENT_OTHER_KEY] }
+    : {};
+  other[WARP_AUTO_APPROVE_BYPASS_KEY] = value;
+  warpAgent[WARP_AGENT_OTHER_KEY] = other;
+  agents[WARP_AGENT_KEY] = warpAgent;
+}
+
+/**
+ * Read `[agents.warp_agent.other] auto_approve_bypasses_command_denylist`, or
+ * `undefined` when it is unset (Warp then defaults to `true`).
+ */
+export function readAutoApproveBypass(agents: Record<string, unknown>): boolean | undefined {
+  const warpAgent = agents[WARP_AGENT_KEY];
+  const other = isRecord(warpAgent) ? warpAgent[WARP_AGENT_OTHER_KEY] : undefined;
+  const value = isRecord(other) ? other[WARP_AUTO_APPROVE_BYPASS_KEY] : undefined;
+  return typeof value === "boolean" ? value : undefined;
 }
 
 /**
@@ -415,27 +531,12 @@ function mergeIntoDefaultExecutionProfile({
     return;
   }
 
-  const executionProfiles = { ...agents[EXECUTION_PROFILES_KEY] };
-  const defaultProfile = isRecord(executionProfiles[DEFAULT_PROFILE_KEY])
-    ? { ...executionProfiles[DEFAULT_PROFILE_KEY] }
-    : {};
-  // Autonomy keys from the `warp.execution_profile` override merge first
-  // (verbatim, so forward-compat keys like `write_to_pty` pass through); the
-  // rulesync-owned command lists below always win over the override.
-  if (executionProfileOverride) {
-    Object.assign(defaultProfile, executionProfileOverride);
-  }
-  if (mergedAllow.length > 0) {
-    defaultProfile[PROFILE_ALLOWLIST_KEY] = mergedAllow;
-  } else {
-    delete defaultProfile[PROFILE_ALLOWLIST_KEY];
-  }
-  if (mergedDeny.length > 0) {
-    defaultProfile[PROFILE_DENYLIST_KEY] = mergedDeny;
-  } else {
-    delete defaultProfile[PROFILE_DENYLIST_KEY];
-  }
-  executionProfiles[DEFAULT_PROFILE_KEY] = defaultProfile;
+  const executionProfiles = mergeDefaultExecutionProfile({
+    executionProfiles: agents[EXECUTION_PROFILES_KEY],
+    mergedAllow,
+    mergedDeny,
+    executionProfileOverride,
+  });
   agents[EXECUTION_PROFILES_KEY] = executionProfiles;
 
   // Runtime enforcement reads the *active* profile, and rulesync manages only
@@ -452,46 +553,402 @@ function mergeIntoDefaultExecutionProfile({
 }
 
 /**
- * Convert rulesync permissions config to Warp command allow/deny regex lists.
- * Only the `bash` category maps; `ask` rules and non-`bash` categories are
- * dropped (the latter with a warning when they carry `deny` rules).
+ * Return a copy of an `[agents.execution_profiles]` collection whose `default`
+ * record carries the command lists and the execution-profile override's
+ * autonomy keys, keeping every other key and profile ID. The override merges
+ * first (verbatim, so forward-compat keys like `write_to_pty` pass through) and
+ * the rulesync-owned command lists always win over it; an empty list removes
+ * the key.
  */
-function convertRulesyncToWarpPermissions({
-  config,
-  logger,
+export function mergeDefaultExecutionProfile({
+  executionProfiles,
+  mergedAllow,
+  mergedDeny,
+  executionProfileOverride,
 }: {
-  config: PermissionsConfig;
-  logger?: Logger;
-}): { allow: string[]; deny: string[] } {
-  const allow: string[] = [];
-  const deny: string[] = [];
+  executionProfiles: Record<string, unknown>;
+  mergedAllow: string[];
+  mergedDeny: string[];
+  executionProfileOverride: Record<string, unknown> | undefined;
+}): Record<string, unknown> {
+  const defaultProfile = isRecord(executionProfiles[DEFAULT_PROFILE_KEY])
+    ? { ...executionProfiles[DEFAULT_PROFILE_KEY] }
+    : {};
+  if (executionProfileOverride) {
+    Object.assign(defaultProfile, executionProfileOverride);
+  }
+  if (mergedAllow.length > 0) {
+    defaultProfile[PROFILE_ALLOWLIST_KEY] = mergedAllow;
+  } else {
+    delete defaultProfile[PROFILE_ALLOWLIST_KEY];
+  }
+  if (mergedDeny.length > 0) {
+    defaultProfile[PROFILE_DENYLIST_KEY] = mergedDeny;
+  } else {
+    delete defaultProfile[PROFILE_DENYLIST_KEY];
+  }
+  return { ...executionProfiles, [DEFAULT_PROFILE_KEY]: defaultProfile };
+}
 
-  for (const [category, rules] of Object.entries(config.permission)) {
-    if (category !== "bash") {
-      const hasDeny = Object.values(rules).some((action) => action === "deny");
-      if (hasDeny && logger) {
-        logger.warn(
-          `Warp only models shell-command permissions (agent_mode_command_execution_allowlist/denylist); ` +
-            `'${category}' deny rules cannot be represented and were skipped.`,
-        );
+/**
+ * Collect the permission keys of an execution profile record (the counterpart
+ * of the `execution_profile` override), or `undefined` when it holds none.
+ */
+export function liftExecutionProfileOverride(
+  profile: Record<string, unknown>,
+): Record<string, unknown> | undefined {
+  const override: Record<string, unknown> = {};
+  for (const key of WARP_EXECUTION_PROFILE_KEYS) {
+    if (profile[key] !== undefined) override[key] = profile[key];
+  }
+  return Object.keys(override).length > 0 ? override : undefined;
+}
+
+/**
+ * Read a `[...]` class starting at its `[` and return the index just past its
+ * `]`, or `undefined` when it cannot be read that simply. Regex class rules
+ * apply: a `]` in the first position is a member rather than the terminator and
+ * a backslash escapes the character after it. A nested `[` gives up: Rust's
+ * `regex` crate — the engine Warp matches with — reads `[a[b]c]` as one class
+ * built by set operations, so stopping at the first `]` would leave `c]` behind
+ * as text the glob then requires. Giving up widens the whole pattern instead,
+ * which is the only safe direction here.
+ */
+function skipRegexClass(body: string, start: number): number | undefined {
+  let index = start + 1;
+  if (body.charAt(index) === "^") {
+    index += 1;
+  }
+  if (body.charAt(index) === "]") {
+    index += 1;
+  }
+  while (index < body.length) {
+    const character = body.charAt(index);
+    if (character === "\\") {
+      index += 2;
+      continue;
+    }
+    if (character === "[") {
+      return undefined;
+    }
+    if (character === "]") {
+      return index + 1;
+    }
+    index += 1;
+  }
+  return undefined;
+}
+
+/**
+ * Read a `(...)` group starting at its `(` and return the index just past its
+ * `)`, or `undefined` when it never closes. Groups nest, so the depth is
+ * counted — but a class inside one is skipped whole, since a `)` written there
+ * is a member rather than a closer.
+ */
+function skipRegexGroup(body: string, start: number): number | undefined {
+  let depth = 0;
+  let index = start;
+  while (index < body.length) {
+    const character = body.charAt(index);
+    if (character === "\\") {
+      index += 2;
+      continue;
+    }
+    if (character === "[") {
+      const next = skipRegexClass(body, index);
+      if (next === undefined) {
+        return undefined;
+      }
+      index = next;
+      continue;
+    }
+    if (character === "(") {
+      depth += 1;
+      index += 1;
+      continue;
+    }
+    if (character === ")") {
+      depth -= 1;
+      index += 1;
+      if (depth === 0) {
+        return index;
       }
       continue;
     }
-    for (const [pattern, action] of Object.entries(rules)) {
-      switch (action) {
-        case "allow":
-          allow.push(pattern);
-          break;
-        case "deny":
-          deny.push(pattern);
-          break;
-        case "ask":
-          // Warp has no per-command "ask" list (commands not in the allowlist
-          // already prompt), so there is nothing to populate.
-          break;
-      }
-    }
+    index += 1;
   }
+  return undefined;
+}
+
+/**
+ * Read a `{2,3}` quantifier starting at its `{`, or `undefined` when what
+ * follows is not one. The shape is checked rather than scanned to the next `}`,
+ * because a `{` that spells no repetition is a literal to the regex engine —
+ * `{a|b}` is an alternation in braces, and reading it as a quantifier would skip
+ * past the `|` that has to widen the whole pattern.
+ */
+const QUANTIFIER = /\{\d+(,\d*)?\}/y;
+
+function skipQuantifier(body: string, start: number): number | undefined {
+  // Sticky rather than anchored against a slice: the scan asks this at every
+  // `{` in the pattern, and copying the rest of the body each time would make
+  // reading one pattern quadratic in its length.
+  QUANTIFIER.lastIndex = start;
+  const match = QUANTIFIER.exec(body);
+  return match === null ? undefined : QUANTIFIER.lastIndex;
+}
+
+/**
+ * Read the bracketed construct that opens at `start`, whichever kind it is, and
+ * return the index just past it — or `undefined` when it never closes.
+ */
+function skipBracketedConstruct(body: string, start: number, open: string): number | undefined {
+  if (open === "[") {
+    return skipRegexClass(body, start);
+  }
+  if (open === "(") {
+    return skipRegexGroup(body, start);
+  }
+  return skipQuantifier(body, start);
+}
+
+/**
+ * Read the tail of a `\\x` / `\\u` escape — the hex run of `\\x20`, or the
+ * braced `\\x{263A}` form — and return the index just past it. Such an escape
+ * spells one character across several, so consuming only its introducer would
+ * leave the hex digits behind as literal atoms and *narrow* the glob, the one
+ * direction the rewrite must never take. Over-consuming only widens, so an
+ * unterminated brace swallows the rest of the pattern.
+ */
+function skipHexEscapeTail(body: string, start: number): number {
+  if (body.charAt(start) === "{") {
+    const closing = body.indexOf("}", start);
+    return closing === -1 ? body.length : closing + 1;
+  }
+  let index = start;
+  while (index < body.length && /^[0-9A-Fa-f]$/.test(body.charAt(index))) {
+    index += 1;
+  }
+  return index;
+}
+
+/**
+ * Read the tail of a `\\p` / `\\P` Unicode-class escape — the braced `\\p{Greek}`
+ * form, or the one-letter `\\pL` shorthand — and return the index just past it.
+ * Like a hex escape, it spells its class across more than one character, so
+ * leaving the shorthand letter behind would narrow the glob.
+ */
+function skipUnicodeClassTail(body: string, start: number): number {
+  if (body.charAt(start) === "{") {
+    const closing = body.indexOf("}", start);
+    return closing === -1 ? body.length : closing + 1;
+  }
+  return Math.min(start + 1, body.length);
+}
+
+/**
+ * Read the escape that opens at `start` — the `\\` and whatever it spells — and
+ * say where it ends and which atom it stands for.
+ */
+function readEscape(body: string, start: number): { next: number; atom: string } {
+  // `charAt` past the end is the empty string, so a trailing backslash widens
+  // like any other escape it cannot spell.
+  const escaped = body.charAt(start + 1);
+  // Rust's regex crate — which Warp matches with — spells a code point as
+  // `\\x41`, `\\u0041` or `\\U00000041`, braced or not.
+  if (escaped === "x" || escaped === "u" || escaped === "U") {
+    return { next: skipHexEscapeTail(body, start + 2), atom: "*" };
+  }
+  if (escaped === "p" || escaped === "P") {
+    return { next: skipUnicodeClassTail(body, start + 2), atom: "*" };
+  }
+  return { next: start + 2, atom: escapedCharacterWidens(escaped) ? "*" : escaped };
+}
+
+/**
+ * Whether an escaped character has to widen to `*` rather than stand for
+ * itself: a letter or a digit spells a class (`\s`, `\d`, `\w`), a glob
+ * metacharacter would be read as a wildcard or a class by the comparison
+ * instead of as the literal the escape asked for, and an empty string is a
+ * trailing backslash spelling nothing at all.
+ */
+function escapedCharacterWidens(escaped: string): boolean {
+  return escaped === "" || /^[A-Za-z0-9*?[\]]$/.test(escaped);
+}
+
+/**
+ * Read one `[...]`, `(...)` or `{...}` construct starting at `start`, saying
+ * where it ends and whether it repeats the atom in front of it (a quantifier)
+ * or is an atom of its own (a class or a group) — or that the whole pattern has
+ * to widen, which is the only safe reading of a construct that never closes and
+ * of one that sets flags for everything after it.
+ */
+function readBracketedConstruct(
+  body: string,
+  start: number,
+  open: string,
+): { next: number; widensLastAtom: boolean } | "widens-pattern" {
+  const next = skipBracketedConstruct(body, start, open);
+  if (next === undefined) {
+    return "widens-pattern";
+  }
+  // `(?i)` and its kin set flags for everything that follows rather than
+  // matching anything themselves, and a case-insensitive rest-of-pattern covers
+  // spellings the glob written here does not. Widening only the group would
+  // narrow the reading, so the whole pattern widens.
+  if (open === "(" && INLINE_FLAG_GROUP_PATTERN.test(body.slice(start, next))) {
+    return "widens-pattern";
+  }
+  return { next, widensLastAtom: open === "{" };
+}
+
+/**
+ * A group that only sets flags — `(?i)`, `(?im)`, `(?-i)` — as opposed to one
+ * that scopes them to its own body (`(?i:...)`, which widens to `*` like any
+ * other group).
+ */
+const INLINE_FLAG_GROUP_PATTERN = /^\(\?[A-Za-z]*-?[A-Za-z]*\)$/;
+
+/**
+ * Approximate a Warp command pattern as a glob, so restrictions and allow rules
+ * can be compared by `createShadowingRestrictionsTest`.
+ *
+ * Warp matches commands with regular expressions, and a glob reader would
+ * misread the ordinary spellings: `.*` — Warp's catch-all — is a literal dot
+ * followed by a wildcard, `[rf]` is a character class in one language and plain
+ * text in the other, and an unanchored regex covers every command that merely
+ * contains it. The rewrite therefore only ever widens what a pattern covers, so
+ * an inexact reading withholds an allow rather than writing one the config
+ * restricts.
+ *
+ * Widening means a construct is replaced whole rather than character by
+ * character, because the characters inside it are not literals of the command:
+ * a class (`[rf]`), a group (`(sudo )?`), a character escape (`\s`) and a
+ * missing `^`/`$` anchor all become `*`, and a quantifier (`?`, `*`, `+`,
+ * `{2}`) widens the atom in front of it — `git commits?` covers `git commit`,
+ * so its glob has to as well. Both sides of a comparison are widened, so a
+ * pattern that is really a glob still compares sensibly.
+ *
+ * A pattern the walk cannot read as one sequence widens to `*` whole: a
+ * top-level `|` is two patterns rather than one, and a class, group or
+ * quantifier that never closes leaves the rest of the pattern unreadable —
+ * guessing at either could only narrow the result, which is the one direction
+ * this rewrite must never take. An alternation *inside* a group needs no such
+ * treatment: the group it sits in already widens to `*`.
+ */
+function warpCommandPatternToGlob(pattern: string): string {
+  const anchoredStart = pattern.startsWith("^");
+  const anchoredEnd = pattern.endsWith("$") && !pattern.endsWith("\\$");
+  const body = pattern.slice(anchoredStart ? 1 : 0, anchoredEnd ? -1 : undefined);
+
+  // One entry per regex atom, so a quantifier can reach back and widen the atom
+  // it repeats instead of leaving it behind as a required literal.
+  const atoms: string[] = [];
+  const widenLastAtom = (): void => {
+    if (atoms.length === 0) {
+      atoms.push("*");
+      return;
+    }
+    atoms[atoms.length - 1] = "*";
+  };
+
+  let index = 0;
+  while (index < body.length) {
+    const character = body.charAt(index);
+    if (character === "|") {
+      return "*";
+    }
+    if (character === "\\") {
+      const escape = readEscape(body, index);
+      index = escape.next;
+      atoms.push(escape.atom);
+      continue;
+    }
+    if (character === "[" || character === "(" || character === "{") {
+      const read = readBracketedConstruct(body, index, character);
+      if (read === "widens-pattern") {
+        return "*";
+      }
+      index = read.next;
+      if (read.widensLastAtom) {
+        widenLastAtom();
+      } else {
+        atoms.push("*");
+      }
+      continue;
+    }
+    if (character === "*" || character === "+" || character === "?") {
+      index += 1;
+      widenLastAtom();
+      continue;
+    }
+    // A character outside the BMP is two UTF-16 units, and pushing them as two
+    // atoms would let a following quantifier widen the low surrogate alone,
+    // leaving the high one behind as a literal that matches nothing — a
+    // narrowing, the one direction this rewrite must never take.
+    const codePoint = body.codePointAt(index);
+    const atom = codePoint === undefined ? character : String.fromCodePoint(codePoint);
+    index += atom.length;
+    atoms.push(atom === "." || ")]}^$".includes(atom) ? "*" : atom);
+  }
+
+  const glob = atoms.join("");
+  return `${anchoredStart ? "" : "*"}${glob}${anchoredEnd ? "" : "*"}`;
+}
+
+/**
+ * Convert rulesync permissions config to Warp command allow/deny regex lists.
+ * The `bash` category maps to both lists. The all-tools `*` category's
+ * restricting rules are read too — a rule written there covers shell commands
+ * as well, and ignoring it would auto-approve a command the file blocks — but
+ * they only *withhold* the allow rules they cover: Warp's denylist is a regex
+ * list that replaces the tool's built-in default one, so writing a pattern
+ * there that may not even name a command would cost more protection than it
+ * adds. Other categories are dropped (with a warning when they carry `deny`
+ * rules).
+ */
+export function convertRulesyncToWarpPermissions({
+  config,
+  logger,
+  toolLabel = "Warp",
+  surfaceLabel = "agent_mode_command_execution_allowlist/denylist",
+}: {
+  config: PermissionsConfig;
+  logger?: Logger;
+  toolLabel?: string;
+  surfaceLabel?: string;
+}): { allow: string[]; deny: string[] } {
+  const { rules, foreignRestrictingCategories, ignoredAllToolsAllowPatterns } =
+    collectShellCommandRules(config.permission);
+  // Warp's denylist is a regex list that replaces the tool's built-in default
+  // one, so an all-tools `*` pattern — which may not even name a command —
+  // withholds the allow rules it covers instead of being written there.
+  const {
+    allow,
+    deny,
+    shadowedAllowPatterns,
+    unwrittenDenyPatterns,
+    unenforcedAllToolsAskPatterns,
+    intersectionBudgetExhausted,
+  } = partitionCommandRules({
+    rules,
+    writesAllToolsDeny: false,
+    normalizePattern: warpCommandPatternToGlob,
+  });
+  warnAboutUnwrittenCommandRules({
+    toolLabel,
+    surfaceLabel,
+    foreignRestrictingCategories,
+    shadowedAllowPatterns,
+    unwrittenDenyPatterns,
+    unwrittenDenyReason:
+      `Writing any denylist replaces ${toolLabel}'s built-in default one, and a pattern written ` +
+      "under '*' need not be a command at all.",
+    unenforcedAllToolsAskPatterns,
+    ignoredAllToolsAllowPatterns,
+    intersectionBudgetExhausted,
+    logger,
+  });
 
   return { allow, deny };
 }
@@ -500,7 +957,7 @@ function convertRulesyncToWarpPermissions({
  * Convert Warp command allow/deny regex lists back to rulesync config under the
  * `bash` category.
  */
-function convertWarpToRulesyncPermissions(params: {
+export function convertWarpToRulesyncPermissions(params: {
   allow: string[];
   deny: string[];
 }): PermissionsConfig {

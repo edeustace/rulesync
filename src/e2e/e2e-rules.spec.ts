@@ -7,12 +7,17 @@ import {
   RULESYNC_MCP_RELATIVE_FILE_PATH,
   RULESYNC_OVERVIEW_FILE_NAME,
   RULESYNC_RULES_RELATIVE_DIR_PATH,
+  RULESYNC_SKILLS_RELATIVE_DIR_PATH,
 } from "../constants/rulesync-paths.js";
 import { getZedGlobalDir } from "../constants/zed-paths.js";
 import { RulesProcessor } from "../features/rules/rules-processor.js";
-import { fileExists, readFileContent, writeFileContent } from "../utils/file.js";
+import { buildLanguageInstruction } from "../types/language.js";
+import { fileExists, readFileContent, removeFile, writeFileContent } from "../utils/file.js";
 import {
   assertGenerateMatrixCoversTargets,
+  execFileAsync,
+  rulesyncArgs,
+  rulesyncCmd,
   runGenerate,
   runImport,
   useGlobalTestDirectories,
@@ -22,18 +27,27 @@ import {
 // Tools whose root rule lands in a single memory file.
 const rulesRootTargets = [
   { target: "claudecode", outputPath: "CLAUDE.md" },
+  { target: "codebuddy", outputPath: "CODEBUDDY.md" },
   { target: "cursor", outputPath: join(".cursor", "rules", "overview.mdc") },
+  { target: "trae", outputPath: join(".trae", "rules", "overview.md") },
   { target: "aiassistant", outputPath: join(".aiassistant", "rules", "overview.md") },
   { target: "amp", outputPath: "AGENTS.md" },
   { target: "codexcli", outputPath: "AGENTS.md" },
+  { target: "commandcode", outputPath: "AGENTS.md" },
+  { target: "qoder", outputPath: "AGENTS.md" },
+  { target: "xum", outputPath: join(".xum", "AGENTS.md") },
   { target: "grokcli", outputPath: "AGENTS.md" },
+  { target: "gitlabduo", outputPath: join(".gitlab", "duo", "chat-rules.md") },
   { target: "hermesagent", outputPath: ".hermes.md" },
   { target: "copilot", outputPath: join(".github", "copilot-instructions.md") },
+  { target: "mimocode", outputPath: "AGENTS.md" },
+  { target: "omp", outputPath: join(".omp", "AGENTS.md") },
   { target: "opencode", outputPath: "AGENTS.md" },
   { target: "antigravity-cli", outputPath: "AGENTS.md" },
   { target: "antigravity-ide", outputPath: "AGENTS.md" },
   { target: "goose", outputPath: ".goosehints" },
   { target: "copilotcli", outputPath: join(".github", "copilot-instructions.md") },
+  { target: "crush", outputPath: "CRUSH.md" },
   { target: "kilo", outputPath: "AGENTS.md" },
   { target: "kimi-code", outputPath: join(".kimi-code", "AGENTS.md") },
   { target: "agentsmd", outputPath: "AGENTS.md" },
@@ -46,27 +60,49 @@ const rulesRootTargets = [
   // The root rule goes to the project-root AGENTS.md Devin CLI/Local reads
   // (issue #2406); .devin/rules/ holds non-root Cascade rules.
   { target: "devin", outputPath: "AGENTS.md" },
+  { target: "devin-plugin", outputPath: "AGENTS.md" },
+  { target: "kimi-code-plugin", outputPath: "SYSTEM.md" },
   { target: "replit", outputPath: "replit.md" },
   { target: "pi", outputPath: "AGENTS.md" },
   { target: "zed", outputPath: ".rules" },
   { target: "vibe", outputPath: "AGENTS.md" },
   { target: "reasonix", outputPath: "REASONIX.md" },
   { target: "musecode", outputPath: "AGENTS.md" },
+  { target: "zcode", outputPath: "AGENTS.md" },
+  { target: "openclaw", outputPath: "AGENTS.md" },
+  { target: "bob", outputPath: "AGENTS.md" },
+  { target: "tabnine", outputPath: "TABNINE.md" },
+  { target: "cortexcode", outputPath: "AGENTS.md" },
+  { target: "codewhale", outputPath: "AGENTS.md" },
+  { target: "continue", outputPath: "AGENTS.md" },
+  { target: "pool", outputPath: "AGENTS.md" },
+  { target: "dsh", outputPath: "AGENTS.md" },
+  { target: "firebender", outputPath: join(".firebender", "AGENTS.md") },
 ] as const;
 
 // Tools that emit every rule as a directory entry.
 const rulesNonRootTargets = [
   { target: "cline", outputPath: join(".clinerules", "overview.md") },
+  { target: "trae", outputPath: join(".trae", "rules", "overview.md") },
   { target: "roo", outputPath: join(".roo", "rules", "overview.md") },
   { target: "zoocode", outputPath: join(".roo", "rules", "overview.md") },
   { target: "kiro", outputPath: join(".kiro", "steering", "overview.md") },
   { target: "kiro-cli", outputPath: join(".kiro", "steering", "overview.md") },
   { target: "kiro-ide", outputPath: join(".kiro", "steering", "overview.md") },
   { target: "antigravity-ide", outputPath: join(".agents", "rules", "overview.md") },
+  { target: "antigravity-cli", outputPath: join(".agents", "rules", "overview.md") },
   { target: "antigravity-plugin", outputPath: join("rules", "overview.md") },
+  { target: "augmentcode-plugin", outputPath: join("rules", "overview.md") },
   { target: "augmentcode", outputPath: join(".augment", "rules", "overview.md") },
+  { target: "bob", outputPath: join(".bob", "rules", "overview.md") },
+  { target: "tabnine", outputPath: join(".tabnine", "guidelines", "overview.md") },
+  { target: "continue", outputPath: join(".continue", "rules", "overview.md") },
   { target: "devin", outputPath: join(".devin", "rules", "overview.md") },
+  { target: "devin-plugin", outputPath: join("rules", "overview.md") },
+  { target: "codewhale", outputPath: join(".codewhale", "rules", "overview.md") },
   { target: "takt", outputPath: join(".takt", "facets", "policies", "overview.md") },
+  { target: "omp", outputPath: join(".omp", "rules", "overview.md") },
+  { target: "firebender", outputPath: join(".firebender", "rules", "overview.mdc") },
 ] as const;
 
 describe("E2E: rules", () => {
@@ -186,6 +222,34 @@ description: "Additional project root rule"
       expect(generatedContent.split("# Additional Project Root Fragment")).toHaveLength(2);
     },
   );
+
+  it("should flatten nested omp rules into the top-level .omp/rules directory", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "frontend", "style.md"),
+      `---
+targets: ["omp"]
+description: "Frontend style"
+globs: ["src/**/*.tsx"]
+---
+
+# Frontend Style
+`,
+    );
+
+    // A nested file an earlier Rulesync version wrote is swept by `--delete`.
+    await writeFileContent(join(testDir, ".omp", "rules", "frontend", "style.md"), "# Stale\n");
+
+    await runGenerate({ target: "omp", features: "rules", deleteFiles: true });
+
+    // oh-my-pi reads `.omp/rules/` non-recursively.
+    const generatedContent = await readFileContent(
+      join(testDir, ".omp", "rules", "frontend-style.md"),
+    );
+    expect(generatedContent).toContain("Frontend Style");
+    expect(await fileExists(join(testDir, ".omp", "rules", "frontend", "style.md"))).toBe(false);
+  });
 
   it("should fold pi non-root rules into the root AGENTS.md", async () => {
     const testDir = getTestDir();
@@ -345,6 +409,418 @@ description: "Detail rule"
     expect(imported).toContain("Pi Root Rule");
   });
 
+  it("should warn when a later target overwrites the AGENTS.md a fold target folds non-root rules into", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+---
+
+# Shared Root Rule
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "style.md"),
+      `---
+targets: ["*"]
+---
+
+# Shared Style Rule
+`,
+    );
+
+    // codexcli folds every non-root rule into AGENTS.md; zoocode writes the root
+    // body alone there and files non-root rules under .roo/rules/. Listed last,
+    // zoocode wins the shared file (documented last-wins), which silently strips
+    // the folded content Codex CLI depends on — so the run says so (#3022).
+    // `NODE_ENV=e2e` keeps the CLI from muting its logger under vitest, so the
+    // warning is observable on stderr.
+    const lossy = await runGenerate({
+      target: "codexcli,zoocode",
+      features: "rules",
+      env: { NODE_ENV: "e2e" },
+    });
+    expect(lossy.stderr).toContain("Target 'zoocode' overwrites AGENTS.md");
+    expect(lossy.stderr).toContain("list 'codexcli' after 'zoocode'");
+    const overwritten = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(overwritten).toContain("Shared Root Rule");
+    expect(overwritten).not.toContain("Shared Style Rule");
+    expect(await readFileContent(join(testDir, ".roo", "rules", "style.md"))).toContain(
+      "Shared Style Rule",
+    );
+
+    // The suggested order keeps the fold and needs no warning: zoocode still
+    // has its own copy under .roo/rules/, so nothing is lost either way.
+    const kept = await runGenerate({
+      target: "zoocode,codexcli",
+      features: "rules",
+      env: { NODE_ENV: "e2e" },
+    });
+    expect(kept.stderr).not.toContain("overwrites AGENTS.md");
+    const folded = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(folded).toContain("Shared Root Rule");
+    expect(folded).toContain("Shared Style Rule");
+
+    // A fold target after zoocode wins the file back with every non-root body
+    // in it, so the verdict has to wait until every target has been seen.
+    const reclaimed = await runGenerate({
+      target: "codexcli,zoocode,pi",
+      features: "rules",
+      env: { NODE_ENV: "e2e" },
+    });
+    expect(reclaimed.stderr).not.toContain("overwrites AGENTS.md");
+    expect(await readFileContent(join(testDir, "AGENTS.md"))).toContain("Shared Style Rule");
+  });
+
+  it("should route factorydroid.channel:design rules to DESIGN.md and round-trip", async () => {
+    const testDir = getTestDir();
+
+    const rootRuleContent = `---
+root: true
+targets: ["factorydroid"]
+description: "Root rule"
+globs: ["**/*"]
+---
+
+# Factory Droid Root Rule
+`;
+    const designOneContent = `---
+targets: ["factorydroid"]
+description: "Color palette"
+factorydroid:
+  channel: design
+---
+
+# Factory Droid Design One
+`;
+    const designTwoContent = `---
+targets: ["factorydroid"]
+description: "Spacing scale"
+factorydroid:
+  channel: design
+---
+
+# Factory Droid Design Two
+`;
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      rootRuleContent,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "colors.md"),
+      designOneContent,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "spacing.md"),
+      designTwoContent,
+    );
+
+    await runGenerate({ target: "factorydroid", features: "rules" });
+
+    // Opted-in bodies land in DESIGN.md (concatenated in source order), not in
+    // AGENTS.md, and are not listed in AGENTS.md's TOON reference section since
+    // Factory Droid already auto-loads DESIGN.md itself.
+    const rootContent = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(rootContent).toContain("Factory Droid Root Rule");
+    expect(rootContent).not.toContain("Factory Droid Design One");
+    expect(rootContent).not.toContain("DESIGN.md");
+
+    const designPath = join(testDir, "DESIGN.md");
+    const designContent = await readFileContent(designPath);
+    expect(designContent).toContain("Factory Droid Design One");
+    expect(designContent).toContain("Factory Droid Design Two");
+    expect(designContent.indexOf("Factory Droid Design One")).toBeLessThan(
+      designContent.indexOf("Factory Droid Design Two"),
+    );
+
+    // Import the generated DESIGN.md back and confirm the routing frontmatter
+    // is recovered.
+    await runImport({ target: "factorydroid", features: "rules" });
+
+    const importedDesign = await readFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "DESIGN.md"),
+    );
+    expect(importedDesign).toContain("channel: design");
+    expect(importedDesign).toContain("Factory Droid Design One");
+    expect(importedDesign).toContain("Factory Droid Design Two");
+  });
+
+  it("should route factorydroid.channel:threat-model rules to .factory/threat-model.md and round-trip", async () => {
+    const testDir = getTestDir();
+
+    const rootRuleContent = `---
+root: true
+targets: ["factorydroid"]
+description: "Root rule"
+globs: ["**/*"]
+---
+
+# Factory Droid Root Rule
+`;
+    const threatModelOneContent = `---
+targets: ["factorydroid"]
+description: "Trust boundaries"
+factorydroid:
+  channel: threat-model
+---
+
+# Factory Droid Threat Model One
+`;
+    const threatModelTwoContent = `---
+targets: ["factorydroid"]
+description: "Sensitive data flows"
+factorydroid:
+  channel: threat-model
+---
+
+# Factory Droid Threat Model Two
+`;
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      rootRuleContent,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "boundaries.md"),
+      threatModelOneContent,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "data-flows.md"),
+      threatModelTwoContent,
+    );
+
+    await runGenerate({ target: "factorydroid", features: "rules" });
+
+    // Opted-in bodies land in .factory/threat-model.md (concatenated in source
+    // order), not in AGENTS.md or .factory/rules/, and are not listed in
+    // AGENTS.md's TOON reference section since Factory's Security Review reads
+    // the threat model itself.
+    const rootContent = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(rootContent).toContain("Factory Droid Root Rule");
+    expect(rootContent).not.toContain("Factory Droid Threat Model One");
+    expect(rootContent).not.toContain("threat-model.md");
+
+    const threatModelContent = await readFileContent(join(testDir, ".factory", "threat-model.md"));
+    expect(threatModelContent).toContain("Factory Droid Threat Model One");
+    expect(threatModelContent).toContain("Factory Droid Threat Model Two");
+    expect(threatModelContent.indexOf("Factory Droid Threat Model One")).toBeLessThan(
+      threatModelContent.indexOf("Factory Droid Threat Model Two"),
+    );
+
+    await runImport({ target: "factorydroid", features: "rules" });
+
+    const importedThreatModel = await readFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "threat-model.md"),
+    );
+    expect(importedThreatModel).toContain("channel: threat-model");
+    expect(importedThreatModel).toContain("Factory Droid Threat Model One");
+    expect(importedThreatModel).toContain("Factory Droid Threat Model Two");
+  });
+
+  it("should write factorydroid.channel:output-style rules to .factory/output-styles/ and round-trip", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["factorydroid"]
+description: "Root rule"
+globs: ["**/*"]
+---
+
+# Factory Droid Root Rule
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "review-notes.md"),
+      `---
+targets: ["factorydroid"]
+description: "Put findings before the summary"
+factorydroid:
+  channel: output-style
+  name: "Review Notes"
+---
+
+Start with actionable findings, ordered by severity.
+`,
+    );
+
+    await runGenerate({ target: "factorydroid", features: "rules" });
+
+    // One file per style, carrying the picker name and description, and not
+    // listed in AGENTS.md's TOON reference section since Droid loads styles
+    // itself.
+    const rootContent = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(rootContent).not.toContain("review-notes.md");
+    expect(rootContent).not.toContain("Start with actionable findings");
+
+    const styleContent = await readFileContent(
+      join(testDir, ".factory", "output-styles", "review-notes.md"),
+    );
+    expect(styleContent).toContain("name: Review Notes");
+    expect(styleContent).toContain("description: Put findings before the summary");
+    expect(styleContent).toContain("Start with actionable findings, ordered by severity.");
+
+    await runImport({ target: "factorydroid", features: "rules" });
+
+    const importedStyle = await readFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "review-notes.md"),
+    );
+    expect(importedStyle).toContain("channel: output-style");
+    expect(importedStyle).toContain("name: Review Notes");
+    expect(importedStyle).toContain("Start with actionable findings, ordered by severity.");
+  });
+
+  it("should nest a rule under the directory derived from its globs when deriveSubprojectPathFromGlobs is on", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        { targets: ["agentsmd"], features: ["rules"], deriveSubprojectPathFromGlobs: true },
+        null,
+        2,
+      ),
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+description: "Root rule"
+globs: ["**/*"]
+---
+
+# Project Overview
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "api.md"),
+      `---
+targets: ["*"]
+description: "API rule"
+globs: ["packages/api/**/*"]
+---
+
+# API Instructions
+`,
+    );
+    // Where the same rule landed before the option was turned on: a managed
+    // file the run no longer produces, so `--delete` sweeps it.
+    await writeFileContent(
+      join(testDir, ".agents", "memories", "api.md"),
+      "# API Instructions (stale)\n",
+    );
+
+    await runGenerate({ target: "agentsmd", features: "rules", deleteFiles: true });
+
+    expect(await readFileContent(join(testDir, "packages", "api", "AGENTS.md"))).toContain(
+      "API Instructions",
+    );
+    expect(await fileExists(join(testDir, ".agents", "memories", "api.md"))).toBe(false);
+    // The nested file is listed from the root file like an explicit one.
+    expect(await readFileContent(join(testDir, "AGENTS.md"))).toContain("packages/api/AGENTS.md");
+  });
+
+  // Codex CLI loads one `AGENTS.md` per directory from the project root down
+  // to the cwd, and stops once their combined size reaches
+  // `project_doc_max_bytes` (32 KiB by default).
+  // https://learn.chatgpt.com/docs/agent-configuration/agents-md
+  it("should nest a glob-scoped codexcli rule and warn when the root AGENTS.md exceeds 32 KiB", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        { targets: ["codexcli"], features: ["rules"], deriveSubprojectPathFromGlobs: true },
+        null,
+        2,
+      ),
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+description: "Root rule"
+globs: ["**/*"]
+---
+
+# Project Overview
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "svc1.md"),
+      `---
+targets: ["*"]
+description: "svc1 rule"
+globs: ["services/svc1/**"]
+---
+
+# Rule for svc1
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "big.md"),
+      `---
+targets: ["*"]
+description: "Large always-on rule"
+globs: ["**/*.ts"]
+---
+
+# Large Rule
+
+${"x".repeat(33 * 1024)}
+`,
+    );
+
+    // `NODE_ENV=e2e` keeps the CLI from muting its logger under vitest, so the
+    // warning is observable on stderr.
+    const { stderr } = await runGenerate({
+      target: "codexcli",
+      features: "rules",
+      env: { NODE_ENV: "e2e" },
+    });
+
+    expect(await readFileContent(join(testDir, "services", "svc1", "AGENTS.md"))).toContain(
+      "Rule for svc1",
+    );
+    const root = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(root).toContain("Project Overview");
+    expect(root).toContain("Large Rule");
+    expect(root).not.toContain("Rule for svc1");
+    expect(stderr).toContain("project_doc_max_bytes");
+
+    // Raising the budget in `.codex/config.toml` suppresses the warning, and
+    // rulesync only reads that file, never rewrites it.
+    const configPath = join(testDir, ".codex", "config.toml");
+    const raisedConfig = "project_doc_max_bytes = 131072\n";
+    await writeFileContent(configPath, raisedConfig);
+    const raised = await runGenerate({
+      target: "codexcli",
+      features: "rules",
+      env: { NODE_ENV: "e2e" },
+    });
+    expect(raised.stderr).not.toContain("project_doc_max_bytes");
+    expect(await readFileContent(configPath)).toBe(raisedConfig);
+
+    // `project_doc_max_bytes = 0` disables project docs in Codex, so the
+    // warning says the generated files will not be loaded.
+    const disabledConfig = "project_doc_max_bytes = 0\n";
+    await writeFileContent(configPath, disabledConfig);
+    const disabled = await runGenerate({
+      target: "codexcli",
+      features: "rules",
+      env: { NODE_ENV: "e2e" },
+    });
+    expect(disabled.stderr).toContain("is set to 0");
+    expect(disabled.stderr).toContain("will not be loaded");
+    expect(await readFileContent(configPath)).toBe(disabledConfig);
+  });
+
   it("should fold junie non-root rules into the root .junie/AGENTS.md", async () => {
     const testDir = getTestDir();
 
@@ -472,6 +948,53 @@ globs: ["src/**/*.ts"]
     expect(nonRootContent).toContain("description: Coding guidelines");
   });
 
+  it("should generate qoder non-root rules into .qoder/rules with trigger frontmatter", async () => {
+    const testDir = getTestDir();
+
+    // Root rule -> AGENTS.md (plain), non-root rule with globs -> .qoder/rules/*.md
+    // with `trigger: glob` + `glob`.
+    const rootRuleContent = `---
+root: true
+targets: ["*"]
+description: "Root rule"
+globs: ["**/*"]
+---
+
+# Root Rule
+`;
+    const nonRootRuleContent = `---
+targets: ["*"]
+description: "Coding guidelines"
+globs: ["src/**/*.ts"]
+---
+
+# Non-Root Rule
+`;
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      rootRuleContent,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "coding-guidelines.md"),
+      nonRootRuleContent,
+    );
+
+    await runGenerate({ target: "qoder", features: "rules" });
+
+    const rootContent = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(rootContent).toContain("Root Rule");
+    expect(rootContent).not.toContain("---");
+
+    const nonRootContent = await readFileContent(
+      join(testDir, ".qoder", "rules", "coding-guidelines.md"),
+    );
+    expect(nonRootContent).toContain("Non-Root Rule");
+    expect(nonRootContent).toContain("trigger: glob");
+    expect(nonRootContent).toContain("glob:");
+    expect(nonRootContent).toContain("src/**/*.ts");
+    expect(nonRootContent).toContain("description: Coding guidelines");
+  });
+
   it("should generate cline non-root rules into .clinerules with paths frontmatter", async () => {
     const testDir = getTestDir();
 
@@ -534,6 +1057,69 @@ globs: ["**/*"]
     const alwaysContent = await readFileContent(join(testDir, ".clinerules", "always.md"));
     expect(alwaysContent).toContain("alwaysApply: true");
     expect(alwaysContent).not.toContain("paths:");
+  });
+
+  it("should skip CLAUDE.md and CLAUDE.local.md for claudecode when includeRoot is false", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+---
+
+# Project Overview
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "local.md"),
+      `---
+localRoot: true
+---
+
+# Personal Notes
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "typescript.md"),
+      `---
+targets: ["*"]
+globs: ["**/*.ts"]
+---
+
+# TypeScript Rules
+`,
+    );
+    // Root files generated before the option was turned on: `--delete` sweeps
+    // them because the run no longer produces them.
+    await writeFileContent(join(testDir, "CLAUDE.md"), "# Project Overview (stale)\n");
+    await writeFileContent(join(testDir, "CLAUDE.local.md"), "# Personal Notes (stale)\n");
+    // Per-feature options live in the object form of `targets`, which the
+    // `--targets` CLI flag would replace, so the config file drives this run.
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          targets: {
+            agentsmd: ["rules"],
+            claudecode: { rules: { includeRoot: false } },
+          },
+          delete: true,
+        },
+        null,
+        2,
+      ),
+    );
+
+    await execFileAsync(rulesyncCmd, [...rulesyncArgs, "generate"]);
+
+    expect(await fileExists(join(testDir, "CLAUDE.md"))).toBe(false);
+    expect(await fileExists(join(testDir, "CLAUDE.local.md"))).toBe(false);
+    expect(await readFileContent(join(testDir, ".claude", "rules", "typescript.md"))).toContain(
+      "# TypeScript Rules",
+    );
+    expect(await readFileContent(join(testDir, "AGENTS.md"))).toContain("# Project Overview");
   });
 
   it("should fail in check mode when delete would remove an orphan rule file", async () => {
@@ -768,6 +1354,288 @@ description: "Root rule"
     expect(stdout).toContain("All files are up to date.");
   });
 
+  it.each(["codexcli", "agentsmd"])(
+    "should fail check for non-owning target %s when the shared AGENTS.md has been edited (#3198)",
+    async (target) => {
+      const testDir = getTestDir();
+
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+        `---
+root: true
+targets: ["*"]
+description: "Root rule"
+---
+
+# Root Rule
+`,
+      );
+
+      // The target list `rulesync init` writes: opencode is last in config
+      // order, so it owns ./AGENTS.md, and a `-t codexcli` / `-t agentsmd`
+      // check skips that file as a non-owner.
+      await writeFileContent(
+        join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+        JSON.stringify({ targets: ["codexcli", "claudecode", "opencode"] }, null, 2),
+      );
+
+      await execFileAsync(rulesyncCmd, [...rulesyncArgs, "generate", "--features", "rules"]);
+
+      // Untouched: the non-owning target's check still passes.
+      const { stdout } = await runGenerate({
+        target,
+        features: "rules",
+        check: true,
+        env: { NODE_ENV: "e2e" },
+      });
+      expect(stdout).toContain("All files are up to date.");
+
+      const agentsMdPath = join(testDir, "AGENTS.md");
+      await writeFileContent(agentsMdPath, `${await readFileContent(agentsMdPath)}- drift\n`);
+
+      await expect(
+        runGenerate({
+          target,
+          features: "rules",
+          check: true,
+          env: { NODE_ENV: "e2e" },
+        }),
+      ).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringContaining(
+          "Files are not up to date. Run 'rulesync generate' to update.",
+        ),
+      });
+
+      // Check mode never writes.
+      expect(await readFileContent(agentsMdPath)).toContain("- drift");
+    },
+  );
+
+  it("should fail check for a non-owning target when AGENTS.md drifts from the owner's output", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+description: "Root rule"
+---
+
+# Root Rule
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify({ targets: { codexcli: ["rules"], rovodev: ["rules"] } }, null, 2),
+    );
+
+    await runGenerate({ target: "codexcli,rovodev", features: "rules", env: { NODE_ENV: "e2e" } });
+
+    // Overwrite the owner's (rovodev) mirrored ./AGENTS.md with codexcli's
+    // output: the non-owner's content is not what a full generate leaves on
+    // disk, so the codexcli check must not accept it either.
+    await runGenerate({ target: "codexcli", features: "rules", env: { NODE_ENV: "e2e" } });
+    expect(await readFileContent(join(testDir, "AGENTS.md"))).not.toContain(
+      "Additional Conventions",
+    );
+
+    await expect(
+      runGenerate({
+        target: "codexcli",
+        features: "rules",
+        check: true,
+        env: { NODE_ENV: "e2e" },
+      }),
+    ).rejects.toMatchObject({ code: 1 });
+  });
+
+  it("should not let a later target without the rules feature own AGENTS.md in check mode", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+description: "Root rule"
+---
+
+# Root Rule
+`,
+    );
+    // rovodev is last in config order but only generates MCP, so it never
+    // writes ./AGENTS.md and must not be treated as its owner.
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify({ targets: { codexcli: ["rules"], rovodev: ["mcp"] } }, null, 2),
+    );
+
+    await execFileAsync(rulesyncCmd, [...rulesyncArgs, "generate"]);
+
+    const { stdout: fullStdout } = await execFileAsync(
+      rulesyncCmd,
+      [...rulesyncArgs, "generate", "--check"],
+      { env: { ...process.env, NODE_ENV: "e2e" } },
+    );
+    expect(fullStdout).toContain("All files are up to date.");
+
+    const { stdout: codexStdout } = await runGenerate({
+      target: "codexcli",
+      features: "rules",
+      check: true,
+      env: { NODE_ENV: "e2e" },
+    });
+    expect(codexStdout).toContain("All files are up to date.");
+
+    const agentsMdPath = join(testDir, "AGENTS.md");
+    await writeFileContent(agentsMdPath, `${await readFileContent(agentsMdPath)}- drift\n`);
+
+    await expect(
+      runGenerate({
+        target: "codexcli",
+        features: "rules",
+        check: true,
+        env: { NODE_ENV: "e2e" },
+      }),
+    ).rejects.toMatchObject({ code: 1 });
+  });
+
+  it("should keep ownership for targets in the run when --features adds rules to a config without it (#1894)", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+description: "Root rule"
+---
+
+# Root Rule
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify({ targets: ["codexcli", "agentsmd"], features: ["mcp"] }, null, 2),
+    );
+
+    await execFileAsync(rulesyncCmd, [...rulesyncArgs, "generate", "--features", "rules"]);
+
+    const { stdout } = await execFileAsync(
+      rulesyncCmd,
+      [...rulesyncArgs, "generate", "--check", "--features", "rules"],
+      { env: { ...process.env, NODE_ENV: "e2e" } },
+    );
+    expect(stdout).toContain("All files are up to date.");
+
+    // Narrowed to either target, --features rules still makes agentsmd (last)
+    // the owner, as it is in a run without --targets.
+    for (const target of ["codexcli", "agentsmd"]) {
+      const { stdout: narrowedStdout } = await runGenerate({
+        target,
+        features: "rules",
+        check: true,
+        env: { NODE_ENV: "e2e" },
+      });
+      expect(narrowedStdout).toContain("All files are up to date.");
+    }
+  });
+
+  it("should build the owner's skills section with the CLI --features in a narrowed check", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+description: "Root rule"
+---
+
+# Root Rule
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_SKILLS_RELATIVE_DIR_PATH, "test-skill", "SKILL.md"),
+      `---
+name: test-skill
+description: "A test skill"
+targets: ["*"]
+---
+Skill body.
+`,
+    );
+    // The config file does not enable skills; --features adds them.
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        { targets: ["codexcli", "agentsmd"], features: ["rules"], simulateSkills: true },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "codexcli,agentsmd", features: "rules,skills" });
+    expect(await readFileContent(join(testDir, "AGENTS.md"))).toContain("test-skill");
+
+    const { stdout } = await runGenerate({
+      target: "codexcli",
+      features: "rules,skills",
+      check: true,
+      env: { NODE_ENV: "e2e" },
+    });
+    expect(stdout).toContain("All files are up to date.");
+  });
+
+  it("should build the owner's simulated skills section from the full run's skills in a narrowed check", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      `---
+root: true
+targets: ["*"]
+description: "Root rule"
+---
+
+# Root Rule
+`,
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_SKILLS_RELATIVE_DIR_PATH, "test-skill", "SKILL.md"),
+      `---
+name: test-skill
+description: "A test skill"
+targets: ["*"]
+---
+Skill body.
+`,
+    );
+    // agentsmd owns AGENTS.md and lists the simulated skills in it; a
+    // `-t codexcli` run has no skills step of its own to collect them from.
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        { targets: { codexcli: ["rules"], agentsmd: ["rules", "skills"] }, simulateSkills: true },
+        null,
+        2,
+      ),
+    );
+
+    await execFileAsync(rulesyncCmd, [...rulesyncArgs, "generate"]);
+    expect(await readFileContent(join(testDir, "AGENTS.md"))).toContain("test-skill");
+
+    const { stdout } = await runGenerate({
+      target: "codexcli",
+      features: "rules",
+      check: true,
+      env: { NODE_ENV: "e2e" },
+    });
+    expect(stdout).toContain("All files are up to date.");
+  });
+
   it("should generate and re-import zoocode mode-specific rules under .roo/rules-{mode}", async () => {
     const testDir = getTestDir();
 
@@ -806,6 +1674,97 @@ roo:
   });
 });
 
+describe("E2E: rules (language)", () => {
+  const { getTestDir } = useTestDirectory();
+
+  const rootRuleContent = `---
+root: true
+targets: ["*"]
+description: "Test rule"
+---
+
+# Test Rule
+
+This is a test rule for E2E testing.
+`;
+
+  it("should append one language block to the root rule file and keep it single across an import round trip", async () => {
+    const testDir = getTestDir();
+    const instruction = buildLanguageInstruction("ja");
+
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify({ language: "ja" }, null, 2),
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      rootRuleContent,
+    );
+
+    await runGenerate({ target: "agentsmd", features: "rules" });
+
+    const generated = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(generated.trimEnd().endsWith(`---\n\n${instruction}`)).toBe(true);
+    expect(generated.split(instruction)).toHaveLength(2);
+
+    // The generated root file goes back in without the block...
+    await runImport({ target: "agentsmd", features: "rules" });
+    const imported = await readFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+    );
+    expect(imported).toContain("Test Rule");
+    expect(imported).not.toContain("You must always answer in");
+
+    // ...so a second generate still ends with exactly one block.
+    await runGenerate({ target: "agentsmd", features: "rules" });
+    const regenerated = await readFileContent(join(testDir, "AGENTS.md"));
+    expect(regenerated.split(instruction)).toHaveLength(2);
+    expect(regenerated.trimEnd().endsWith(instruction)).toBe(true);
+  });
+
+  it("should write Claude Code's native language setting instead of a block in CLAUDE.md", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_CONFIG_RELATIVE_FILE_PATH),
+      JSON.stringify({ language: "ja" }, null, 2),
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      rootRuleContent,
+    );
+    await writeFileContent(
+      join(testDir, ".claude", "settings.local.json"),
+      JSON.stringify({ permissions: { allow: ["Bash(git *)"] } }, null, 2),
+    );
+
+    await runGenerate({ target: "claudecode", features: "rules" });
+
+    const claudeMd = await readFileContent(join(testDir, "CLAUDE.md"));
+    expect(claudeMd).toContain("Test Rule");
+    expect(claudeMd).not.toContain("You must always answer in");
+
+    const settings = JSON.parse(
+      await readFileContent(join(testDir, ".claude", "settings.local.json")),
+    );
+    expect(settings.language).toBe("japanese");
+    expect(settings.permissions).toEqual({ allow: ["Bash(git *)"] });
+  });
+
+  it("should leave the Claude Code settings file alone when language is unset", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      rootRuleContent,
+    );
+
+    await runGenerate({ target: "claudecode", features: "rules" });
+
+    expect(await fileExists(join(testDir, ".claude", "settings.local.json"))).toBe(false);
+  });
+});
+
 describe("E2E: rules (import)", () => {
   const { getTestDir } = useTestDirectory();
 
@@ -816,12 +1775,27 @@ describe("E2E: rules (import)", () => {
       sourcePath: join(".cursor", "rules", "overview.mdc"),
       importedFileName: "overview.md",
     },
+    {
+      target: "trae",
+      sourcePath: join(".trae", "rules", "overview.md"),
+      importedFileName: "overview.md",
+    },
     { target: "amp", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
     { target: "codexcli", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "commandcode", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "qoder", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "xum", sourcePath: join(".xum", "AGENTS.md"), importedFileName: "overview.md" },
     {
       target: "copilot",
       sourcePath: join(".github", "copilot-instructions.md"),
       importedFileName: "copilot-instructions.md",
+    },
+    { target: "mimocode", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "omp", sourcePath: join(".omp", "AGENTS.md"), importedFileName: "overview.md" },
+    {
+      target: "gitlabduo",
+      sourcePath: join(".gitlab", "duo", "chat-rules.md"),
+      importedFileName: "overview.md",
     },
     { target: "opencode", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
     { target: "goose", sourcePath: ".goosehints", importedFileName: "overview.md" },
@@ -857,6 +1831,11 @@ describe("E2E: rules (import)", () => {
     { target: "warp", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
     { target: "replit", sourcePath: "replit.md", importedFileName: "overview.md" },
     { target: "pi", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "pool", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "cortexcode", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "codewhale", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "continue", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
+    { target: "dsh", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
     { target: "vibe", sourcePath: "AGENTS.md", importedFileName: "overview.md" },
     {
       target: "cline",
@@ -899,11 +1878,36 @@ describe("E2E: rules (import)", () => {
       importedFileName: "overview.md",
     },
     {
+      target: "bob",
+      sourcePath: join(".bob", "rules", "overview.md"),
+      importedFileName: "overview.md",
+    },
+    {
+      target: "tabnine",
+      sourcePath: join(".tabnine", "guidelines", "overview.md"),
+      importedFileName: "overview.md",
+    },
+    {
+      target: "continue",
+      sourcePath: join(".continue", "rules", "overview.md"),
+      importedFileName: "overview.md",
+    },
+    {
       target: "devin",
       sourcePath: join(".devin", "rules", "overview.md"),
       importedFileName: "overview.md",
     },
     { target: "zed", sourcePath: ".rules", importedFileName: "overview.md" },
+    {
+      target: "firebender",
+      sourcePath: join(".firebender", "AGENTS.md"),
+      importedFileName: "overview.md",
+    },
+    {
+      target: "firebender",
+      sourcePath: join(".firebender", "rules", "overview.mdc"),
+      importedFileName: "overview.md",
+    },
   ])("should import $target rules", async ({ target, sourcePath, importedFileName }) => {
     const testDir = getTestDir();
 
@@ -949,14 +1953,91 @@ This is a test project for E2E testing.
       "API Instructions",
     );
   });
+
+  // Warp applies the root `AGENTS.md` plus the current subdirectory's one.
+  // https://docs.warp.dev/agents/capabilities/rules/
+  it("should import nested warp rules and round-trip their subproject scope", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(join(testDir, "AGENTS.md"), "# Project Overview\n");
+    await writeFileContent(join(testDir, "packages", "api", "AGENTS.md"), "# API Instructions\n");
+    await writeFileContent(join(testDir, "node_modules", "dep", "AGENTS.md"), "# Vendored\n");
+
+    await runImport({ target: "warp", features: "rules" });
+
+    const importedNested = await readFileContent(
+      join(testDir, ".rulesync", "rules", "packages-api.md"),
+    );
+    expect(importedNested).toContain("API Instructions");
+    expect(importedNested).toContain("subprojectPath: packages/api");
+    expect(await fileExists(join(testDir, ".rulesync", "rules", "node_modules-dep.md"))).toBe(
+      false,
+    );
+
+    await removeFile(join(testDir, "packages", "api", "AGENTS.md"));
+    await runGenerate({ target: "warp", features: "rules" });
+
+    expect(await readFileContent(join(testDir, "packages", "api", "AGENTS.md"))).toContain(
+      "API Instructions",
+    );
+    expect(await readFileContent(join(testDir, "AGENTS.md"))).not.toContain("API Instructions");
+  });
+
+  // Trae reads a `.trae/rules/` folder in any project subdirectory.
+  // https://docs.trae.ai/ide/rules?_lang=en
+  it("should import nested trae rules and round-trip their subproject scope", async () => {
+    const testDir = getTestDir();
+
+    // The entry `rulesync gitignore` writes for Trae must not hide the nested
+    // rules directories from the import scan.
+    await writeFileContent(join(testDir, ".gitignore"), "**/.trae/rules/\nvendored/\n");
+    await writeFileContent(
+      join(testDir, "vendored", "dep", ".trae", "rules", "dep.md"),
+      "# Vendored\n",
+    );
+
+    await writeFileContent(
+      join(testDir, ".trae", "rules", "overview.md"),
+      "---\nalwaysApply: true\n---\n# Project Overview\n",
+    );
+    await writeFileContent(
+      join(testDir, "packages", "api", ".trae", "rules", "api.md"),
+      "---\nalwaysApply: false\ndescription: API rules\n---\n# API Instructions\n",
+    );
+
+    await runImport({ target: "trae", features: "rules" });
+
+    const importedNested = await readFileContent(join(testDir, ".rulesync", "rules", "api.md"));
+    expect(importedNested).toContain("API Instructions");
+    expect(importedNested).toContain("subprojectPath: packages/api");
+    expect(await fileExists(join(testDir, ".rulesync", "rules", "dep.md"))).toBe(false);
+
+    await removeFile(join(testDir, "packages", "api", ".trae", "rules", "api.md"));
+    await runGenerate({ target: "trae", features: "rules" });
+
+    const generated = await readFileContent(
+      join(testDir, "packages", "api", ".trae", "rules", "api.md"),
+    );
+    expect(generated).toContain("API Instructions");
+    expect(generated).toContain("description: API rules");
+    expect(await fileExists(join(testDir, ".trae", "rules", "api.md"))).toBe(false);
+  });
 });
 
 const rulesGlobalTargets = [
   { target: "claudecode", outputPath: join(".claude", "CLAUDE.md") },
+  { target: "codebuddy", outputPath: join(".codebuddy", "CODEBUDDY.md") },
+  { target: "codebuff", outputPath: ".AGENTS.md" },
   { target: "copilot", outputPath: join(".copilot", "copilot-instructions.md") },
+  { target: "mimocode", outputPath: join(".config", "mimocode", "AGENTS.md") },
+  { target: "omp", outputPath: join(".omp", "agent", "AGENTS.md") },
   { target: "opencode", outputPath: join(".config", "opencode", "AGENTS.md") },
   { target: "codexcli", outputPath: join(".codex", "AGENTS.md") },
+  { target: "commandcode", outputPath: join(".commandcode", "AGENTS.md") },
+  { target: "qoder", outputPath: join(".qoder", "AGENTS.md") },
+  { target: "xum", outputPath: join(".xum", "AGENTS.md") },
   { target: "grokcli", outputPath: join(".grok", "AGENTS.md") },
+  { target: "gitlabduo", outputPath: join(".gitlab", "duo", "chat-rules.md") },
   { target: "amp", outputPath: join(".config", "amp", "AGENTS.md") },
   { target: "cline", outputPath: join(".agents", "AGENTS.md") },
   { target: "warp", outputPath: join(".agents", "AGENTS.md") },
@@ -964,7 +2045,8 @@ const rulesGlobalTargets = [
   { target: "antigravity-cli", outputPath: join(".gemini", "GEMINI.md") },
   { target: "goose", outputPath: join(".config", "goose", ".goosehints") },
   { target: "copilotcli", outputPath: join(".copilot", "copilot-instructions.md") },
-  { target: "deepagents", outputPath: join(".deepagents", "deepagents", "AGENTS.md") },
+  { target: "crush", outputPath: join(".config", "crush", "CRUSH.md") },
+  { target: "deepagents", outputPath: join(".deepagents", "agent", "AGENTS.md") },
   { target: "factorydroid", outputPath: join(".factory", "AGENTS.md") },
   { target: "kilo", outputPath: join(".config", "kilo", "AGENTS.md") },
   { target: "kimi-code", outputPath: join(".kimi-code", "AGENTS.md") },
@@ -973,6 +2055,7 @@ const rulesGlobalTargets = [
   { target: "pi", outputPath: join(".pi", "agent", "AGENTS.md") },
   { target: "zed", outputPath: join(getZedGlobalDir(), "AGENTS.md") },
   { target: "vibe", outputPath: join(".vibe", "AGENTS.md") },
+  { target: "codewhale", outputPath: join(".codewhale", "AGENTS.md") },
   { target: "augmentcode", outputPath: join(".augment", "rules", "overview.md") },
   {
     target: "devin",
@@ -984,6 +2067,14 @@ const rulesGlobalTargets = [
   { target: "kiro-cli", outputPath: join(".kiro", "steering", "product.md") },
   { target: "kiro-ide", outputPath: join(".kiro", "steering", "product.md") },
   { target: "reasonix", outputPath: join(".reasonix", "REASONIX.md") },
+  { target: "zcode", outputPath: join(".zcode", "AGENTS.md") },
+  { target: "openclaw", outputPath: join(".openclaw", "workspace", "AGENTS.md") },
+  { target: "bob", outputPath: join(".bob", "AGENTS.md") },
+  { target: "tabnine", outputPath: join(".tabnine", "agent", "TABNINE.md") },
+  { target: "continue", outputPath: join(".continue", "rules", "AGENTS.md") },
+  { target: "pool", outputPath: join(".config", "poolside", "AGENTS.md") },
+  { target: "dsh", outputPath: join(".dsh", "AGENTS.md") },
+  { target: "firebender", outputPath: join(".firebender", "AGENTS.md") },
 ] as const;
 
 describe("E2E: rules (global mode)", () => {
@@ -1148,8 +2239,10 @@ globs: ["src/**/*"]
 
   it.each([
     { target: "codexcli", outputPath: join(".codex", "AGENTS.md") },
+    { target: "commandcode", outputPath: join(".commandcode", "AGENTS.md") },
     { target: "junie", outputPath: join(".junie", "AGENTS.md") },
     { target: "pi", outputPath: join(".pi", "agent", "AGENTS.md") },
+    { target: "xum", outputPath: join(".xum", "AGENTS.md") },
   ] as const)(
     "should fold $target non-root rules into its global root file",
     async ({ target, outputPath }) => {
@@ -1283,6 +2376,119 @@ globs: ["src/**/*.ts"]
     expect(nonRootContent).toContain("Global Non-Root Rule");
     expect(nonRootContent).toContain("src/**/*.ts");
   });
+
+  it("should generate qoder non-root rules into ~/.qoder/rules in global mode", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    const rootRuleContent = `---
+root: true
+targets: ["*"]
+description: "Root rule"
+globs: ["**/*"]
+---
+
+# Root Rule Content
+`;
+    const nonRootRuleContent = `---
+targets: ["*"]
+description: "Global coding guidelines"
+globs: ["src/**/*.ts"]
+---
+
+# Global Non-Root Rule
+`;
+    await writeFileContent(
+      join(projectDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+      rootRuleContent,
+    );
+    await writeFileContent(
+      join(projectDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "coding-guidelines.md"),
+      nonRootRuleContent,
+    );
+
+    await runGenerate({
+      target: "qoder",
+      features: "rules",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    // Root memory file -> ~/.qoder/AGENTS.md
+    const rootContent = await readFileContent(join(homeDir, ".qoder", "AGENTS.md"));
+    expect(rootContent).toContain("Root Rule Content");
+
+    // Non-root rule -> ~/.qoder/rules/*.md with `trigger: glob` frontmatter
+    const nonRootContent = await readFileContent(
+      join(homeDir, ".qoder", "rules", "coding-guidelines.md"),
+    );
+    expect(nonRootContent).toContain("Global Non-Root Rule");
+    expect(nonRootContent).toContain("trigger: glob");
+    expect(nonRootContent).toContain("src/**/*.ts");
+  });
+
+  it.each(["antigravity-cli", "antigravity-ide"])(
+    "should generate %s non-root rules into ~/.gemini/config/rules in global mode",
+    async (target) => {
+      const projectDir = getProjectDir();
+      const homeDir = getHomeDir();
+
+      const rootRuleContent = `---
+root: true
+targets: ["*"]
+description: "Root rule"
+globs: ["**/*"]
+---
+
+# Root Rule Content
+`;
+      const nonRootRuleContent = `---
+targets: ["*"]
+description: "Global coding guidelines"
+globs: ["**/*"]
+---
+
+# Global Non-Root Rule
+`;
+      await writeFileContent(
+        join(projectDir, RULESYNC_RULES_RELATIVE_DIR_PATH, RULESYNC_OVERVIEW_FILE_NAME),
+        rootRuleContent,
+      );
+      await writeFileContent(
+        join(projectDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "coding-guidelines.md"),
+        nonRootRuleContent,
+      );
+
+      // A global rule the user created outside rulesync in the shared directory.
+      const userRulePath = join(homeDir, ".gemini", "config", "rules", "user-rule.md");
+      await writeFileContent(userRulePath, "---\ntrigger: always_on\n---\n# User Rule\n");
+
+      await runGenerate({
+        target,
+        features: "rules",
+        global: true,
+        deleteFiles: true,
+        env: { HOME_DIR: homeDir },
+      });
+
+      // The shared directory is never swept, so the user's own rule survives.
+      expect(await readFileContent(userRulePath)).toContain("User Rule");
+
+      // Root rule -> ~/.gemini/GEMINI.md, with no reference to the non-root rule
+      // because Antigravity loads ~/.gemini/config/rules/ by itself.
+      const rootContent = await readFileContent(join(homeDir, ".gemini", "GEMINI.md"));
+      expect(rootContent).toContain("Root Rule Content");
+      expect(rootContent).not.toContain("Global Non-Root Rule");
+      expect(rootContent).not.toContain("coding-guidelines.md");
+
+      // Non-root rule -> ~/.gemini/config/rules/*.md with `trigger` frontmatter
+      const nonRootContent = await readFileContent(
+        join(homeDir, ".gemini", "config", "rules", "coding-guidelines.md"),
+      );
+      expect(nonRootContent).toContain("trigger: always_on");
+      expect(nonRootContent).toContain("Global Non-Root Rule");
+    },
+  );
 
   it("should generate devin non-root rules into ~/.devin/rules in global mode", async () => {
     const projectDir = getProjectDir();

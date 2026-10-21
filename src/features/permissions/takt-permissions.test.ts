@@ -70,7 +70,7 @@ describe("TaktPermissions", () => {
         }),
       });
 
-      expect(readMode(permissions.getFileContent(), "claude")).toBe("readonly");
+      expect(readMode(permissions.getFileContent(), "claude-sdk")).toBe("readonly");
     });
 
     it("derives edit when an edit/write category has an allow rule", async () => {
@@ -82,7 +82,7 @@ describe("TaktPermissions", () => {
         }),
       });
 
-      expect(readMode(permissions.getFileContent(), "claude")).toBe("edit");
+      expect(readMode(permissions.getFileContent(), "claude-sdk")).toBe("edit");
     });
 
     it("derives full when only a bash category has an allow rule", async () => {
@@ -93,7 +93,7 @@ describe("TaktPermissions", () => {
         }),
       });
 
-      expect(readMode(permissions.getFileContent(), "claude")).toBe("full");
+      expect(readMode(permissions.getFileContent(), "claude-sdk")).toBe("full");
     });
 
     it("defaults an empty config to readonly", async () => {
@@ -102,10 +102,10 @@ describe("TaktPermissions", () => {
         rulesyncPermissions: makeRulesyncPermissions({}),
       });
 
-      expect(readMode(permissions.getFileContent(), "claude")).toBe("readonly");
+      expect(readMode(permissions.getFileContent(), "claude-sdk")).toBe("readonly");
     });
 
-    it("defaults to the claude provider when no provider key exists", async () => {
+    it("defaults to the claude-sdk provider when no provider key exists", async () => {
       const permissions = await TaktPermissions.fromRulesyncPermissions({
         outputRoot: testDir,
         rulesyncPermissions: makeRulesyncPermissions({ bash: { "*": "allow" } }),
@@ -113,7 +113,43 @@ describe("TaktPermissions", () => {
 
       const parsed = toRecord(load(permissions.getFileContent()));
       const profiles = toRecord(parsed.provider_profiles);
-      expect(Object.keys(profiles)).toEqual(["claude"]);
+      // Takt 0.68.0+ selects `claude-sdk` when no provider is configured and
+      // does not resolve the `claude` alias for profile lookup.
+      expect(Object.keys(profiles)).toEqual(["claude-sdk"]);
+    });
+
+    it("writes to claude-sdk instead of promoting a lone legacy claude profile", async () => {
+      // Earlier rulesync versions wrote their fallback under `claude`; Takt
+      // 0.68.0+ ignores it when no provider is configured.
+      await writeFileContent(
+        join(testDir, ".takt", "config.yaml"),
+        ["provider_profiles:", "  claude:", "    default_permission_mode: full"].join("\n"),
+      );
+
+      const permissions = await TaktPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: makeRulesyncPermissions({ bash: { "*": "allow", "rm *": "deny" } }),
+      });
+
+      expect(readMode(permissions.getFileContent(), "claude-sdk")).toBe("readonly");
+      // The old profile is left in place by the in-place merge.
+      expect(readMode(permissions.getFileContent(), "claude")).toBe("full");
+    });
+
+    it("still promotes a lone non-claude profile when no provider key exists", async () => {
+      await writeFileContent(
+        join(testDir, ".takt", "config.yaml"),
+        ["provider_profiles:", "  codex:", "    default_permission_mode: readonly"].join("\n"),
+      );
+
+      const permissions = await TaktPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: makeRulesyncPermissions({ bash: { "*": "allow" } }),
+      });
+
+      const profiles = toRecord(toRecord(load(permissions.getFileContent())).provider_profiles);
+      expect(Object.keys(profiles)).toEqual(["codex"]);
+      expect(readMode(permissions.getFileContent(), "codex")).toBe("full");
     });
 
     it("writes under the active provider and preserves other top-level keys + step overrides", async () => {
@@ -163,10 +199,10 @@ describe("TaktPermissions", () => {
       });
 
       const parsed = toRecord(load(permissions.getFileContent()));
-      const claude = toRecord(toRecord(parsed.provider_profiles).claude);
+      const claudeSdk = toRecord(toRecord(parsed.provider_profiles)["claude-sdk"]);
       // Derived coarse mode and per-step overrides coexist in the profile.
-      expect(claude.default_permission_mode).toBe("full");
-      expect(toRecord(claude.step_permission_overrides)).toEqual({
+      expect(claudeSdk.default_permission_mode).toBe("full");
+      expect(toRecord(claudeSdk.step_permission_overrides)).toEqual({
         ai_review: "readonly",
         build: "full",
       });
@@ -369,6 +405,89 @@ describe("TaktPermissions", () => {
       }
     });
 
+    it("inherits the global config.yaml provider for a project config that names none (issue #2421)", async () => {
+      const { testDir: homeDir, cleanup: cleanupHome } = await setupTestDirectory({ home: true });
+      try {
+        vi.stubEnv("HOME_DIR", homeDir);
+        await writeFileContent(join(homeDir, ".takt", "config.yaml"), "provider: codex\n");
+
+        const permissions = await TaktPermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: makeRulesyncPermissions({ bash: { "*": "allow" } }),
+        });
+
+        expect(readMode(permissions.getFileContent(), "codex")).toBe("full");
+        expect(readMode(permissions.getFileContent(), "claude-sdk")).toBeUndefined();
+      } finally {
+        vi.unstubAllEnvs();
+        await cleanupHome();
+      }
+    });
+
+    it("inherits the block-form global provider (issue #2421)", async () => {
+      const { testDir: homeDir, cleanup: cleanupHome } = await setupTestDirectory({ home: true });
+      try {
+        vi.stubEnv("HOME_DIR", homeDir);
+        await writeFileContent(
+          join(homeDir, ".takt", "config.yaml"),
+          "provider:\n  type: codex\n  model: gpt-5\n",
+        );
+
+        const permissions = await TaktPermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: makeRulesyncPermissions({ bash: { "*": "allow" } }),
+        });
+
+        expect(readMode(permissions.getFileContent(), "codex")).toBe("full");
+      } finally {
+        vi.unstubAllEnvs();
+        await cleanupHome();
+      }
+    });
+
+    it("warns and falls back when the global config.yaml cannot be parsed (issue #2421)", async () => {
+      const { testDir: homeDir, cleanup: cleanupHome } = await setupTestDirectory({ home: true });
+      try {
+        vi.stubEnv("HOME_DIR", homeDir);
+        await writeFileContent(join(homeDir, ".takt", "config.yaml"), "- not\n- a mapping\n");
+        const logger = createMockLogger();
+
+        const permissions = await TaktPermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: makeRulesyncPermissions({ bash: { "*": "allow" } }),
+          logger,
+        });
+
+        expect(readMode(permissions.getFileContent(), "claude-sdk")).toBe("full");
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("could not read the provider from"),
+        );
+      } finally {
+        vi.unstubAllEnvs();
+        await cleanupHome();
+      }
+    });
+
+    it("keeps the project config.yaml provider over the global one (issue #2421)", async () => {
+      const { testDir: homeDir, cleanup: cleanupHome } = await setupTestDirectory({ home: true });
+      try {
+        vi.stubEnv("HOME_DIR", homeDir);
+        await writeFileContent(join(homeDir, ".takt", "config.yaml"), "provider: codex\n");
+        await writeFileContent(join(testDir, ".takt", "config.yaml"), "provider: opencode\n");
+
+        const permissions = await TaktPermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: makeRulesyncPermissions({ bash: { "*": "allow" } }),
+        });
+
+        expect(readMode(permissions.getFileContent(), "opencode")).toBe("full");
+        expect(readMode(permissions.getFileContent(), "codex")).toBeUndefined();
+      } finally {
+        vi.unstubAllEnvs();
+        await cleanupHome();
+      }
+    });
+
     it("does not promote a lone runtime profile to the default, as upstream does not", async () => {
       await writeRuntimeYaml(
         testDir,
@@ -383,8 +502,8 @@ describe("TaktPermissions", () => {
       });
 
       // No `defaults.profile`, so Takt names no provider here either: the legacy
-      // chain decides, ending at its `claude` default.
-      expect(readMode(permissions.getFileContent(), "claude")).toBe("full");
+      // chain decides, ending at its `claude-sdk` default.
+      expect(readMode(permissions.getFileContent(), "claude-sdk")).toBe("full");
     });
 
     it("merges the project and global runtime.yaml before resolving the provider", async () => {
@@ -394,7 +513,7 @@ describe("TaktPermissions", () => {
         // The project file is active through `targets:` alone; the assignment
         // that names the provider lives in the global file. Takt merges the two
         // before resolving (profiles union, `defaults` project-else-global), so
-        // the provider is codex rather than the legacy `claude` default.
+        // the provider is codex rather than the legacy `claude-sdk` default.
         await writeRuntimeYaml(
           testDir,
           [
@@ -549,6 +668,192 @@ describe("TaktPermissions", () => {
       const json = JSON.parse(tool.toRulesyncPermissions().getFileContent());
 
       expect(json.takt).toBeUndefined();
+    });
+
+    describe("companion routing (companion.enabled, off by default)", () => {
+      // A provider section that only routes companion reviewers. Takt drops
+      // it before mode detection while companions are disabled (the default),
+      // so on its own it leaves the install in legacy mode.
+      const COMPANION_ONLY_RUNTIME_YAML = [
+        "version: 1",
+        "provider:",
+        "  profiles:",
+        "    base:",
+        "      provider: codex",
+        "      options:",
+        "        reasoning_effort: high",
+        "    reviewer:",
+        "      extends: base",
+        "      provider: codex",
+        "  targets:",
+        "    companions:",
+        "      security:",
+        "        profile: reviewer",
+      ].join("\n");
+
+      it("keeps writing provider_options when only companion targets exist", async () => {
+        await writeRuntimeYaml(testDir, COMPANION_ONLY_RUNTIME_YAML);
+        const logger = createMockLogger();
+
+        const permissions = await generateWithProviderOptions(logger);
+
+        const parsed = toRecord(load(permissions.getFileContent()));
+        expect(toRecord(toRecord(parsed.provider_options).codex).network_access).toBe(true);
+        expect(logger.warn).not.toHaveBeenCalled();
+      });
+
+      it("treats the same file as active once companions are enabled", async () => {
+        await writeRuntimeYaml(
+          testDir,
+          `companion:\n  enabled: true\n${COMPANION_ONLY_RUNTIME_YAML}`,
+        );
+        const logger = createMockLogger();
+
+        const permissions = await generateWithProviderOptions(logger);
+
+        expect(toRecord(load(permissions.getFileContent())).provider_options).toBeUndefined();
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("Mixed provider configuration detected"),
+        );
+      });
+
+      it("keeps a profile an agent assignment also reaches through extends", async () => {
+        // `base` is reached from the companion root (`reviewer` extends it) but
+        // also from a persona assignment, so it survives the filter and keeps
+        // the section active.
+        await writeRuntimeYaml(
+          testDir,
+          [
+            COMPANION_ONLY_RUNTIME_YAML,
+            "    personas:",
+            "      coder:",
+            "        profile: base",
+          ].join("\n"),
+        );
+
+        const permissions = await generateWithProviderOptions();
+
+        expect(toRecord(load(permissions.getFileContent())).provider_options).toBeUndefined();
+      });
+
+      it("treats a named assignment set with agent targets as active", async () => {
+        await writeRuntimeYaml(
+          testDir,
+          [
+            "version: 1",
+            "provider:",
+            "  assignments:",
+            "    backend:",
+            "      targets:",
+            "        personas:",
+            "          coder:",
+            "            profile: default",
+          ].join("\n"),
+        );
+
+        const permissions = await generateWithProviderOptions();
+
+        expect(toRecord(load(permissions.getFileContent())).provider_options).toBeUndefined();
+      });
+
+      it("ignores a named assignment set that only routes companions", async () => {
+        await writeRuntimeYaml(
+          testDir,
+          [
+            "version: 1",
+            "provider:",
+            "  assignments:",
+            "    backend:",
+            "      targets:",
+            "        companions:",
+            "          security:",
+            "            profile: reviewer",
+          ].join("\n"),
+        );
+
+        const permissions = await generateWithProviderOptions();
+
+        const parsed = toRecord(load(permissions.getFileContent()));
+        expect(toRecord(toRecord(parsed.provider_options).codex).network_access).toBe(true);
+      });
+
+      it("turns companions off when either scope disables them", async () => {
+        const { testDir: homeDir, cleanup: cleanupHome } = await setupTestDirectory({ home: true });
+        try {
+          vi.stubEnv("HOME_DIR", homeDir);
+          // Upstream ANDs the two flags (`enabled` is on only when neither file
+          // turns it off), so a project `enabled: true` cannot override the
+          // global opt-out, and the companion-only section stays inactive.
+          await writeRuntimeYaml(homeDir, "version: 1\ncompanion:\n  enabled: false\n");
+          await writeRuntimeYaml(
+            testDir,
+            `companion:\n  enabled: true\n${COMPANION_ONLY_RUNTIME_YAML}`,
+          );
+
+          const permissions = await generateWithProviderOptions();
+
+          const parsed = toRecord(load(permissions.getFileContent()));
+          expect(toRecord(toRecord(parsed.provider_options).codex).network_access).toBe(true);
+        } finally {
+          vi.unstubAllEnvs();
+          await cleanupHome();
+        }
+      });
+
+      it("lets a global companion opt-in activate a project companion-only section", async () => {
+        const { testDir: homeDir, cleanup: cleanupHome } = await setupTestDirectory({ home: true });
+        try {
+          vi.stubEnv("HOME_DIR", homeDir);
+          // The global file turns companions on; the project file is the
+          // companion-only section. Merged, the section is active.
+          await writeRuntimeYaml(homeDir, "version: 1\ncompanion:\n  enabled: true\n");
+          await writeRuntimeYaml(testDir, COMPANION_ONLY_RUNTIME_YAML);
+
+          const permissions = await generateWithProviderOptions();
+
+          expect(toRecord(load(permissions.getFileContent())).provider_options).toBeUndefined();
+        } finally {
+          vi.unstubAllEnvs();
+          await cleanupHome();
+        }
+      });
+
+      it("does not lift options of a companion-only profile on import", async () => {
+        // The active `default` profile keeps runtime mode on; `reviewer` is
+        // reachable only from a companion target, so Takt ignores it and its
+        // options never reach an agent.
+        await writeRuntimeYaml(
+          testDir,
+          [
+            "version: 1",
+            "provider:",
+            "  defaults:",
+            "    profile: default",
+            "  profiles:",
+            "    default:",
+            "      provider: codex",
+            "      options:",
+            "        reasoning_effort: high",
+            "    reviewer:",
+            "      provider: claude",
+            "      options:",
+            "        sandbox: true",
+            "  targets:",
+            "    companions:",
+            "      security:",
+            "        profile: reviewer",
+          ].join("\n"),
+        );
+        await writeFileContent(
+          join(testDir, ".takt", "config.yaml"),
+          ["provider_profiles:", "  codex:", "    default_permission_mode: full"].join("\n"),
+        );
+
+        const tool = await TaktPermissions.fromFile({ outputRoot: testDir });
+        const json = JSON.parse(tool.toRulesyncPermissions().getFileContent());
+
+        expect(json.takt.provider_options).toEqual({ codex: { reasoning_effort: "high" } });
+      });
     });
   });
 
@@ -823,6 +1128,28 @@ describe("TaktPermissions", () => {
         ["provider_profiles:", "  codex:", "    default_permission_mode: full"].join("\n"),
       );
       expect(json.permission.bash["*"]).toBe("allow");
+    });
+
+    it("reads the claude-sdk profile, not the claude one, when no provider key exists", async () => {
+      const json = await importMode(
+        [
+          "provider_profiles:",
+          "  claude:",
+          "    default_permission_mode: readonly",
+          "  claude-sdk:",
+          "    default_permission_mode: full",
+        ].join("\n"),
+      );
+      expect(json.permission.bash["*"]).toBe("allow");
+    });
+
+    it("ignores a lone legacy claude profile when no provider key exists", async () => {
+      // Takt 0.68.0+ reads `claude-sdk` here, so the stale `claude` profile an
+      // earlier rulesync generate left behind is not the active mode.
+      const json = await importMode(
+        ["provider_profiles:", "  claude:", "    default_permission_mode: full"].join("\n"),
+      );
+      expect(json.permission.bash["*"]).toBe("deny");
     });
   });
 

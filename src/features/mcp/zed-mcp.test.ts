@@ -89,6 +89,23 @@ describe("ZedMcp", () => {
   });
 
   describe("fromRulesyncMcp", () => {
+    it("should retract context_servers when no server is left, keeping unrelated keys", async () => {
+      await ensureDir(join(testDir, ".zed"));
+      await writeFileContent(
+        join(testDir, ".zed", "settings.json"),
+        JSON.stringify({ theme: "One Dark", context_servers: { old: { command: "old" } } }),
+      );
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({ mcpServers: {} }),
+      });
+
+      const mcp = await ZedMcp.fromRulesyncMcp({ outputRoot: testDir, rulesyncMcp });
+
+      expect(mcp.getJson()).toEqual({ theme: "One Dark" });
+    });
+
     it("should write servers under the context_servers key", async () => {
       const rulesyncMcp = new RulesyncMcp({
         relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
@@ -300,6 +317,8 @@ describe("ZedMcp", () => {
       ["ws", { type: "ws", url: "wss://example.com" }],
       ["url-less remote", { type: "http" }],
       ["command-less local", { type: "stdio" }],
+      // `args[0]` must not be promoted to the program.
+      ["args-only local", { type: "stdio", args: ["-y", "git-mcp"] }],
     ])("should skip a server Zed cannot start: %s", async (_label, server) => {
       const rulesyncMcp = new RulesyncMcp({
         relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,

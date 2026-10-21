@@ -1,7 +1,6 @@
 import { join } from "node:path";
 
 import { CURSOR_DIR, CURSOR_HOOKS_FILE_NAME } from "../../constants/cursor-paths.js";
-import type { AiFileParams } from "../../types/ai-file.js";
 import type { ValidationResult } from "../../types/ai-file.js";
 import type { HooksConfig } from "../../types/hooks.js";
 import {
@@ -9,7 +8,12 @@ import {
   CURSOR_TO_CANONICAL_EVENT_NAMES,
   CANONICAL_TO_CURSOR_EVENT_NAMES,
 } from "../../types/hooks.js";
-import { readFileContent } from "../../utils/file.js";
+import type { ToolFile } from "../../types/tool-file.js";
+import { readFileContent, readFileContentOrNull } from "../../utils/file.js";
+import type { Logger } from "../../utils/logger.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
+import { HOOKS_OWNERSHIP_LOCK_FILE_NAME, parseHooksOwnershipLock } from "./hooks-ownership-lock.js";
+import { mergeGeneratedHookLists } from "./preserve-unowned-hook-commands.js";
 import type { RulesyncHooks } from "./rulesync-hooks.js";
 import { buildImportedHooksConfig } from "./tool-hooks-converter.js";
 import {
@@ -17,10 +21,11 @@ import {
   type ToolHooksForDeletionParams,
   type ToolHooksFromFileParams,
   type ToolHooksFromRulesyncHooksParams,
+  type ToolHooksParams,
   type ToolHooksSettablePaths,
 } from "./tool-hooks.js";
 
-export type CursorHooksConstructorParams = AiFileParams & {
+export type CursorHooksConstructorParams = ToolHooksParams & {
   rulesyncHooks?: RulesyncHooks;
 };
 
@@ -63,12 +68,14 @@ export class CursorHooks extends ToolHooks {
     });
   }
 
-  static fromRulesyncHooks({
+  static async fromRulesyncHooks({
     outputRoot = process.cwd(),
     rulesyncHooks,
     validate = true,
     global = false,
-  }: ToolHooksFromRulesyncHooksParams & { global?: boolean }): CursorHooks {
+    preserveUnowned = false,
+    logger,
+  }: ToolHooksFromRulesyncHooksParams & { global?: boolean }): Promise<CursorHooks> {
     const config = rulesyncHooks.getJson();
     const cursorSupported: Set<string> = new Set(CURSOR_HOOK_EVENTS);
     const sharedHooks: HooksConfig["hooks"] = {};
@@ -90,7 +97,8 @@ export class CursorHooks extends ToolHooks {
     // types are skipped (the HooksProcessor warns about them).
     const cursorSupportedTypes = new Set(["command", "prompt"]);
     for (const [eventName, defs] of Object.entries(mergedHooks)) {
-      const cursorEventName = CANONICAL_TO_CURSOR_EVENT_NAMES[eventName] ?? eventName;
+      const cursorEventName =
+        lookupOwn({ record: CANONICAL_TO_CURSOR_EVENT_NAMES, key: eventName }) ?? eventName;
       const mappedDefs = defs
         .filter((def) => cursorSupportedTypes.has(def.type ?? "command"))
         .map((def) => ({
@@ -100,6 +108,11 @@ export class CursorHooks extends ToolHooks {
           ...(def.loop_limit !== undefined && { loop_limit: def.loop_limit }),
           ...(def.matcher !== undefined && def.matcher !== null && { matcher: def.matcher }),
           ...(def.prompt !== undefined && def.prompt !== null && { prompt: def.prompt }),
+          // Prompt hooks accept an optional `model` overriding the fast model
+          // that evaluates the condition. https://cursor.com/docs/hooks
+          ...(def.type === "prompt" &&
+            def.model !== undefined &&
+            def.model !== null && { model: def.model }),
           ...(def.failClosed !== undefined &&
             def.failClosed !== null && {
               failClosed: def.failClosed,
@@ -109,20 +122,53 @@ export class CursorHooks extends ToolHooks {
         mappedHooks[cursorEventName] = mappedDefs;
       }
     }
+    const paths = CursorHooks.getSettablePaths({ global });
+    const filePath = join(outputRoot, paths.relativeDirPath, paths.relativeFilePath);
+    const existingContent = (await readFileContentOrNull(filePath)) ?? "";
+    const previouslyOwned = preserveUnowned
+      ? parseHooksOwnershipLock(
+          await readFileContentOrNull(
+            join(outputRoot, paths.relativeDirPath, HOOKS_OWNERSHIP_LOCK_FILE_NAME),
+          ),
+        )
+      : undefined;
+    const merged = mergeGeneratedHookLists({
+      existingContent,
+      generatedHooks: mappedHooks as Record<string, unknown[]>,
+      shape: "flat",
+      preserveUnowned,
+      previouslyOwned,
+      logger,
+    });
     const cursorConfig = {
       version: config.version ?? 1,
-      hooks: mappedHooks,
+      hooks: merged.hooks,
     };
     const fileContent = JSON.stringify(cursorConfig, null, 2);
-    const paths = CursorHooks.getSettablePaths({ global });
     return new CursorHooks({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath: paths.relativeFilePath,
       fileContent,
+      ownedHookRefs: preserveUnowned ? merged.owned : undefined,
       validate,
       rulesyncHooks,
     });
+  }
+
+  static override supportsPreserveUnowned(): boolean {
+    return true;
+  }
+
+  static override async getAuxiliaryFiles({
+    toolHooks,
+  }: {
+    outputRoot?: string;
+    global?: boolean;
+    toolHooks?: ToolHooks;
+    logger?: Logger;
+  } = {}): Promise<ToolFile[]> {
+    return toolHooks instanceof CursorHooks ? toolHooks.getOwnershipLockFiles() : [];
   }
 
   toRulesyncHooks(): RulesyncHooks {
@@ -134,7 +180,9 @@ export class CursorHooks extends ToolHooks {
     // (see CANONICAL_TO_CURSOR_EVENT_NAMES in types/hooks.ts).
     const canonicalHooks: HooksConfig["hooks"] = {};
     for (const [cursorEventName, defs] of Object.entries(cursorHooks)) {
-      const eventName = CURSOR_TO_CANONICAL_EVENT_NAMES[cursorEventName] ?? cursorEventName;
+      const eventName =
+        lookupOwn({ record: CURSOR_TO_CANONICAL_EVENT_NAMES, key: cursorEventName }) ??
+        cursorEventName;
       canonicalHooks[eventName] = defs;
     }
     const version = parsed.version ?? 1;

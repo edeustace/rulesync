@@ -233,6 +233,24 @@ Assist with any tasks`,
     );
   });
 
+  it("should type the hidden, color, steps, and variant agent fields", () => {
+    expect(
+      OpenCodeSubagentFrontmatterSchema.safeParse({
+        description: "Agent",
+        hidden: true,
+        color: "#FF5733",
+        steps: 5,
+        variant: "high",
+      }).success,
+    ).toBe(true);
+    expect(
+      OpenCodeSubagentFrontmatterSchema.safeParse({ description: "Agent", hidden: "yes" }).success,
+    ).toBe(false);
+    expect(
+      OpenCodeSubagentFrontmatterSchema.safeParse({ description: "Agent", steps: "five" }).success,
+    ).toBe(false);
+  });
+
   it("should apply default mode 'subagent' when mode is omitted", async () => {
     const dirPath = join(testDir, ".opencode", "agents");
     const filePath = join(dirPath, "no-mode.md");
@@ -327,6 +345,42 @@ Body content`,
       expect(frontmatter.prompt).toBeUndefined();
     });
 
+    it("merges inline agents from .opencode/opencode.json over the root config", async () => {
+      await writeFileContent(join(testDir, ".opencode", "prompts", "agent.txt"), "Dot prompt");
+      await writeFileContent(
+        join(testDir, "opencode.json"),
+        JSON.stringify({
+          agent: {
+            reviewer: { description: "Root", mode: "subagent", prompt: "Root prompt" },
+            keeper: { description: "Keeps its prompt", prompt: "Kept prompt" },
+          },
+        }),
+      );
+      await writeFileContent(
+        join(testDir, ".opencode", "opencode.json"),
+        JSON.stringify({
+          agent: {
+            // Resolved against `.opencode/`, the directory of this file.
+            reviewer: { description: "Dot", prompt: "{file:./prompts/agent.txt}" },
+            keeper: { temperature: 0.1 },
+          },
+        }),
+      );
+
+      const subagents = await OpenCodeSubagent.loadAdditionalImportFiles({ outputRoot: testDir });
+      const byName = new Map(subagents.map((agent) => [agent.getRelativeFilePath(), agent]));
+
+      const reviewer = byName.get("reviewer.md");
+      expect(reviewer?.getBody()).toBe("Dot prompt");
+      expect(reviewer?.getFrontmatter()).toMatchObject({ description: "Dot", mode: "subagent" });
+      const keeper = byName.get("keeper.md");
+      expect(keeper?.getBody()).toBe("Kept prompt");
+      expect(keeper?.getFrontmatter()).toMatchObject({
+        description: "Keeps its prompt",
+        temperature: 0.1,
+      });
+    });
+
     it("resolves a {file:./path} prompt reference relative to the config dir", async () => {
       await writeFileContent(join(testDir, "prompts", "agent.txt"), "Prompt from file");
       await writeFileContent(
@@ -366,6 +420,27 @@ Body content`,
       expect(rulesyncSubagent).toBeInstanceOf(RulesyncSubagent);
       expect(rulesyncSubagent?.getBody()).toBe("Do work");
       expect(rulesyncSubagent?.getRelativeFilePath()).toBe("plain.md");
+    });
+
+    it("imports V2 agents entries from opencode.json", async () => {
+      await writeFileContent(
+        join(testDir, "opencode.json"),
+        JSON.stringify({
+          agents: {
+            reviewer: { description: "Reviews", system: "You review.", model: "openai/gpt-5#high" },
+          },
+        }),
+      );
+
+      const [subagent] = await OpenCodeSubagent.loadAdditionalImportFiles({ outputRoot: testDir });
+
+      expect(subagent?.getRelativeFilePath()).toBe("reviewer.md");
+      expect(subagent?.getBody()).toBe("You review.");
+      const frontmatter = subagent?.getFrontmatter() as Record<string, unknown>;
+      expect(frontmatter.description).toBe("Reviews");
+      expect(frontmatter.model).toBe("openai/gpt-5");
+      expect(frontmatter.variant).toBe("high");
+      expect(frontmatter.system).toBeUndefined();
     });
 
     it("returns an empty array when there is no agent block or config", async () => {

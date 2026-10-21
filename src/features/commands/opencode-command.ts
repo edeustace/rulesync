@@ -2,15 +2,17 @@ import { join } from "node:path";
 
 import { optional, z } from "zod/mini";
 
-import {
-  OPENCODE_COMMANDS_DIR_PATH,
-  OPENCODE_GLOBAL_COMMANDS_DIR_PATH,
-} from "../../constants/opencode-paths.js";
+import { OPENCODE_LAYOUT, type OpencodeLayout } from "../../constants/opencode-paths.js";
 import { AiFileParams, ValidationResult } from "../../types/ai-file.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContent } from "../../utils/file.js";
 import { parseFrontmatter, stringifyFrontmatter } from "../../utils/frontmatter.js";
-import { asOpencodeEntries, readOpencodeConfig } from "../opencode-config.js";
+import {
+  asOpencodeEntries,
+  getOpencodeCommandEntries,
+  mergeOpencodeEntryLayers,
+  readOpencodeConfigLayers,
+} from "../opencode-config.js";
 import { RulesyncCommand, RulesyncCommandFrontmatter } from "./rulesync-command.js";
 import {
   ToolCommand,
@@ -24,10 +26,34 @@ export const OpenCodeCommandFrontmatterSchema = z.looseObject({
   description: z.optional(z.string()),
   agent: optional(z.string()),
   subtask: optional(z.boolean()),
+  // OpenCode V2 spelling of `subtask` (V2 keeps `subtask` as a deprecated
+  // alias). OpenCode V1 only knows `subtask`, so rulesync folds `subagent`
+  // into `subtask` on both import and generate; see `foldSubagentAlias`.
+  subagent: optional(z.boolean()),
   model: optional(z.string()),
+  // Default model variant for the command (e.g. a provider reasoning preset).
+  variant: optional(z.string()),
 });
 
 export type OpenCodeCommandFrontmatter = z.infer<typeof OpenCodeCommandFrontmatterSchema>;
+
+/**
+ * Rewrites a boolean `subagent` (OpenCode V2) into `subtask`, the key both V1
+ * and V2 read: V1's command schema rejects unknown keys, while V2 resolves
+ * `subagent ?? subtask`. `subagent` therefore wins when both are set, matching
+ * V2. A non-boolean `subagent` is left untouched for validation to report.
+ *
+ * @see https://opencode.ai/v2/docs/commands/
+ */
+function foldSubagentAlias<T extends Record<string, unknown>>(
+  fields: T,
+): T | (Omit<T, "subagent"> & { subtask: boolean }) {
+  if (typeof fields.subagent !== "boolean") {
+    return fields;
+  }
+  const { subagent, ...rest } = fields;
+  return { ...rest, subtask: subagent };
+}
 
 export type OpenCodeCommandParams = {
   frontmatter: OpenCodeCommandFrontmatter;
@@ -35,6 +61,9 @@ export type OpenCodeCommandParams = {
 } & Omit<AiFileParams, "fileContent">;
 
 export class OpenCodeCommand extends ToolCommand {
+  /** Directory layout; OpenCode forks (MiMo Code) override it. */
+  protected static readonly layout: OpencodeLayout = OPENCODE_LAYOUT;
+
   private readonly frontmatter: OpenCodeCommandFrontmatter;
   private readonly body: string;
 
@@ -63,7 +92,7 @@ export class OpenCodeCommand extends ToolCommand {
     // so rulesync emits the plural form to match the documented convention and
     // its own plural `.opencode/plugins` hooks output.
     return {
-      relativeDirPath: global ? OPENCODE_GLOBAL_COMMANDS_DIR_PATH : OPENCODE_COMMANDS_DIR_PATH,
+      relativeDirPath: join(global ? this.layout.globalDir : this.layout.dir, "commands"),
     };
   }
 
@@ -76,12 +105,14 @@ export class OpenCodeCommand extends ToolCommand {
   }
 
   toRulesyncCommand(): RulesyncCommand {
-    const { description, ...restFields } = this.frontmatter;
+    const { description, ...toolFields } = this.frontmatter;
+    const restFields = foldSubagentAlias(toolFields);
+    const { toolTarget } = (this.constructor as typeof OpenCodeCommand).layout;
 
     const rulesyncFrontmatter: RulesyncCommandFrontmatter = {
       targets: ["*"],
       description,
-      ...(Object.keys(restFields).length > 0 && { opencode: restFields }),
+      ...(Object.keys(restFields).length > 0 && { [toolTarget]: restFields }),
     };
 
     const fileContent = stringifyFrontmatter(this.body, rulesyncFrontmatter);
@@ -104,7 +135,7 @@ export class OpenCodeCommand extends ToolCommand {
     global = false,
   }: ToolCommandFromRulesyncCommandParams): OpenCodeCommand {
     const rulesyncFrontmatter = rulesyncCommand.getFrontmatter();
-    const opencodeFields = rulesyncFrontmatter.opencode ?? {};
+    const opencodeFields = foldSubagentAlias(rulesyncFrontmatter[this.layout.toolTarget] ?? {});
 
     const opencodeFrontmatter: OpenCodeCommandFrontmatter = {
       description: rulesyncFrontmatter.description,
@@ -114,7 +145,7 @@ export class OpenCodeCommand extends ToolCommand {
     const body = rulesyncCommand.getBody();
     const paths = this.getSettablePaths({ global });
 
-    return new OpenCodeCommand({
+    return new this({
       outputRoot: outputRoot,
       frontmatter: opencodeFrontmatter,
       body,
@@ -157,7 +188,7 @@ export class OpenCodeCommand extends ToolCommand {
       throw new Error(`Invalid frontmatter in ${filePath}: ${formatError(result.error)}`);
     }
 
-    return new OpenCodeCommand({
+    return new this({
       outputRoot: outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath,
@@ -170,15 +201,19 @@ export class OpenCodeCommand extends ToolCommand {
   static isTargetedByRulesyncCommand(rulesyncCommand: RulesyncCommand): boolean {
     return this.isTargetedByRulesyncCommandDefault({
       rulesyncCommand,
-      toolTarget: "opencode",
+      toolTarget: this.layout.toolTarget,
     });
   }
 
   /**
-   * Imports commands defined inline in `opencode.json` / `opencode.jsonc` under
-   * the top-level `command` key (in addition to the Markdown files under
+   * Imports commands defined inline in `opencode.json` / `opencode.jsonc` (and,
+   * at project scope, `.opencode/opencode.json(c)`, which OpenCode merges over
+   * them) under the top-level `command` key — or its V2 spelling `commands`, see
+   * `getOpencodeCommandEntries` — (in addition to the Markdown files under
    * `.opencode/commands/`). Each entry's `template` becomes the command body,
-   * while `description` / `agent` / `model` / `subtask` map to the frontmatter.
+   * while `description` / `agent` / `model` / `variant` / `subtask` map to the
+   * frontmatter (a V2 `subagent` is read as `subtask`, taking precedence like
+   * V2 does).
    *
    * Import-only: this is invoked by the commands processor when loading tool
    * files for conversion to rulesync, never for orphan deletion.
@@ -192,8 +227,12 @@ export class OpenCodeCommand extends ToolCommand {
     outputRoot?: string;
     global?: boolean;
   } = {}): Promise<OpenCodeCommand[]> {
-    const config = await readOpencodeConfig({ outputRoot, global });
-    const commandEntries = asOpencodeEntries(config.command);
+    // Each file is lowered on its own and later files win, as OpenCode merges
+    // `.opencode/opencode.json(c)` over the root config.
+    const layers = await readOpencodeConfigLayers({ outputRoot, global, layout: this.layout });
+    const commandEntries = mergeOpencodeEntryLayers(
+      layers.map(({ config }) => getOpencodeCommandEntries({ config, layout: this.layout })),
+    );
     if (!commandEntries) {
       return [];
     }
@@ -208,15 +247,17 @@ export class OpenCodeCommand extends ToolCommand {
       }
 
       const body = typeof entry.template === "string" ? entry.template : "";
+      const { subtask } = foldSubagentAlias(entry);
       const frontmatter: OpenCodeCommandFrontmatter = {
         ...(typeof entry.description === "string" && { description: entry.description }),
         ...(typeof entry.agent === "string" && { agent: entry.agent }),
         ...(typeof entry.model === "string" && { model: entry.model }),
-        ...(typeof entry.subtask === "boolean" && { subtask: entry.subtask }),
+        ...(typeof entry.variant === "string" && { variant: entry.variant }),
+        ...(typeof subtask === "boolean" && { subtask }),
       };
 
       commands.push(
-        new OpenCodeCommand({
+        new this({
           outputRoot,
           frontmatter,
           body,
@@ -235,7 +276,7 @@ export class OpenCodeCommand extends ToolCommand {
     relativeDirPath,
     relativeFilePath,
   }: ToolCommandForDeletionParams): OpenCodeCommand {
-    return new OpenCodeCommand({
+    return new this({
       outputRoot,
       relativeDirPath,
       relativeFilePath,

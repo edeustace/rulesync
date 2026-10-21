@@ -37,7 +37,8 @@ import {
  *
  * Devin matches `matcher` against the event's `tool_name`, which is only
  * meaningful for the tool/permission lifecycle events
- * (`PreToolUse`/`PostToolUse`/`PermissionRequest`). The session, turn, and
+ * (`PreToolUse`/`PostToolUse`/`PermissionRequest`). `PreCompact` takes a
+ * `manual` / `auto` trigger matcher instead. The other session, turn, and
  * compaction events are matcher-less; any matcher defined on them is dropped
  * with a warning.
  */
@@ -111,10 +112,10 @@ export class DevinHooks extends ToolHooks {
     validate = true,
     global = false,
   }: ToolHooksFromFileParams): Promise<DevinHooks> {
-    const paths = DevinHooks.getSettablePaths({ global });
+    const paths = this.getSettablePaths({ global });
     const filePath = join(outputRoot, paths.relativeDirPath, paths.relativeFilePath);
     const fileContent = (await readFileContentOrNull(filePath)) ?? "{}";
-    return new DevinHooks({
+    return new this({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath: paths.relativeFilePath,
@@ -133,7 +134,7 @@ export class DevinHooks extends ToolHooks {
     global?: boolean;
     logger?: Logger;
   }): Promise<DevinHooks> {
-    const paths = DevinHooks.getSettablePaths({ global });
+    const paths = this.getSettablePaths({ global });
     const filePath = join(outputRoot, paths.relativeDirPath, paths.relativeFilePath);
 
     const config = rulesyncHooks.getJson();
@@ -164,7 +165,7 @@ export class DevinHooks extends ToolHooks {
       fileContent = JSON.stringify(devinHooks, null, 2);
     }
 
-    return new DevinHooks({
+    return new this({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath: paths.relativeFilePath,
@@ -216,7 +217,7 @@ export class DevinHooks extends ToolHooks {
     relativeDirPath,
     relativeFilePath,
   }: ToolHooksForDeletionParams): DevinHooks {
-    return new DevinHooks({
+    return new this({
       outputRoot,
       relativeDirPath,
       relativeFilePath,

@@ -247,3 +247,131 @@ describe("GrokcliSkill invocation flags", () => {
     expect(imported["disable-model-invocation"]).toBeUndefined();
   });
 });
+
+describe("GrokcliSkill paths", () => {
+  // Grok's `parse_skill_paths` accepts a YAML list or a comma-separated string
+  // and keeps the skill out of the listing until a tool touches a matching file.
+  // https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-tools/src/implementations/skills/discovery.rs
+  it("emits the grokcli section's paths as authored, list or string", () => {
+    expect(
+      buildGrokcliSkill({ grokcli: { paths: ["src/api/**", "*.sql"] } }).getFrontmatter().paths,
+    ).toEqual(["src/api/**", "*.sql"]);
+    expect(
+      buildGrokcliSkill({ grokcli: { paths: "src/api/**, *.sql" } }).getFrontmatter().paths,
+    ).toBe("src/api/**, *.sql");
+  });
+
+  it("does not read paths from another tool's section or emit it when unset", () => {
+    // `paths` has no root-level shared default: Claude Code, Cursor and Qwen
+    // Code each carry their own, so a value authored for one of them must not
+    // gate the Grok skill.
+    expect(
+      buildGrokcliSkill({ claudecode: { paths: ["src/**"] } }).getFrontmatter().paths,
+    ).toBeUndefined();
+    expect(buildGrokcliSkill({}).getFrontmatter().paths).toBeUndefined();
+  });
+
+  it("reads paths back into the grokcli section on import", () => {
+    const skill = new GrokcliSkill({
+      dirName: "sample",
+      frontmatter: {
+        name: "sample",
+        description: "Sample",
+        paths: ["src/api/**"],
+      },
+      body: "Body.",
+    });
+
+    const imported = skill.toRulesyncSkill().getFrontmatter();
+    expect(imported.grokcli).toEqual({ paths: ["src/api/**"] });
+    expect(imported.paths).toBeUndefined();
+  });
+});
+
+describe("GrokcliSkill optional frontmatter fields", () => {
+  // The optional fields Grok's skill parser reads besides the invocation flags.
+  // https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-pager/docs/user-guide/08-skills.md
+  const grokcliSection = {
+    "when-to-use": "When the user asks to deploy",
+    "allowed-tools": ["Bash", "Read"],
+    "argument-hint": "[environment]",
+    model: "grok-code-fast-1",
+    effort: "high",
+    license: "Apache-2.0",
+    compatibility: "Requires git",
+    metadata: { author: "example-org", "short-description": "Deploy" },
+  };
+
+  it("emits the grokcli section's fields verbatim", () => {
+    const frontmatter = buildGrokcliSkill({ grokcli: grokcliSection }).getFrontmatter();
+
+    expect(frontmatter).toEqual({ name: "sample", description: "Sample", ...grokcliSection });
+  });
+
+  it("keeps the when_to_use spelling and unknown keys as authored", () => {
+    const frontmatter = buildGrokcliSkill({
+      grokcli: { when_to_use: "When deploying", origin: "example" },
+    }).getFrontmatter();
+
+    expect(frontmatter.when_to_use).toBe("When deploying");
+    expect(frontmatter["when-to-use"]).toBeUndefined();
+    expect(frontmatter.origin).toBe("example");
+  });
+
+  it("falls back to the root packaging fields and lets the section override them", () => {
+    const frontmatter = buildGrokcliSkill({
+      license: "MIT",
+      compatibility: "Requires jq",
+      metadata: { author: "root" },
+      grokcli: { metadata: { author: "grok" } },
+    }).getFrontmatter();
+
+    expect(frontmatter.license).toBe("MIT");
+    expect(frontmatter.compatibility).toBe("Requires jq");
+    expect(frontmatter.metadata).toEqual({ author: "grok" });
+  });
+
+  it("does not read the fields from another tool's section", () => {
+    const frontmatter = buildGrokcliSkill({
+      claudecode: { model: "opus", "allowed-tools": ["Bash"], when_to_use: "Never" },
+    }).getFrontmatter();
+
+    expect(frontmatter).toEqual({ name: "sample", description: "Sample" });
+  });
+
+  it("reads every field back into the grokcli section on import", () => {
+    const skill = new GrokcliSkill({
+      dirName: "sample",
+      frontmatter: {
+        name: "sample",
+        description: "Sample",
+        ...grokcliSection,
+        when_to_use: "Alias",
+        origin: "example",
+      },
+      body: "Body.",
+    });
+
+    const imported = skill.toRulesyncSkill().getFrontmatter();
+    expect(imported.grokcli).toEqual({
+      ...grokcliSection,
+      when_to_use: "Alias",
+      origin: "example",
+    });
+    expect(imported.license).toBeUndefined();
+    expect(imported.metadata).toBeUndefined();
+  });
+
+  it("round-trips the fields through import and generate", () => {
+    const skill = new GrokcliSkill({
+      dirName: "sample",
+      frontmatter: { name: "sample", description: "Sample", ...grokcliSection },
+      body: "Body.",
+    });
+
+    const regenerated = GrokcliSkill.fromRulesyncSkill({
+      rulesyncSkill: skill.toRulesyncSkill(),
+    }).getFrontmatter();
+    expect(regenerated).toEqual({ name: "sample", description: "Sample", ...grokcliSection });
+  });
+});

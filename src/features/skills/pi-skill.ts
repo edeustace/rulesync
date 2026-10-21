@@ -3,12 +3,17 @@ import { join } from "node:path";
 import { z } from "zod/mini";
 
 import { SKILL_FILE_NAME } from "../../constants/general.js";
-import { PI_AGENT_SKILLS_DIR_PATH, PI_SKILLS_DIR_PATH } from "../../constants/pi-paths.js";
+import { PI_LAYOUT, type PiLayout } from "../../constants/pi-paths.js";
 import { RULESYNC_SKILLS_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
 import { ValidationResult } from "../../types/ai-dir.js";
 import { formatError } from "../../utils/error.js";
 import { RulesyncSkill, RulesyncSkillFrontmatterInput, SkillFile } from "./rulesync-skill.js";
-import { resolveDisableModelInvocation } from "./skills-utils.js";
+import {
+  resolveCompatibility,
+  resolveDisableModelInvocation,
+  resolveLicense,
+  resolveMetadata,
+} from "./skills-utils.js";
 import {
   ToolSkill,
   ToolSkillForDeletionParams,
@@ -59,6 +64,9 @@ export type PiSkillParams = {
  * - Global scope: `~/.pi/agent/skills/<name>/SKILL.md`
  */
 export class PiSkill extends ToolSkill {
+  /** Directory layout; Pi forks (oh-my-pi) override it. */
+  protected static readonly layout: PiLayout = PI_LAYOUT;
+
   constructor({
     outputRoot = process.cwd(),
     relativeDirPath,
@@ -69,7 +77,9 @@ export class PiSkill extends ToolSkill {
     validate = true,
     global = false,
   }: PiSkillParams) {
-    const resolvedDirPath = relativeDirPath ?? PiSkill.getSettablePaths({ global }).relativeDirPath;
+    const resolvedDirPath =
+      relativeDirPath ??
+      (new.target as typeof PiSkill).getSettablePaths({ global }).relativeDirPath;
 
     super({
       outputRoot,
@@ -93,13 +103,8 @@ export class PiSkill extends ToolSkill {
   }
 
   static getSettablePaths({ global }: { global?: boolean } = {}): ToolSkillSettablePaths {
-    if (global) {
-      return {
-        relativeDirPath: PI_AGENT_SKILLS_DIR_PATH,
-      };
-    }
     return {
-      relativeDirPath: PI_SKILLS_DIR_PATH,
+      relativeDirPath: join(global ? this.layout.globalDir : this.layout.dir, "skills"),
     };
   }
 
@@ -159,7 +164,9 @@ export class PiSkill extends ToolSkill {
       name: frontmatter.name,
       description: frontmatter.description,
       targets: ["*"],
-      ...(Object.keys(piBlock).length > 0 && { pi: piBlock }),
+      ...(Object.keys(piBlock).length > 0 && {
+        [(this.constructor as typeof PiSkill).layout.toolTarget]: piBlock,
+      }),
     };
 
     return new RulesyncSkill({
@@ -180,9 +187,9 @@ export class PiSkill extends ToolSkill {
     validate = true,
     global = false,
   }: ToolSkillFromRulesyncSkillParams): PiSkill {
-    const settablePaths = PiSkill.getSettablePaths({ global });
+    const settablePaths = this.getSettablePaths({ global });
     const rulesyncFrontmatter = rulesyncSkill.getFrontmatter();
-    const piSection = rulesyncFrontmatter.pi;
+    const piSection = rulesyncFrontmatter[this.layout.toolTarget];
     const resolvedDisableModelInvocation = resolveDisableModelInvocation({
       rootFrontmatter: rulesyncFrontmatter,
       section: piSection,
@@ -193,21 +200,33 @@ export class PiSkill extends ToolSkill {
     // emitted as a YAML sequence. Mirrors `DeepagentsSkill`.
     const { "allowed-tools": allowedTools, ...piSectionRest } = piSection ?? {};
     const allowedToolsString = Array.isArray(allowedTools) ? allowedTools.join(" ") : allowedTools;
+    // The Agent Skills standard fields fall back to the root-level rulesync
+    // value when the `pi` section omits them.
+    const license = resolveLicense({ rootFrontmatter: rulesyncFrontmatter, section: piSection });
+    const compatibility = resolveCompatibility({
+      rootFrontmatter: rulesyncFrontmatter,
+      section: piSection,
+    });
+    const metadata = resolveMetadata({ rootFrontmatter: rulesyncFrontmatter, section: piSection });
 
     const piFrontmatter: PiSkillFrontmatter = {
       name: rulesyncFrontmatter.name,
       description: rulesyncFrontmatter.description,
       ...(allowedToolsString && { "allowed-tools": allowedToolsString }),
       // Spread the section first to carry over any tool-specific keys, then
-      // re-apply the resolved `disable-model-invocation` so the root default is
-      // honored when the section omits the key.
+      // re-apply the resolved values so the root defaults are honored when the
+      // section omits a key. Every resolver already prefers a defined section
+      // value, so overriding the spread never discards one.
       ...piSectionRest,
+      ...(license !== undefined && { license }),
+      ...(compatibility !== undefined && { compatibility }),
+      ...(metadata !== undefined && { metadata }),
       ...(resolvedDisableModelInvocation !== undefined && {
         "disable-model-invocation": resolvedDisableModelInvocation,
       }),
     };
 
-    return new PiSkill({
+    return new this({
       outputRoot,
       relativeDirPath: settablePaths.relativeDirPath,
       dirName: rulesyncSkill.getDirName(),
@@ -221,13 +240,13 @@ export class PiSkill extends ToolSkill {
 
   static isTargetedByRulesyncSkill(rulesyncSkill: RulesyncSkill): boolean {
     const targets = rulesyncSkill.getFrontmatter().targets;
-    return targets.includes("*") || targets.includes("pi");
+    return targets.includes("*") || targets.includes(this.layout.toolTarget);
   }
 
   static async fromDir(params: ToolSkillFromDirParams): Promise<PiSkill> {
     const loaded = await this.loadSkillDirContent({
       ...params,
-      getSettablePaths: PiSkill.getSettablePaths,
+      getSettablePaths: (options) => this.getSettablePaths(options),
     });
 
     const result = PiSkillFrontmatterSchema.safeParse(loaded.frontmatter);
@@ -238,7 +257,7 @@ export class PiSkill extends ToolSkill {
       );
     }
 
-    return new PiSkill({
+    return new this({
       outputRoot: loaded.outputRoot,
       relativeDirPath: loaded.relativeDirPath,
       dirName: loaded.dirName,
@@ -256,8 +275,8 @@ export class PiSkill extends ToolSkill {
     dirName,
     global = false,
   }: ToolSkillForDeletionParams): PiSkill {
-    const settablePaths = PiSkill.getSettablePaths({ global });
-    return new PiSkill({
+    const settablePaths = this.getSettablePaths({ global });
+    return new this({
       outputRoot,
       relativeDirPath: relativeDirPath ?? settablePaths.relativeDirPath,
       dirName,

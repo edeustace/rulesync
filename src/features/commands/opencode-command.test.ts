@@ -7,7 +7,7 @@ import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
 import { stringifyFrontmatter } from "../../utils/frontmatter.js";
 import { OpenCodeCommand, OpenCodeCommandFrontmatterSchema } from "./opencode-command.js";
-import { RulesyncCommand } from "./rulesync-command.js";
+import { RulesyncCommand, type RulesyncCommandFrontmatter } from "./rulesync-command.js";
 
 describe("OpenCodeCommand", () => {
   let testDir: string;
@@ -63,6 +63,24 @@ describe("OpenCodeCommand", () => {
     });
   });
 
+  it("should type the variant field", () => {
+    expect(
+      OpenCodeCommandFrontmatterSchema.safeParse({ description: "Cmd", variant: "high" }).success,
+    ).toBe(true);
+    expect(
+      OpenCodeCommandFrontmatterSchema.safeParse({ description: "Cmd", variant: 1 }).success,
+    ).toBe(false);
+  });
+
+  it("should type the subagent field", () => {
+    expect(
+      OpenCodeCommandFrontmatterSchema.safeParse({ description: "Cmd", subagent: true }).success,
+    ).toBe(true);
+    expect(
+      OpenCodeCommandFrontmatterSchema.safeParse({ description: "Cmd", subagent: "yes" }).success,
+    ).toBe(false);
+  });
+
   describe("getSettablePaths", () => {
     it("should return project and global paths", () => {
       expect(OpenCodeCommand.getSettablePaths()).toEqual({
@@ -102,6 +120,27 @@ describe("OpenCodeCommand", () => {
       expect(command.getFrontmatter()).toEqual({ description: "Analyze coverage", subtask: true });
       expect(command.getRelativeDirPath()).toBe(join(".config", "opencode", "commands"));
     });
+
+    it("should fold the V2 subagent spelling into subtask, letting subagent win", () => {
+      const frontmatter: RulesyncCommandFrontmatter = {
+        targets: ["opencode"],
+        description: "Analyze coverage",
+        opencode: { subagent: false, subtask: true },
+      };
+      const rulesyncCommand = new RulesyncCommand({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_COMMANDS_RELATIVE_DIR_PATH,
+        relativeFilePath: "custom.md",
+        frontmatter,
+        body: "Analyze coverage details",
+        fileContent: stringifyFrontmatter("Analyze coverage details", frontmatter),
+      });
+
+      const command = OpenCodeCommand.fromRulesyncCommand({ outputRoot: testDir, rulesyncCommand });
+
+      expect(command.getFrontmatter()).toEqual({ description: "Analyze coverage", subtask: false });
+      expect(command.getFileContent()).not.toContain("subagent");
+    });
   });
 
   describe("toRulesyncCommand", () => {
@@ -123,6 +162,26 @@ describe("OpenCodeCommand", () => {
         opencode: { agent: "plan" },
       });
       expect(rulesyncCommand.getRelativeDirPath()).toBe(RULESYNC_COMMANDS_RELATIVE_DIR_PATH);
+    });
+
+    it("should import the V2 subagent spelling as subtask", async () => {
+      const commandDir = join(testDir, ".opencode", "commands");
+      await ensureDir(commandDir);
+      await writeFileContent(
+        join(commandDir, "review.md"),
+        `---\ndescription: Review\nsubagent: true\n---\nReview the diff`,
+      );
+
+      const command = await OpenCodeCommand.fromFile({
+        outputRoot: testDir,
+        relativeFilePath: "review.md",
+      });
+
+      expect(command.toRulesyncCommand().getFrontmatter()).toEqual({
+        targets: ["*"],
+        description: "Review",
+        opencode: { subtask: true },
+      });
     });
   });
 
@@ -150,6 +209,34 @@ describe("OpenCodeCommand", () => {
   });
 
   describe("loadAdditionalImportFiles", () => {
+    it("merges inline commands from .opencode/opencode.json(c) over the root config", async () => {
+      await writeFileContent(
+        join(testDir, "opencode.json"),
+        JSON.stringify({ command: { test: { template: "Root", description: "Run tests" } } }),
+      );
+      await writeFileContent(
+        join(testDir, ".opencode", "opencode.json"),
+        JSON.stringify({ command: { test: { template: "Dot" } } }),
+      );
+      await writeFileContent(
+        join(testDir, ".opencode", "opencode.jsonc"),
+        JSON.stringify({ commands: { review: { template: "Review", model: "a/b#high" } } }),
+      );
+
+      const commands = await OpenCodeCommand.loadAdditionalImportFiles({ outputRoot: testDir });
+
+      expect(
+        commands.map((command) => [
+          command.getRelativeFilePath(),
+          command.getBody(),
+          command.getFrontmatter(),
+        ]),
+      ).toEqual([
+        ["test.md", "Dot", { description: "Run tests" }],
+        ["review.md", "Review", { model: "a/b", variant: "high" }],
+      ]);
+    });
+
     it("imports inline commands from opencode.json", async () => {
       await writeFileContent(
         join(testDir, "opencode.json"),
@@ -179,6 +266,56 @@ describe("OpenCodeCommand", () => {
         model: "anthropic/claude-3-5-sonnet-20241022",
         subtask: true,
       });
+    });
+
+    it("reads an inline V2 subagent as subtask, taking precedence over subtask", async () => {
+      await writeFileContent(
+        join(testDir, "opencode.json"),
+        JSON.stringify({
+          command: { review: { template: "Review", subagent: true, subtask: false } },
+        }),
+      );
+
+      const commands = await OpenCodeCommand.loadAdditionalImportFiles({ outputRoot: testDir });
+
+      expect(commands.map((command) => command.getFrontmatter())).toEqual([{ subtask: true }]);
+    });
+
+    it("imports the variant of an inline command", async () => {
+      await writeFileContent(
+        join(testDir, "opencode.json"),
+        JSON.stringify({ command: { deep: { template: "Think", variant: "high" } } }),
+      );
+
+      const commands = await OpenCodeCommand.loadAdditionalImportFiles({ outputRoot: testDir });
+
+      expect(commands.map((command) => command.getFrontmatter())).toEqual([{ variant: "high" }]);
+    });
+
+    it("imports V2 commands entries, keeping the V1 command on a name clash", async () => {
+      await writeFileContent(
+        join(testDir, "opencode.json"),
+        JSON.stringify({
+          command: { ship: { template: "V1 ship" } },
+          commands: {
+            ship: { template: "V2 ship" },
+            review: { template: "Review", model: "openai/gpt-5#high", subagent: true },
+          },
+        }),
+      );
+
+      const commands = await OpenCodeCommand.loadAdditionalImportFiles({ outputRoot: testDir });
+
+      expect(
+        commands.map((command) => [
+          command.getRelativeFilePath(),
+          command.getBody(),
+          command.getFrontmatter(),
+        ]),
+      ).toEqual([
+        ["ship.md", "V1 ship", {}],
+        ["review.md", "Review", { model: "openai/gpt-5", variant: "high", subtask: true }],
+      ]);
     });
 
     it("prefers opencode.jsonc over opencode.json", async () => {

@@ -274,12 +274,14 @@ describe("HermesagentHooks", () => {
       expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("failClosed"));
     });
 
-    it("does not warn about the events VALID_HOOKS gained in v0.20.1/v0.20.2 (issue #2414)", async () => {
+    it("does not warn about the events VALID_HOOKS gained in v0.20.1 through v0.21.6 (issue #2414)", async () => {
       const warnSpy = vi.spyOn(logger, "warn").mockClear();
-      // The names `VALID_HOOKS` grew by between v2026.8.3 (23) and v2026.8.16
-      // (37), minus `transform_api_error_classification`, which shell hooks may
+      // The names `VALID_HOOKS` grew by between v2026.8.3 (23) and v0.21.6
+      // (44), minus `transform_api_error_classification`, which shell hooks may
       // not register for (covered by its own case below).
       const addedEvents = [
+        "agent_loop_stopped",
+        "on_room_member_activity",
         "pre_transcription",
         "on_stream_start",
         "on_stream_delta",
@@ -293,6 +295,11 @@ describe("HermesagentHooks", () => {
         "on_kanban_worker_stale_claim",
         "on_kanban_task_updated",
         "on_kanban_dispatch_tick",
+        "pre_auxiliary_call",
+        "post_auxiliary_call",
+        "post_gateway_admission",
+        "on_human_input_request",
+        "on_human_input_resolved",
       ];
       const rulesyncHooks = rulesyncHooksFrom({
         version: 1,
@@ -346,7 +353,7 @@ describe("HermesagentHooks", () => {
       await HermesagentHooks.fromRulesyncHooks({ outputRoot: ".", rulesyncHooks, logger });
 
       expect(warnSpy).toHaveBeenCalledWith(
-        expect.stringContaining('"on_future_event" is not documented by Hermes Agent v0.20.2'),
+        expect.stringContaining('"on_future_event" is not documented by Hermes Agent v0.21.6'),
       );
     });
 
@@ -597,6 +604,46 @@ hooks:
         pre_verify: [{ type: "command", command: "verify.sh" }],
         transform_tool_result: [{ type: "command", command: "redact.sh" }],
       });
+    });
+
+    it("imports the v0.21.5 auxiliary-call events under hermesagent override (#2414)", () => {
+      const hooks = new HermesagentHooks({
+        outputRoot: ".",
+        fileContent: `hooks:
+  pre_auxiliary_call:
+    - command: aux-pre.sh
+  post_auxiliary_call:
+    - command: aux-post.sh
+`,
+      });
+
+      const json = hooks.toRulesyncHooks().getJson();
+      expect(json.hooks).toEqual({});
+      expect(json.hermesagent?.hooks).toEqual({
+        pre_auxiliary_call: [{ type: "command", command: "aux-pre.sh" }],
+        post_auxiliary_call: [{ type: "command", command: "aux-post.sh" }],
+      });
+    });
+
+    it("carries an event named toString through as a plain string key (#2757)", () => {
+      // `toString` is not a prototype-pollution key, so it reaches the event
+      // name lookup; the lookup must not resolve Object.prototype.toString.
+      const hooks = new HermesagentHooks({
+        outputRoot: ".",
+        fileContent: `hooks:
+  pre_tool_call:
+    - command: guard.sh
+  toString:
+    - command: crafted.sh
+`,
+      });
+
+      const json = hooks.toRulesyncHooks().getJson();
+      expect(json.hooks.preToolUse).toEqual([{ type: "command", command: "guard.sh" }]);
+      expect(Object.keys(json.hooks)).toEqual(["preToolUse"]);
+      const overrideHooks = json.hermesagent?.hooks ?? {};
+      expect(Object.keys(overrideHooks)).toEqual(["toString"]);
+      expect(overrideHooks["toString"]).toEqual([{ type: "command", command: "crafted.sh" }]);
     });
 
     it("imports both fail_closed spellings back into canonical failClosed (#2414)", () => {

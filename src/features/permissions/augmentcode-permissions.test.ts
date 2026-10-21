@@ -8,6 +8,7 @@ import {
 } from "../../constants/rulesync-paths.js";
 import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
+import { parseAugmentcodeSettingsDocument } from "../../utils/augmentcode-settings.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
 import { ConsoleLogger } from "../../utils/logger.js";
 import { AugmentcodePermissions } from "./augmentcode-permissions.js";
@@ -68,6 +69,240 @@ describe("AugmentcodePermissions", () => {
 
     const view = entries.find((e: { toolName: string }) => e.toolName === "view");
     expect(view.permission.type).toBe("allow");
+  });
+
+  it("should apply all-tools restrictions to launch-process entries", async () => {
+    const rulesyncPermissions = new RulesyncPermissions({
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: {
+          "*": { "rm *": "deny" },
+          bash: { "rm *": "allow", "git *": "allow" },
+        },
+      }),
+    });
+
+    const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    const entries = JSON.parse(instance.getFileContent()).toolPermissions as Array<{
+      toolName: string;
+      shellInputRegex?: string;
+      permission: { type: string };
+    }>;
+    const launchEntries = entries.filter((entry) => entry.toolName === "launch-process");
+
+    expect(launchEntries).toEqual([
+      {
+        toolName: "launch-process",
+        shellInputRegex: "^rm .*$",
+        permission: { type: "deny" },
+      },
+      {
+        toolName: "launch-process",
+        shellInputRegex: "^git .*$",
+        permission: { type: "allow" },
+      },
+    ]);
+    expect(entries).not.toContainEqual(expect.objectContaining({ toolName: "*" }));
+  });
+
+  it("should synthesize launch-process restrictions and remove legacy wildcard entries", async () => {
+    const settingsDir = join(testDir, ".augment");
+    await ensureDir(settingsDir);
+    await writeFileContent(
+      join(settingsDir, "settings.json"),
+      JSON.stringify({
+        toolPermissions: [{ toolName: "*", permission: { type: "deny" } }],
+      }),
+    );
+
+    const rulesyncPermissions = new RulesyncPermissions({
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: {
+          "*": { "rm *": "deny", "git push *": "ask", "git status": "allow" },
+        },
+      }),
+    });
+
+    const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    const entries = JSON.parse(instance.getFileContent()).toolPermissions;
+    expect(entries).toEqual([
+      {
+        toolName: "launch-process",
+        shellInputRegex: "^rm .*$",
+        permission: { type: "deny" },
+      },
+      {
+        toolName: "launch-process",
+        shellInputRegex: "^git push .*$",
+        permission: { type: "ask-user" },
+      },
+      // Every other managed tool has no rules of its own, so the all-tools `deny` (from `rm *`)
+      // still fails closed onto them even though AugmentCode has no per-input matcher for them.
+      { toolName: "view", permission: { type: "deny" } },
+      { toolName: "str-replace-editor", permission: { type: "deny" } },
+      { toolName: "save-file", permission: { type: "deny" } },
+      { toolName: "web-fetch", permission: { type: "deny" } },
+      { toolName: "web-search", permission: { type: "deny" } },
+    ]);
+  });
+
+  it("should fail-closed onto every managed tool when the all-tools category is deny-only, and honor an explicit category's own rules instead", async () => {
+    const logger = createMockLogger();
+    const rulesyncPermissions = new RulesyncPermissions({
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: {
+          "*": { "*": "deny" },
+          read: { "*": "allow" },
+        },
+      }),
+    });
+
+    const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+      logger,
+    });
+
+    const entries = JSON.parse(instance.getFileContent()).toolPermissions as Array<{
+      toolName: string;
+      permission: { type: string };
+    }>;
+    // `read` stated its own rules, so the all-tools deny does not override it.
+    expect(entries).toContainEqual({ toolName: "view", permission: { type: "allow" } });
+    // Every other managed tool has no rules of its own, so it fails closed to the all-tools deny.
+    for (const toolName of [
+      "launch-process",
+      "str-replace-editor",
+      "save-file",
+      "web-fetch",
+      "web-search",
+    ]) {
+      expect(entries).toContainEqual({ toolName, permission: { type: "deny" } });
+    }
+    expect(entries).not.toContainEqual(expect.objectContaining({ toolName: "*" }));
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("the all-tools '*' category cannot be emitted"),
+    );
+  });
+
+  it("should fail-closed to 'ask-user' (not deny) when the all-tools category only asks", async () => {
+    const rulesyncPermissions = new RulesyncPermissions({
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: {
+          "*": { "*": "ask" },
+        },
+      }),
+    });
+
+    const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    const entries = JSON.parse(instance.getFileContent()).toolPermissions as Array<{
+      toolName: string;
+      permission: { type: string };
+    }>;
+    for (const toolName of ["view", "str-replace-editor", "save-file", "web-fetch", "web-search"]) {
+      expect(entries).toContainEqual({ toolName, permission: { type: "ask-user" } });
+    }
+  });
+
+  it("should not synthesize entries for other managed tools when the all-tools category is allow-only", async () => {
+    const rulesyncPermissions = new RulesyncPermissions({
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: {
+          "*": { "*": "allow" },
+        },
+      }),
+    });
+
+    const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    const entries = JSON.parse(instance.getFileContent()).toolPermissions as Array<{
+      toolName: string;
+    }>;
+    for (const toolName of [
+      "launch-process",
+      "view",
+      "str-replace-editor",
+      "save-file",
+      "web-fetch",
+      "web-search",
+    ]) {
+      expect(entries).not.toContainEqual(expect.objectContaining({ toolName }));
+    }
+  });
+
+  it("should fail-closed onto a managed tool whose own rules are all non-wildcard and get dropped, not just when the category is absent", async () => {
+    const rulesyncPermissions = new RulesyncPermissions({
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: {
+          "*": { "*": "deny" },
+          write: { "important-file.txt": "ask" },
+        },
+      }),
+    });
+
+    const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    const entries = JSON.parse(instance.getFileContent()).toolPermissions as Array<{
+      toolName: string;
+      permission: { type: string };
+    }>;
+    // `write` stated a rule, but it is a non-wildcard pattern that produces no entry of its own
+    // (AugmentCode has no per-input matcher for save-file), so it must still fail closed to the
+    // all-tools deny rather than silently falling back to AugmentCode's permissive default.
+    expect(entries).toContainEqual({ toolName: "save-file", permission: { type: "deny" } });
+  });
+
+  it("should fail-closed onto a managed tool whose own category is an empty rules object", async () => {
+    const rulesyncPermissions = new RulesyncPermissions({
+      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+      fileContent: JSON.stringify({
+        permission: {
+          "*": { "*": "deny" },
+          read: {},
+        },
+      }),
+    });
+
+    const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions,
+    });
+
+    const entries = JSON.parse(instance.getFileContent()).toolPermissions as Array<{
+      toolName: string;
+      permission: { type: string };
+    }>;
+    expect(entries).toContainEqual({ toolName: "view", permission: { type: "deny" } });
   });
 
   it("should preserve unrelated toolPermissions entries, top-level keys, and existing launch-process deny entries (fail-closed)", async () => {
@@ -1053,6 +1288,70 @@ describe("AugmentcodePermissions", () => {
     });
   });
 
+  describe("JSON with Comments settings", () => {
+    // https://docs.augmentcode.com/cli/config: settings files support JSON
+    // with Comments (comments and trailing commas).
+    it("should import toolPermissions from a JSONC settings.json", async () => {
+      const settingsDir = join(testDir, ".augment");
+      await ensureDir(settingsDir);
+      await writeFileContent(
+        join(settingsDir, "settings.json"),
+        `{
+  // shell rules
+  "toolPermissions": [
+    { "toolName": "launch-process", "shellInputRegex": "^git .*$", "permission": { "type": "allow" }, },
+  ],
+}`,
+      );
+
+      const instance = await AugmentcodePermissions.fromFile({
+        outputRoot: testDir,
+        validate: true,
+      });
+      const config = instance.toRulesyncPermissions().getJson();
+      expect(config.permission.bash).toEqual({ "git *": "allow" });
+    });
+
+    it("should regenerate into a JSONC settings.json while preserving comments and other keys", async () => {
+      const settingsDir = join(testDir, ".augment");
+      await ensureDir(settingsDir);
+      await writeFileContent(
+        join(settingsDir, "settings.json"),
+        `{
+  // MCP servers are owned by the mcp feature.
+  "mcpServers": { "fs": { "command": "fs", }, },
+  "toolPermissions": [],
+}
+`,
+      );
+
+      const rulesyncPermissions = new RulesyncPermissions({
+        outputRoot: testDir,
+        relativeDirPath: ".rulesync",
+        relativeFilePath: "permissions.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          permission: { bash: { "git *": "allow" } },
+        }),
+        validate: true,
+      });
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        validate: true,
+      });
+
+      const content = instance.getFileContent();
+      expect(content).toContain("// MCP servers are owned by the mcp feature.");
+      const parsed = parseAugmentcodeSettingsDocument({ fileContent: content, configPath: "x" });
+      expect(parsed.mcpServers).toEqual({ fs: { command: "fs" } });
+      expect(parsed.toolPermissions).toEqual([
+        { toolName: "launch-process", shellInputRegex: "^git .*$", permission: { type: "allow" } },
+      ]);
+    });
+  });
+
   describe("recommendedMarketplaces preservation guard", () => {
     it("should preserve an existing recommendedMarketplaces key verbatim on regenerate", async () => {
       // Auggie CLI 0.20.0 added a `recommendedMarketplaces` key in
@@ -1083,6 +1382,459 @@ describe("AugmentcodePermissions", () => {
 
       const content = JSON.parse(instance.getFileContent());
       expect(content.recommendedMarketplaces).toEqual(recommendedMarketplaces);
+    });
+  });
+
+  describe("plugin-consumption keys (recommendedMarketplaces / enabledPlugins)", () => {
+    const writeSettings = async (settings: Record<string, unknown>) => {
+      const settingsDir = join(testDir, ".augment");
+      await ensureDir(settingsDir);
+      await writeFileContent(join(settingsDir, "settings.json"), JSON.stringify(settings));
+    };
+
+    const permissionsWithOverride = (augmentcode: Record<string, unknown>) =>
+      new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({ permission: { bash: { "git *": "allow" } }, augmentcode }),
+      });
+
+    it("should write recommendedMarketplaces from the override in project mode, replacing the list", async () => {
+      await writeSettings({ recommendedMarketplaces: ["old/market"], theme: "dark" });
+      const logger = createMockLogger();
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: permissionsWithOverride({
+          recommendedMarketplaces: ["acme/team-plugins", "acme/security-tools"],
+        }),
+        logger,
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      expect(content.recommendedMarketplaces).toEqual(["acme/team-plugins", "acme/security-tools"]);
+      expect(content.theme).toBe("dark");
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('("acme/team-plugins", "acme/security-tools")'),
+      );
+    });
+
+    it("should skip recommendedMarketplaces with a warning in global mode", async () => {
+      await writeSettings({ toolPermissions: [] });
+      const logger = createMockLogger();
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: permissionsWithOverride({
+          recommendedMarketplaces: ["acme/team-plugins"],
+        }),
+        global: true,
+        logger,
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      expect(content).not.toHaveProperty("recommendedMarketplaces");
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("only in a project's `.augment/settings.json`"),
+      );
+    });
+
+    it("should replace enabledPlugins with the authored map in project mode", async () => {
+      await writeSettings({
+        enabledPlugins: { "dropped@acme": true, "flipped@acme": true },
+      });
+      const logger = createMockLogger();
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: permissionsWithOverride({
+          enabledPlugins: { "flipped@acme": false, "added@acme": true },
+        }),
+        logger,
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      expect(content.enabledPlugins).toEqual({ "flipped@acme": false, "added@acme": true });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('("added@acme")'));
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /Removing AugmentCode `enabledPlugins` entries \("dropped@acme"\).*rulesync import/,
+        ),
+      );
+    });
+
+    it("should warn about recommendedMarketplaces entries the override would remove", async () => {
+      await writeSettings({ recommendedMarketplaces: ["acme/team-plugins", "acme/installed"] });
+      const logger = createMockLogger();
+
+      await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: permissionsWithOverride({
+          recommendedMarketplaces: ["acme/team-plugins"],
+        }),
+        logger,
+      });
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining(
+          'Removing AugmentCode `recommendedMarketplaces` entries ("acme/installed")',
+        ),
+      );
+    });
+
+    it("should not repeat the trust warnings when the file already holds the stated values", async () => {
+      await writeSettings({
+        recommendedMarketplaces: ["acme/team-plugins"],
+        enabledPlugins: { "tool@acme": true },
+      });
+      const logger = createMockLogger();
+
+      await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: permissionsWithOverride({
+          recommendedMarketplaces: ["acme/team-plugins"],
+          enabledPlugins: { "tool@acme": true },
+        }),
+        logger,
+      });
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("recommendedMarketplaces"),
+      );
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("enabledPlugins"));
+    });
+
+    it("should write enabledPlugins in global mode", async () => {
+      await writeSettings({ toolPermissions: [] });
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: permissionsWithOverride({ enabledPlugins: { "tool@acme": true } }),
+        global: true,
+      });
+
+      expect(JSON.parse(instance.getFileContent()).enabledPlugins).toEqual({ "tool@acme": true });
+    });
+
+    it("should not warn when enabledPlugins only disables plugins", async () => {
+      await writeSettings({ toolPermissions: [] });
+      const logger = createMockLogger();
+
+      await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: permissionsWithOverride({ enabledPlugins: { "tool@acme": false } }),
+        logger,
+      });
+
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("enabledPlugins"));
+    });
+
+    it("should leave both keys untouched when the override does not state them", async () => {
+      await writeSettings({
+        recommendedMarketplaces: ["acme/team-plugins"],
+        enabledPlugins: { "tool@acme": true },
+      });
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: permissionsWithOverride({}),
+      });
+
+      const content = JSON.parse(instance.getFileContent());
+      expect(content.recommendedMarketplaces).toEqual(["acme/team-plugins"]);
+      expect(content.enabledPlugins).toEqual({ "tool@acme": true });
+    });
+
+    it("should lift both keys into the augmentcode override on import", () => {
+      const instance = new AugmentcodePermissions({
+        relativeDirPath: ".augment",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          toolPermissions: [],
+          recommendedMarketplaces: ["acme/team-plugins"],
+          enabledPlugins: { "tool@acme": true, "other@acme": false },
+          dismissedMarketplaces: ["acme/skipped"],
+        }),
+      });
+
+      const json = instance.toRulesyncPermissions().getJson();
+      expect(json.augmentcode).toEqual({
+        recommendedMarketplaces: ["acme/team-plugins"],
+        enabledPlugins: { "tool@acme": true, "other@acme": false },
+      });
+    });
+
+    it("should not lift recommendedMarketplaces on a global import, where Auggie ignores it", async () => {
+      await writeSettings({
+        toolPermissions: [],
+        recommendedMarketplaces: ["acme/team-plugins"],
+        enabledPlugins: { "tool@acme": true },
+      });
+
+      const instance = await AugmentcodePermissions.fromFile({ outputRoot: testDir, global: true });
+
+      expect(instance.toRulesyncPermissions().getJson().augmentcode).toEqual({
+        enabledPlugins: { "tool@acme": true },
+      });
+    });
+
+    it("should import only the base file's plugin keys, ignoring the local file's", async () => {
+      await writeSettings({
+        toolPermissions: [],
+        recommendedMarketplaces: ["acme/team-plugins"],
+        enabledPlugins: { "shared@acme": true },
+      });
+      await writeFileContent(
+        join(testDir, ".augment", "settings.local.json"),
+        JSON.stringify({
+          recommendedMarketplaces: ["me/personal"],
+          enabledPlugins: { "mine@me": true },
+        }),
+      );
+
+      const instance = await AugmentcodePermissions.fromFile({
+        outputRoot: testDir,
+        logger: createMockLogger(),
+      });
+
+      expect(instance.toRulesyncPermissions().getJson().augmentcode).toEqual({
+        recommendedMarketplaces: ["acme/team-plugins"],
+        enabledPlugins: { "shared@acme": true },
+      });
+    });
+
+    it("should not import an enabledPlugins that only the local file states", async () => {
+      await writeSettings({ toolPermissions: [] });
+      await writeFileContent(
+        join(testDir, ".augment", "settings.local.json"),
+        JSON.stringify({ enabledPlugins: { "mine@me": true } }),
+      );
+
+      const instance = await AugmentcodePermissions.fromFile({
+        outputRoot: testDir,
+        logger: createMockLogger(),
+      });
+
+      expect(instance.toRulesyncPermissions().getJson()).not.toHaveProperty("augmentcode");
+    });
+
+    it("should not lift values whose shape Auggie does not document", () => {
+      const instance = new AugmentcodePermissions({
+        relativeDirPath: ".augment",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          toolPermissions: [],
+          recommendedMarketplaces: [{ name: "official" }],
+          enabledPlugins: { "tool@acme": "yes" },
+        }),
+      });
+
+      expect(instance.toRulesyncPermissions().getJson()).not.toHaveProperty("augmentcode");
+    });
+  });
+
+  describe("current AugmentCode tool-name aliases (terminal / read / edit / write)", () => {
+    // Auggie's docs renamed `launch-process` / `view` / `str-replace-editor` / `save-file` to
+    // `terminal` / `read` / `edit` / `write` and alias the legacy names to them. Rulesync keeps
+    // emitting the legacy names (the shipped CLI matches exact names), but an existing file
+    // authored with the current names must be read as the same managed tools.
+
+    it("should import current tool names, recovering shellInputRegex on terminal", () => {
+      const instance = new AugmentcodePermissions({
+        relativeDirPath: ".augment",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          toolPermissions: [
+            {
+              toolName: "terminal",
+              shellInputRegex: "^git merge .*$",
+              permission: { type: "deny" },
+            },
+            { toolName: "terminal", permission: { type: "ask-user" } },
+            { toolName: "read", permission: { type: "allow" } },
+            { toolName: "edit", permission: { type: "ask-user" } },
+            { toolName: "write", permission: { type: "deny" } },
+          ],
+        }),
+      });
+
+      const config = instance.toRulesyncPermissions().getJson();
+      expect(config.permission).toEqual({
+        bash: { "git merge *": "deny", "*": "ask" },
+        read: { "*": "allow" },
+        edit: { "*": "ask" },
+        write: { "*": "deny" },
+      });
+    });
+
+    it("should not resolve inherited property names through the alias tables", () => {
+      const instance = new AugmentcodePermissions({
+        relativeDirPath: ".augment",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          toolPermissions: [
+            // Bracket reads on the alias maps must not yield Object.prototype members: the
+            // reserved names stay strings so the `forbiddenMapKeys` guard below still fires,
+            // and an inherited-but-harmless name passes through verbatim.
+            { toolName: "constructor", permission: { type: "allow" } },
+            { toolName: "__proto__", permission: { type: "allow" } },
+            { toolName: "toString", permission: { type: "allow" } },
+          ],
+        }),
+      });
+
+      const config = instance.toRulesyncPermissions().getJson();
+      expect(config.permission).toEqual({ toString: { "*": "allow" } });
+      expect(Object.hasOwn(Object.prototype.toString, "*")).toBe(false);
+    });
+
+    it("should broaden a non-roundtrippable terminal deny regex to the catch-all pattern", () => {
+      const warnSpy = vi.spyOn(ConsoleLogger.prototype, "warn").mockImplementation(() => {});
+      const instance = new AugmentcodePermissions({
+        relativeDirPath: ".augment",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          toolPermissions: [
+            { toolName: "terminal", shellInputRegex: "rm|del", permission: { type: "deny" } },
+          ],
+        }),
+      });
+
+      const config = instance.toRulesyncPermissions().getJson();
+      expect(config.permission.bash).toEqual({ "*": "deny" });
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      warnSpy.mockRestore();
+    });
+
+    it("should not duplicate a passed-through current-name row across regenerates", async () => {
+      const settingsDir = join(testDir, ".augment");
+      await ensureDir(settingsDir);
+      await writeFileContent(
+        join(settingsDir, "settings.json"),
+        JSON.stringify({
+          toolPermissions: [{ toolName: "terminal", permission: { type: "deny" } }],
+        }),
+      );
+
+      // An unknown canonical category is passed through verbatim as the toolName, so the
+      // generated row carries the current spelling; it must still dedupe against the
+      // existing row instead of accumulating one copy per regenerate.
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({ permission: { terminal: { "*": "deny" } } }),
+      });
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+      });
+
+      expect(JSON.parse(instance.getFileContent()).toolPermissions).toEqual([
+        { toolName: "terminal", permission: { type: "deny" } },
+      ]);
+    });
+
+    it("should keep an existing legacy-named deny when the generated row uses a passed-through current name", async () => {
+      const settingsDir = join(testDir, ".augment");
+      await ensureDir(settingsDir);
+      await writeFileContent(
+        join(settingsDir, "settings.json"),
+        JSON.stringify({
+          toolPermissions: [
+            { toolName: "launch-process", permission: { type: "deny" } },
+            {
+              toolName: "launch-process",
+              shellInputRegex: "^rm .*$",
+              permission: { type: "deny" },
+            },
+          ],
+        }),
+      );
+
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({ permission: { terminal: { "*": "deny" } } }),
+      });
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+      });
+
+      // The generated `terminal` row is not the legacy spelling, so it must not retire the
+      // user's `launch-process` catch-all deny (fail-closed): both rows survive.
+      expect(JSON.parse(instance.getFileContent()).toolPermissions).toEqual([
+        { toolName: "launch-process", shellInputRegex: "^rm .*$", permission: { type: "deny" } },
+        { toolName: "terminal", permission: { type: "deny" } },
+        { toolName: "launch-process", permission: { type: "deny" } },
+      ]);
+    });
+
+    it("should fold a current alias and its legacy name into one category, most restrictive wins", () => {
+      const instance = new AugmentcodePermissions({
+        relativeDirPath: ".augment",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          toolPermissions: [
+            { toolName: "view", permission: { type: "allow" } },
+            { toolName: "read", permission: { type: "deny" } },
+          ],
+        }),
+      });
+
+      const config = instance.toRulesyncPermissions().getJson();
+      expect(config.permission).toEqual({ read: { "*": "deny" } });
+    });
+
+    it("should treat current-name rows as managed on regenerate: replace allows, keep denies, drop exact duplicates", async () => {
+      const settingsDir = join(testDir, ".augment");
+      await ensureDir(settingsDir);
+      await writeFileContent(
+        join(settingsDir, "settings.json"),
+        JSON.stringify({
+          toolPermissions: [
+            // Stale permissive rows under current names: rulesync owns this surface.
+            { toolName: "terminal", permission: { type: "allow" } },
+            { toolName: "read", permission: { type: "allow" } },
+            // A user-added deny under a current name survives (fail-closed) ...
+            { toolName: "write", permission: { type: "deny" } },
+            // ... unless it is re-emitted under the legacy name with the same shape.
+            { toolName: "terminal", shellInputRegex: "^rm .*$", permission: { type: "deny" } },
+            // Genuinely unmanaged tools are still kept verbatim.
+            { toolName: "github-api", permission: { type: "allow" } },
+          ],
+        }),
+      );
+
+      const rulesyncPermissions = new RulesyncPermissions({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
+        fileContent: JSON.stringify({
+          permission: { bash: { "*": "ask", "rm *": "deny" }, read: { "*": "allow" } },
+        }),
+      });
+
+      const instance = await AugmentcodePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+      });
+
+      const entries = JSON.parse(instance.getFileContent()).toolPermissions as Array<{
+        toolName: string;
+        shellInputRegex?: string;
+        permission: { type: string };
+      }>;
+      expect(entries).toEqual([
+        { toolName: "launch-process", shellInputRegex: "^rm .*$", permission: { type: "deny" } },
+        { toolName: "write", permission: { type: "deny" } },
+        { toolName: "launch-process", permission: { type: "ask-user" } },
+        { toolName: "view", permission: { type: "allow" } },
+        { toolName: "github-api", permission: { type: "allow" } },
+      ]);
+      // The current-name rows are gone: no stale `terminal` / `read` allow shadows the output.
+      expect(entries.some((e) => e.toolName === "terminal" || e.toolName === "read")).toBe(false);
     });
   });
 

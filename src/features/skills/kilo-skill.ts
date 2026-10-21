@@ -8,6 +8,7 @@ import { RULESYNC_SKILLS_RELATIVE_DIR_PATH } from "../../constants/rulesync-path
 import { ValidationResult } from "../../types/ai-dir.js";
 import { formatError } from "../../utils/error.js";
 import { RulesyncSkill, RulesyncSkillFrontmatterInput, SkillFile } from "./rulesync-skill.js";
+import { resolveCompatibility, resolveLicense, resolveMetadata } from "./skills-utils.js";
 import {
   ToolSkill,
   ToolSkillForDeletionParams,
@@ -19,11 +20,16 @@ import {
 export const KiloSkillFrontmatterSchema = z.looseObject({
   name: z.string(),
   description: z.string(),
-  // Kilo's official SKILL.md frontmatter: `name`, `description`, `license`,
-  // `compatibility`, and `metadata`. https://kilo.ai/docs/customize/skills
-  license: z.optional(z.string()),
-  compatibility: z.optional(z.looseObject({})),
-  metadata: z.optional(z.looseObject({})),
+  // Kilo Code documents `name`, `description`, `license`, `compatibility`,
+  // and `metadata` (https://kilo.ai/docs/customize/skills), but its SKILL.md
+  // parser is forked from OpenCode's engine, whose `Frontmatter` schema
+  // (`packages/core/src/skill.ts` in Kilo-Org/kilocode) does not model
+  // `license`, `compatibility`, or `metadata` at all, so it cannot reject any
+  // shape rulesync writes for them. Left untyped so rulesync never aborts on
+  // a value the underlying tool itself tolerates.
+  license: z.optional(z.unknown()),
+  compatibility: z.optional(z.unknown()),
+  metadata: z.optional(z.unknown()),
   // `allowed-tools` is NOT recognized by Kilo; it is retained for backward
   // compatibility with existing rulesync skill files.
   "allowed-tools": z.optional(z.array(z.string())),
@@ -151,17 +157,27 @@ export class KiloSkill extends ToolSkill {
     const rulesyncFrontmatter = rulesyncSkill.getFrontmatter();
     const kiloSection = rulesyncFrontmatter.kilo;
 
+    // The Agent Skills standard fields fall back to the root-level rulesync
+    // value when the `kilo` section omits them.
+    const license = resolveLicense({ rootFrontmatter: rulesyncFrontmatter, section: kiloSection });
+    const compatibility = resolveCompatibility({
+      rootFrontmatter: rulesyncFrontmatter,
+      section: kiloSection,
+    });
+    const metadata = resolveMetadata({
+      rootFrontmatter: rulesyncFrontmatter,
+      section: kiloSection,
+    });
+
     const kiloFrontmatter: KiloSkillFrontmatter = {
       name: rulesyncFrontmatter.name,
       description: rulesyncFrontmatter.description,
       ...(kiloSection?.["allowed-tools"] !== undefined && {
         "allowed-tools": kiloSection["allowed-tools"],
       }),
-      ...(kiloSection?.license !== undefined && { license: kiloSection.license }),
-      ...(kiloSection?.compatibility !== undefined && {
-        compatibility: kiloSection.compatibility,
-      }),
-      ...(kiloSection?.metadata !== undefined && { metadata: kiloSection.metadata }),
+      ...(license !== undefined && { license }),
+      ...(compatibility !== undefined && { compatibility }),
+      ...(metadata !== undefined && { metadata }),
     };
 
     const settablePaths = KiloSkill.getSettablePaths({ global });

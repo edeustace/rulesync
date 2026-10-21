@@ -90,6 +90,11 @@ describe("Config", () => {
       expect(targets).not.toContain("augmentcode-legacy");
       expect(targets).not.toContain("claudecode-plugin");
       expect(targets).not.toContain("antigravity-plugin");
+      expect(targets).not.toContain("augmentcode-plugin");
+      expect(targets).not.toContain("zcode-plugin");
+      expect(targets).not.toContain("vibe-plugin");
+      expect(targets).not.toContain("devin-plugin");
+      expect(targets).not.toContain("kimi-code-plugin");
       expect(targets).toContain("claudecode");
       expect(targets).toContain("augmentcode");
     });
@@ -103,7 +108,12 @@ describe("Config", () => {
           t !== "claudecode-legacy" &&
           t !== "augmentcode-legacy" &&
           t !== "claudecode-plugin" &&
-          t !== "antigravity-plugin",
+          t !== "antigravity-plugin" &&
+          t !== "augmentcode-plugin" &&
+          t !== "zcode-plugin" &&
+          t !== "vibe-plugin" &&
+          t !== "devin-plugin" &&
+          t !== "kimi-code-plugin",
       );
 
       expect(targets).toEqual(expectedTargets);
@@ -132,12 +142,26 @@ describe("Config", () => {
 
     it("should preserve packaging targets explicitly listed with wildcard", () => {
       const config = createConfig({
-        targets: ["*", "claudecode-plugin", "antigravity-plugin"],
+        targets: [
+          "*",
+          "claudecode-plugin",
+          "antigravity-plugin",
+          "augmentcode-plugin",
+          "zcode-plugin",
+          "vibe-plugin",
+          "devin-plugin",
+          "kimi-code-plugin",
+        ],
       });
       const targets = config.getTargets();
 
       expect(targets).toContain("claudecode-plugin");
       expect(targets).toContain("antigravity-plugin");
+      expect(targets).toContain("augmentcode-plugin");
+      expect(targets).toContain("zcode-plugin");
+      expect(targets).toContain("vibe-plugin");
+      expect(targets).toContain("devin-plugin");
+      expect(targets).toContain("kimi-code-plugin");
       expect(targets).not.toContain("*");
     });
   });
@@ -176,6 +200,29 @@ describe("Config", () => {
     });
   });
 
+  describe("deriveSubprojectPathFromGlobs", () => {
+    it("should default to false when not specified", () => {
+      const config = createConfig();
+      expect(config.getDeriveSubprojectPathFromGlobs()).toBe(false);
+    });
+
+    it("should respect an explicit true value", () => {
+      const config = createConfig({ deriveSubprojectPathFromGlobs: true });
+      expect(config.getDeriveSubprojectPathFromGlobs()).toBe(true);
+    });
+
+    it("should be accepted by the config file schema", () => {
+      expect(
+        ConfigFileSchema.safeParse({ targets: ["agentsmd"], deriveSubprojectPathFromGlobs: true })
+          .success,
+      ).toBe(true);
+      expect(
+        ConfigFileSchema.safeParse({ targets: ["agentsmd"], deriveSubprojectPathFromGlobs: "yes" })
+          .success,
+      ).toBe(false);
+    });
+  });
+
   describe("getGitignoreDestination", () => {
     it("defaults to gitignore", () => {
       const config = createConfig({
@@ -208,6 +255,37 @@ describe("Config", () => {
         },
       });
       expect(config.getGitignoreDestination("claudecode", "rules")).toBe("gitattributes");
+    });
+
+    it("supports the gitexclude destination at every level", () => {
+      expect(
+        createConfig({ gitignoreDestination: "gitexclude" }).getGitignoreDestination(
+          "claudecode",
+          "rules",
+        ),
+      ).toBe("gitexclude");
+      expect(
+        createConfig({
+          targets: { claudecode: { gitignoreDestination: "gitexclude", rules: true } },
+        }).getGitignoreDestination("claudecode", "rules"),
+      ).toBe("gitexclude");
+      expect(
+        createConfig({
+          targets: { claudecode: { rules: { gitignoreDestination: "gitexclude" } } },
+        }).getGitignoreDestination("claudecode", "rules"),
+      ).toBe("gitexclude");
+    });
+
+    it("exposes the root-level destination", () => {
+      expect(
+        createConfig({ gitignoreDestination: "gitexclude" }).getRootGitignoreDestination(),
+      ).toBe("gitexclude");
+      expect(createConfig({}).getRootGitignoreDestination()).toBe("gitignore");
+    });
+
+    it("accepts gitexclude in the config file schema and rejects unknown values", () => {
+      expect(ConfigFileSchema.safeParse({ gitignoreDestination: "gitexclude" }).success).toBe(true);
+      expect(ConfigFileSchema.safeParse({ gitignoreDestination: "exclude" }).success).toBe(false);
     });
 
     it("supports root-level destination", () => {
@@ -476,6 +554,48 @@ describe("Config", () => {
       const parent = resolve(originalCwd, "..");
       process.chdir(parent);
       expect([...config.getInputRoots()]).toEqual(snapshot);
+    });
+  });
+
+  describe("getConfigFileFeatures / getConfigFileFeatureOptions", () => {
+    it("falls back to the resolved features and options without a config file selection", () => {
+      const config = createConfig({
+        targets: { codexcli: { rules: { ruleDiscoveryMode: "none" } } },
+      });
+      expect(config.getConfigFileFeatures("codexcli")).toEqual(config.getFeatures("codexcli"));
+      expect(config.getConfigFileFeatureOptions("codexcli", "rules")).toEqual({
+        ruleDiscoveryMode: "none",
+      });
+    });
+
+    it("reads the config file selection instead of the CLI-overridden targets", () => {
+      const config = createConfig({
+        targets: ["codexcli"],
+        features: ["rules"],
+        configFileSelection: {
+          targets: {
+            codexcli: ["rules"],
+            agentsmd: { rules: { ruleDiscoveryMode: "none" } },
+            opencode: ["mcp"],
+          },
+        },
+      });
+      expect(config.getFeatureOptions("agentsmd", "rules")).toBeUndefined();
+      expect(config.getConfigFileFeatureOptions("agentsmd", "rules")).toEqual({
+        ruleDiscoveryMode: "none",
+      });
+      expect(config.getConfigFileFeatures("agentsmd")).toEqual(["rules"]);
+      expect(config.getConfigFileFeatures("opencode")).toEqual(["mcp"]);
+      expect(config.getConfigFileFeatures("claudecode")).toEqual([]);
+    });
+
+    it("expands array-form config file features for every listed target", () => {
+      const config = createConfig({
+        configFileSelection: { targets: ["codexcli", "opencode"], features: ["*"] },
+      });
+      expect(config.getConfigFileFeatures("opencode")).toContain("rules");
+      expect(config.getConfigFileFeatures("opencode")).toContain("mcp");
+      expect(config.getConfigFileFeatureOptions("opencode", "rules")).toBeUndefined();
     });
   });
 

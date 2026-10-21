@@ -265,6 +265,53 @@ describe("ZedPermissions", () => {
       expect(warn).toHaveBeenCalledWith(expect.stringContaining('pattern "src/**"'));
     });
 
+    it("should not auto-approve a bash allow that an all-tools deny covers", async () => {
+      const permissions = await ZedPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: createRulesyncPermissions({
+          "*": { "rm *": "deny" },
+          bash: { "rm *": "allow", "git *": "allow" },
+        }),
+      });
+
+      const tools = JSON.parse(permissions.getFileContent()).agent.tool_permissions.tools;
+      expect(tools.terminal.always_allow).toEqual([{ pattern: "git *", case_sensitive: false }]);
+      expect(tools.terminal.always_deny).toEqual([{ pattern: "rm *", case_sensitive: false }]);
+    });
+
+    it("should not warn that an all-tools deny was dropped once it lands in the bash denylist", async () => {
+      // Regression: the pattern really is enforced (asserted above via
+      // `always_deny`), so warning that it was "dropped" would be wrong.
+      const warn = vi.fn();
+      const permissions = await ZedPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: createRulesyncPermissions({
+          "*": { "rm *": "deny" },
+          bash: { "rm *": "allow", "git *": "allow" },
+        }),
+        logger: { warn } as unknown as Logger,
+      });
+
+      JSON.parse(permissions.getFileContent());
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("rm *"));
+    });
+
+    it("should carry an all-tools ask into the bash confirm list when bash says nothing about that pattern", async () => {
+      const warn = vi.fn();
+      const permissions = await ZedPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: createRulesyncPermissions({
+          "*": { "rm *": "ask" },
+          bash: { "git *": "allow" },
+        }),
+        logger: { warn } as unknown as Logger,
+      });
+
+      const tools = JSON.parse(permissions.getFileContent()).agent.tool_permissions.tools;
+      expect(tools.terminal.always_confirm).toEqual([{ pattern: "rm *", case_sensitive: false }]);
+      expect(warn).not.toHaveBeenCalledWith(expect.stringContaining("rm *"));
+    });
+
     it("should replace the stale tools['*'] entry older versions wrote for the * category", async () => {
       await writeFileContent(
         join(testDir, ".zed", "settings.json"),
@@ -688,7 +735,7 @@ describe("ZedPermissions", () => {
     });
   });
 
-  describe("zed override (sandbox_permissions / profiles)", () => {
+  describe("zed override (sandbox_permissions / profiles / default_profile)", () => {
     const sandboxPermissions = {
       network_hosts: ["*.github.com", "registry.npmjs.org"],
       write_paths: ["/tmp/build"],
@@ -800,6 +847,41 @@ describe("ZedPermissions", () => {
       expect(agent.sandbox_permissions).toEqual({ network_hosts: ["new.example.com"] });
       // Not authored: left exactly as the user wrote it.
       expect(agent.profiles).toEqual({ legacy: { name: "Legacy" } });
+    });
+
+    it("should write default_profile and lift it back on import", async () => {
+      const rulesyncPermissions = createRulesyncPermissionsWithConfig({
+        permission: { bash: { "*": "ask" } },
+        zed: { profiles, default_profile: "review" },
+      });
+
+      const generated = await ZedPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions,
+        global: true,
+      });
+      expect(JSON.parse(generated.getFileContent()).agent.default_profile).toBe("review");
+
+      await writeFileContent(
+        join(testDir, expectedZedGlobalDir, "settings.json"),
+        generated.getFileContent(),
+      );
+      const imported = await ZedPermissions.fromFile({ outputRoot: testDir, global: true });
+      const json = JSON.parse(imported.toRulesyncPermissions().getFileContent());
+
+      expect(json.zed).toEqual({ profiles, default_profile: "review" });
+    });
+
+    it("should not lift a non-string default_profile on import", async () => {
+      await writeFileContent(
+        join(testDir, expectedZedGlobalDir, "settings.json"),
+        JSON.stringify({ agent: { default_profile: { id: "review" } } }),
+      );
+
+      const imported = await ZedPermissions.fromFile({ outputRoot: testDir, global: true });
+      const json = JSON.parse(imported.toRulesyncPermissions().getFileContent());
+
+      expect(json.zed).toBeUndefined();
     });
 
     it("should ignore a tool_permissions key in the override with a warning", async () => {

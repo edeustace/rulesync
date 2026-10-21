@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { symlink } from "node:fs/promises";
+import { basename, join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -10,7 +11,7 @@ import {
 import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, toPosixPath, writeFileContent } from "../../utils/file.js";
-import { RovodevMcp } from "./rovodev-mcp.js";
+import { classifyExistingPointer, RovodevMcp } from "./rovodev-mcp.js";
 import { RulesyncMcp } from "./rulesync-mcp.js";
 
 describe("RovodevMcp", () => {
@@ -36,6 +37,18 @@ describe("RovodevMcp", () => {
   afterEach(async () => {
     await cleanup();
     vi.restoreAllMocks();
+  });
+
+  describe("classifyExistingPointer", () => {
+    it.each([
+      ["an unset pointer", undefined, false, "unset"],
+      ["the generated project file", ".rovodev/mcp.json", false, "already-generated"],
+      ["Atlassian's documented default", "~/.rovodev/mcp_config.json", true, "documented-default"],
+      ["an environment-variable spelling", "$HOME/.rovodev/mcp.json", true, "env-var-spelling"],
+      ["a user-chosen project file", "custom/mcp.json", false, "unrelated"],
+    ] as const)("classifies %s", (_label, existing, global, kind) => {
+      expect(classifyExistingPointer({ existing, global, outputRoot: testDir })).toEqual({ kind });
+    });
   });
 
   describe("getSettablePaths", () => {
@@ -64,6 +77,220 @@ describe("RovodevMcp", () => {
 
       const imported = await RovodevMcp.fromFile({ outputRoot: testDir, validate: true });
       expect(imported).toBeInstanceOf(RovodevMcp);
+    });
+
+    it("imports the project MCP config selected by mcp.mcpConfigPath", async () => {
+      await ensureDir(join(testDir, ".rovodev"));
+      await ensureDir(join(testDir, "custom"));
+      await writeFileContent(
+        join(testDir, ".rovodev", "config.yml"),
+        "mcp:\n  mcpConfigPath: custom/mcp.json\n",
+      );
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp.json"),
+        JSON.stringify({ mcpServers: { inactive: { command: "inactive-server" } } }),
+      );
+      await writeFileContent(
+        join(testDir, "custom", "mcp.json"),
+        JSON.stringify({ mcpServers: { active: { command: "active-server" } } }),
+      );
+
+      const imported = await RovodevMcp.fromFile({
+        outputRoot: testDir,
+        logger: createMockLogger(),
+      });
+
+      expect(imported.getRelativeDirPath()).toBe("custom");
+      expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+        active: { command: "active-server" },
+      });
+    });
+
+    it("keeps the legacy path when mcp.mcpConfigPath is absent and warns", async () => {
+      const logger = createMockLogger();
+      await ensureDir(join(testDir, ".rovodev"));
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp.json"),
+        JSON.stringify({ mcpServers: { legacy: { command: "legacy-server" } } }),
+      );
+
+      const imported = await RovodevMcp.fromFile({ outputRoot: testDir, logger });
+
+      expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+        legacy: { command: "legacy-server" },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("mcp.mcpConfigPath is unset"),
+      );
+    });
+
+    it.each(["", "   "])(
+      "keeps the legacy path for an empty mcp.mcpConfigPath (%j)",
+      async (value) => {
+        const logger = createMockLogger();
+        await ensureDir(join(testDir, ".rovodev"));
+        await writeFileContent(
+          join(testDir, ".rovodev", "config.yml"),
+          `mcp:\n  mcpConfigPath: ${JSON.stringify(value)}\n`,
+        );
+        await writeFileContent(
+          join(testDir, ".rovodev", "mcp.json"),
+          JSON.stringify({ mcpServers: { fallback: { command: "fallback-server" } } }),
+        );
+
+        const imported = await RovodevMcp.fromFile({ outputRoot: testDir, logger });
+
+        expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+          fallback: { command: "fallback-server" },
+        });
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("must be a non-empty string"),
+        );
+      },
+    );
+
+    it("does not follow a project pointer outside the import scope", async () => {
+      const logger = createMockLogger();
+      await ensureDir(join(testDir, ".rovodev"));
+      await writeFileContent(
+        join(testDir, ".rovodev", "config.yml"),
+        "mcp:\n  mcpConfigPath: ../outside/mcp.json\n",
+      );
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp.json"),
+        JSON.stringify({ mcpServers: { fallback: { command: "fallback-server" } } }),
+      );
+
+      const imported = await RovodevMcp.fromFile({ outputRoot: testDir, logger });
+
+      expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+        fallback: { command: "fallback-server" },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("outside the import scope"));
+    });
+
+    it("does not follow a project pointer that escapes the import scope through a symlink", async () => {
+      const logger = createMockLogger();
+      const outsideDir = join(testDir, "..", `outside-${basename(testDir)}`);
+      await ensureDir(outsideDir);
+      await writeFileContent(
+        join(outsideDir, "mcp.json"),
+        JSON.stringify({ mcpServers: { escaped: { command: "escaped-server" } } }),
+      );
+      await ensureDir(testDir);
+      await symlink(outsideDir, join(testDir, "linked"));
+      await ensureDir(join(testDir, ".rovodev"));
+      await writeFileContent(
+        join(testDir, ".rovodev", "config.yml"),
+        "mcp:\n  mcpConfigPath: linked/mcp.json\n",
+      );
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp.json"),
+        JSON.stringify({ mcpServers: { fallback: { command: "fallback-server" } } }),
+      );
+
+      const imported = await RovodevMcp.fromFile({ outputRoot: testDir, logger });
+
+      expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+        fallback: { command: "fallback-server" },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("outside the import scope"));
+    });
+
+    it("does not follow a home-anchored pointer in project scope", async () => {
+      const logger = createMockLogger();
+      await ensureDir(join(testDir, ".rovodev"));
+      await writeFileContent(
+        join(testDir, ".rovodev", "config.yml"),
+        "mcp:\n  mcpConfigPath: ~/.rovodev/mcp_config.json\n",
+      );
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp.json"),
+        JSON.stringify({ mcpServers: { fallback: { command: "fallback-server" } } }),
+      );
+
+      const imported = await RovodevMcp.fromFile({ outputRoot: testDir, logger });
+
+      expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+        fallback: { command: "fallback-server" },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("cannot be imported as part of a project"),
+      );
+    });
+  });
+
+  describe("global scope", () => {
+    it("imports the home-anchored MCP config selected by mcp.mcpConfigPath", async () => {
+      await ensureDir(join(testDir, ".rovodev"));
+      await writeFileContent(
+        join(testDir, ".rovodev", "config.yml"),
+        "mcp:\n  mcpConfigPath: ~/.rovodev/mcp_config.json\n",
+      );
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp.json"),
+        JSON.stringify({ mcpServers: { inactive: { command: "inactive-server" } } }),
+      );
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp_config.json"),
+        JSON.stringify({ mcpServers: { active: { command: "active-server" } } }),
+      );
+
+      const imported = await RovodevMcp.fromFile({ outputRoot: testDir, global: true });
+
+      expect(imported.getRelativeDirPath()).toBe(".rovodev");
+      expect(imported.getRelativeFilePath()).toBe("mcp_config.json");
+      expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+        active: { command: "active-server" },
+      });
+    });
+
+    it("does not follow a relative, non-home-anchored pointer in global scope", async () => {
+      const logger = createMockLogger();
+      await ensureDir(join(testDir, ".rovodev"));
+      await writeFileContent(
+        join(testDir, ".rovodev", "config.yml"),
+        "mcp:\n  mcpConfigPath: custom/mcp.json\n",
+      );
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp.json"),
+        JSON.stringify({ mcpServers: { fallback: { command: "fallback-server" } } }),
+      );
+
+      const imported = await RovodevMcp.fromFile({ outputRoot: testDir, global: true, logger });
+
+      expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+        fallback: { command: "fallback-server" },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Only home-anchored or absolute paths"),
+      );
+    });
+
+    it("does not follow an absolute pointer outside the home directory in global scope", async () => {
+      const logger = createMockLogger();
+      const outsideDir = join(testDir, "..", `outside-${basename(testDir)}`);
+      await ensureDir(outsideDir);
+      await writeFileContent(
+        join(outsideDir, "mcp.json"),
+        JSON.stringify({ mcpServers: { escaped: { command: "escaped-server" } } }),
+      );
+      await ensureDir(join(testDir, ".rovodev"));
+      await writeFileContent(
+        join(testDir, ".rovodev", "config.yml"),
+        `mcp:\n  mcpConfigPath: ${JSON.stringify(join(outsideDir, "mcp.json"))}\n`,
+      );
+      await writeFileContent(
+        join(testDir, ".rovodev", "mcp.json"),
+        JSON.stringify({ mcpServers: { fallback: { command: "fallback-server" } } }),
+      );
+
+      const imported = await RovodevMcp.fromFile({ outputRoot: testDir, global: true, logger });
+
+      expect(imported.toRulesyncMcp().getJson().mcpServers).toEqual({
+        fallback: { command: "fallback-server" },
+      });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("outside the import scope"));
     });
   });
 
@@ -269,9 +496,12 @@ describe("RovodevMcp", () => {
 
       const servers = JSON.parse(rovodevMcp.getFileContent()).mcpServers;
       expect(servers.trusted).toEqual({ command: "node", enable_instructions: true });
-      // Absent and `false` mean the same thing to Rovo Dev, so neither is written.
+      // Nothing authored means Rovo Dev's own default, so nothing is written.
       expect(servers.plain).toEqual({ command: "node" });
-      expect(servers.off).toEqual({ command: "node" });
+      // Since 2026-09-02 `false` is the only spelling that suppresses a
+      // server's instructions, so it has to be written rather than collapsed
+      // into the absent case (issue #2955).
+      expect(servers.off).toEqual({ command: "node", enable_instructions: false });
     });
 
     it("accepts Rovo Dev's own spelling in the canonical config", async () => {
@@ -324,10 +554,11 @@ describe("RovodevMcp", () => {
 
       expect(JSON.parse(rovodevMcp.getFileContent()).mcpServers.distrusted).toEqual({
         command: "node",
+        enable_instructions: false,
       });
     });
 
-    it("reports the servers whose instructions it enables", async () => {
+    it("says nothing about a flag that restates Rovo Dev's default", async () => {
       const logger = createMockLogger();
       const rulesyncMcp = new RulesyncMcp({
         outputRoot: testDir,
@@ -348,13 +579,12 @@ describe("RovodevMcp", () => {
         logger,
       });
 
-      // Atlassian gates this key on trust, and it is the only thing generate
-      // writes that widens what steers the model — it must not be the quietest.
-      const message = logger.warn.mock.calls
-        .map(([entry]) => String(entry))
-        .find((entry) => entry.includes("enable_instructions: true"));
-      expect(message).toContain("trusted");
-      expect(message).not.toContain("plain");
+      // The old warning named every server written with `true`, back when that
+      // was the write that widened what steers the model. Since the default
+      // inverted, `true` is what Rovo Dev already does for an absent key.
+      expect(logger.warn.mock.calls.map(([entry]) => String(entry)).join("\n")).not.toContain(
+        "enable_instructions",
+      );
     });
 
     it("keeps the flag through the pipeline generate actually runs", async () => {
@@ -397,8 +627,11 @@ describe("RovodevMcp", () => {
           mcpServers: {
             trusted: { transport: "stdio", command: "node", enable_instructions: true },
             plain: { transport: "stdio", command: "node" },
-            // Only a real `true` enables instructions in Rovo Dev, so nothing
-            // else may import as an enabled flag.
+            // The value that actually suppresses instructions upstream, and
+            // the one an import used to throw away (issue #2955).
+            suppressed: { transport: "stdio", command: "node", enable_instructions: false },
+            // Rovo Dev surfaces instructions for anything that is not `false`,
+            // so a non-boolean must not import as a suppression either.
             fuzzy: { transport: "stdio", command: "node", enable_instructions: "yes" },
           },
         }),
@@ -411,7 +644,40 @@ describe("RovodevMcp", () => {
         rovodevEnableInstructions: true,
       });
       expect(servers.plain).toEqual({ type: "stdio", command: "node" });
+      expect(servers.suppressed).toEqual({
+        type: "stdio",
+        command: "node",
+        rovodevEnableInstructions: false,
+      });
       expect(servers.fuzzy).toEqual({ type: "stdio", command: "node" });
+    });
+
+    it("round-trips a suppression instead of switching it back on", async () => {
+      // The fail-open outcome #2955 reports: import dropped `false`, so the
+      // next generate wrote the entry back without it and Rovo Dev surfaced
+      // the instructions the user had switched off.
+      const imported = new RovodevMcp({
+        outputRoot: testDir,
+        relativeDirPath: ".rovodev",
+        relativeFilePath: "mcp.json",
+        fileContent: JSON.stringify({
+          mcpServers: {
+            suppressed: { transport: "stdio", command: "node", enable_instructions: false },
+          },
+        }),
+      }).toRulesyncMcp();
+
+      const regenerated = await RovodevMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp: imported,
+        global: true,
+      });
+
+      expect(JSON.parse(regenerated.getFileContent()).mcpServers.suppressed).toEqual({
+        transport: "stdio",
+        command: "node",
+        enable_instructions: false,
+      });
     });
 
     it("survives an import followed by a generate", async () => {
@@ -1042,7 +1308,7 @@ describe("RovodevMcp", () => {
       expect(message).toContain("defines legacy");
       // This user already has a value, so the message has to end on the change
       // to make rather than on rulesync leaving their value alone.
-      expect(message).toContain('change mcp.mcpConfigPath to "~/.rovodev/mcp.json"');
+      expect(message).toMatch(/change mcp\.mcpConfigPath to "~\/\.rovodev\/mcp\.json"\.$/);
       expect(message).not.toContain("will not overwrite");
     });
 

@@ -125,9 +125,26 @@ describe("shared-file write derivation", () => {
           "mcp",
           "permissions",
         ],
+        ".bob/settings/settings.json": [
+          "hooks",
+          "permissions",
+        ],
         ".claude/settings.json": [
           "hooks",
           "ignore",
+          "permissions",
+          "rules",
+        ],
+        ".claude/settings.local.json": [
+          "ignore",
+          "rules",
+        ],
+        ".codebuddy/settings.json": [
+          "hooks",
+          "permissions",
+        ],
+        ".codewhale/config.toml": [
+          "hooks",
           "permissions",
         ],
         ".codex/config.toml": [
@@ -135,7 +152,16 @@ describe("shared-file write derivation", () => {
           "mcp",
           "permissions",
         ],
+        ".commandcode/settings.json": [
+          "hooks",
+          "permissions",
+        ],
         ".config/amp/settings.json": [
+          "mcp",
+          "permissions",
+        ],
+        ".config/crush/crush.json": [
+          "hooks",
           "mcp",
           "permissions",
         ],
@@ -147,13 +173,39 @@ describe("shared-file write derivation", () => {
           "commands",
           "mcp",
         ],
+        ".config/mimocode/mimocode.json": [
+          "mcp",
+          "permissions",
+          "rules",
+        ],
         ".config/opencode/opencode.json": [
           "mcp",
           "permissions",
           "rules",
         ],
+        ".config/poolside/settings.yaml": [
+          "hooks",
+          "mcp",
+          "permissions",
+          "subagents",
+        ],
         ".config/zed/settings.json": [
           "ignore",
+          "mcp",
+          "permissions",
+        ],
+        ".copilot/settings.json": [
+          "hooks",
+          "mcp",
+          "permissions",
+        ],
+        ".firebender/firebender.json": [
+          "ignore",
+          "mcp",
+          "subagents",
+        ],
+        ".github/copilot/settings.json": [
+          "hooks",
           "mcp",
           "permissions",
         ],
@@ -177,6 +229,26 @@ describe("shared-file write derivation", () => {
           "hooks",
           "permissions",
         ],
+        ".letta/settings.json": [
+          "hooks",
+          "permissions",
+        ],
+        ".mimocode/mimocode.json": [
+          "mcp",
+          "permissions",
+          "rules",
+        ],
+        ".poolside/settings.yaml": [
+          "hooks",
+          "mcp",
+          "permissions",
+          "subagents",
+        ],
+        ".qoder/settings.json": [
+          "hooks",
+          "mcp",
+          "permissions",
+        ],
         ".qwen/settings.json": [
           "hooks",
           "mcp",
@@ -191,6 +263,11 @@ describe("shared-file write derivation", () => {
           "mcp",
           "permissions",
         ],
+        ".tabnine/agent/settings.json": [
+          "hooks",
+          "mcp",
+          "permissions",
+        ],
         ".takt/config.yaml": [
           "checks",
           "mcp",
@@ -199,6 +276,14 @@ describe("shared-file write derivation", () => {
         ".vibe/config.toml": [
           "mcp",
           "permissions",
+        ],
+        ".zcode/cli/config.json": [
+          "hooks",
+          "mcp",
+        ],
+        ".zcode/config.json": [
+          "hooks",
+          "mcp",
         ],
         ".zed/settings.json": [
           "ignore",
@@ -227,6 +312,16 @@ describe("shared-file write derivation", () => {
           "hooks",
           "mcp",
           "permissions",
+          "subagents",
+        ],
+        "crush.json": [
+          "hooks",
+          "mcp",
+          "permissions",
+        ],
+        "firebender.json": [
+          "ignore",
+          "mcp",
           "subagents",
         ],
         "kilo.json": [

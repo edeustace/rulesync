@@ -16,6 +16,7 @@ import { readFileContentOrNull } from "../../utils/file.js";
 import { isPlainObject } from "../../utils/type-guards.js";
 import { applySharedConfigPatch, sharedConfigFileKey } from "../shared/shared-config-gateway.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+import { honorAllToolsOnBash } from "./shell-command-categories.js";
 import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
@@ -276,6 +277,12 @@ function buildZedToolPermissions({
       for (const [pattern, action] of Object.entries(rules)) {
         if (pattern === "*") {
           managedDefault = CANONICAL_TO_ZED_ACTION[action];
+        } else if (permission.bash?.[pattern] === "deny" || permission.bash?.[pattern] === "ask") {
+          // `honorAllToolsOnBash` already folded this restriction into `bash`
+          // (it names a command that overlapped or was carried over verbatim),
+          // so it is enforced there via the `terminal` tool's own deny/confirm
+          // list rather than dropped.
+          continue;
         } else {
           logger?.warn(
             `Zed permissions: dropping the "*" category rule for pattern "${pattern}" — Zed's global tool-permission default takes no patterns; scope the rule to a tool category instead.`,
@@ -330,7 +337,7 @@ function asRecord(value: unknown): Record<string, unknown> {
  * nothing. `permission` is exempt: it is the canonical tool-scoped block, and
  * `RulesyncPermissions.forTarget` has already consumed and stripped it.
  */
-const ZED_OVERRIDE_AGENT_KEYS = ["sandbox_permissions", "profiles"] as const;
+const ZED_OVERRIDE_AGENT_KEYS = ["sandbox_permissions", "profiles", "default_profile"] as const;
 const ZED_CANONICAL_AGENT_KEY = "tool_permissions";
 const ZED_OVERRIDE_CONSUMED_KEYS: ReadonlySet<string> = new Set<string>([
   ...ZED_OVERRIDE_AGENT_KEYS,
@@ -366,14 +373,14 @@ function buildZedOverridePatch({
     logger?.warn(
       `Zed permissions: ignoring the ${unsupportedKeys.map((key) => `'zed.${key}'`).join(", ")} ` +
         `override ${unsupportedKeys.length === 1 ? "key" : "keys"} — the \`zed\` block authors only ` +
-        `${ZED_OVERRIDE_AGENT_KEYS.map((key) => `\`${key}\``).join(" and ")}.`,
+        `${ZED_OVERRIDE_AGENT_KEYS.map((key) => `\`${key}\``).join(", ")}.`,
     );
   }
 
   const patch: Record<string, unknown> = {};
   for (const key of ZED_OVERRIDE_AGENT_KEYS) {
     const value = override[key];
-    if (isPlainObject(value)) {
+    if (isZedOverrideValue(key, value)) {
       patch[key] = value;
     }
   }
@@ -381,16 +388,29 @@ function buildZedOverridePatch({
 }
 
 /**
- * The write-side inverse: lift `agent.sandbox_permissions` / `agent.profiles`
- * back into the `zed` override so a hand-written sandbox policy or profile set
- * round-trips instead of being lost on the next generate. Returns `undefined`
- * when the settings carry neither, so the override key is omitted.
+ * `default_profile` is a profile id string; the other override keys are
+ * objects Zed reads as one unit. A value of the wrong shape is skipped in both
+ * directions rather than written into (or lifted out of) the settings file.
+ */
+function isZedOverrideValue(
+  key: (typeof ZED_OVERRIDE_AGENT_KEYS)[number],
+  value: unknown,
+): boolean {
+  return key === "default_profile" ? typeof value === "string" : isPlainObject(value);
+}
+
+/**
+ * The write-side inverse: lift `agent.sandbox_permissions` / `agent.profiles` /
+ * `agent.default_profile` back into the `zed` override so a hand-written
+ * sandbox policy, profile set or profile selection round-trips instead of being
+ * lost on the next generate. Returns `undefined` when the settings carry none
+ * of them, so the override key is omitted.
  */
 function extractZedOverride(agent: Record<string, unknown>): Record<string, unknown> | undefined {
   const override: Record<string, unknown> = {};
   for (const key of ZED_OVERRIDE_AGENT_KEYS) {
     const value = agent[key];
-    if (isPlainObject(value)) {
+    if (isZedOverrideValue(key, value)) {
       override[key] = value;
     }
   }
@@ -400,16 +420,20 @@ function extractZedOverride(agent: Record<string, unknown>): Record<string, unkn
 /**
  * Permissions generator for the Zed editor.
  *
- * Zed maps tool permissions onto `agent.tool_permissions` inside its settings
- * file (`.zed/settings.json` for project, `~/.config/zed/settings.json` for
- * global). That file is shared with the MCP (`context_servers`) and ignore
- * (`private_files`) features, so reads and writes merge into the existing JSON
- * rather than overwriting it, and the file is never deleted.
+ * Zed maps tool permissions onto `agent.tool_permissions` inside its user
+ * settings file (`~/.config/zed/settings.json`). The processor routes Zed
+ * permissions in global scope only: Zed parses a project `.zed/settings.json`
+ * as `ProjectSettingsContent`, which has no `agent` field, so every `agent.*`
+ * key written there would be ignored. The file is shared with the MCP
+ * (`context_servers`) and ignore (`private_files`) features, so reads and
+ * writes merge into the existing JSON rather than overwriting it, and the file
+ * is never deleted.
  *
- * Zed's OS sandbox (`agent.sandbox_permissions`) and its tool-availability
- * profiles (`agent.profiles`) are separate enforcement layers with no canonical
- * counterpart; they are authored verbatim through the `zed` override and lifted
- * back out of the settings on import. See `ZedPermissionsOverrideSchema`.
+ * Zed's OS sandbox (`agent.sandbox_permissions`), its tool-availability
+ * profiles (`agent.profiles`) and the active-profile selection
+ * (`agent.default_profile`) have no canonical counterpart; they are authored
+ * verbatim through the `zed` override and lifted back out of the settings on
+ * import. See `ZedPermissionsOverrideSchema`.
  */
 export class ZedPermissions extends ToolPermissions {
   constructor(params: AiFileParams) {
@@ -499,7 +523,7 @@ export class ZedPermissions extends ToolPermissions {
     const existingTools = asRecord(toolPermissions.tools);
 
     const { managedDefault, managedTools, excludedCategories, inertMcpCategories } =
-      buildZedToolPermissions({ permission: config.permission, logger });
+      buildZedToolPermissions({ permission: honorAllToolsOnBash(config.permission), logger });
 
     if (excludedCategories.length > 0) {
       logger?.warn(

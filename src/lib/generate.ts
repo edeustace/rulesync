@@ -1,4 +1,4 @@
-import { basename, extname, join } from "node:path";
+import { basename, dirname, extname, join } from "node:path";
 
 import { intersection } from "es-toolkit";
 
@@ -17,6 +17,7 @@ import { IgnoreProcessor } from "../features/ignore/ignore-processor.js";
 import { McpProcessor } from "../features/mcp/mcp-processor.js";
 import { PermissionsProcessor } from "../features/permissions/permissions-processor.js";
 import { RulesProcessor } from "../features/rules/rules-processor.js";
+import { ensureAntigravityPluginManifests } from "../features/shared/antigravity-plugin-manifest.js";
 import {
   activateHermesProjectPlugins,
   type HermesProjectPluginName,
@@ -29,7 +30,7 @@ import { AiDir } from "../types/ai-dir.js";
 import { AiFile } from "../types/ai-file.js";
 import { DirFeatureProcessor } from "../types/dir-feature-processor.js";
 import { FeatureProcessor, resetRootShadowingWarnings } from "../types/feature-processor.js";
-import type { Feature } from "../types/features.js";
+import type { Feature, FeatureOptions } from "../types/features.js";
 import { getProcessorRegistryEntry } from "../types/processor-registry.js";
 import type { RulesyncFile } from "../types/rulesync-file.js";
 import type { ToolTarget } from "../types/tool-targets.js";
@@ -38,15 +39,29 @@ import { formatError } from "../utils/error.js";
 import {
   directoryExists,
   fileExists,
+  isFileSystemError,
   isPresentButUnresolvable,
+  pathEscapesRoot,
+  relativeWriteLanding,
   toPosixPath,
 } from "../utils/file.js";
 import type { Logger } from "../utils/logger.js";
-import { assertPluginRootSafe } from "../utils/plugin-root.js";
+import {
+  assertPluginRootSafe,
+  formatPackagingTargetGlobalMessage,
+  isPackagingToolTarget,
+} from "../utils/plugin-root.js";
 import type { FeatureGenerateResult } from "../utils/result.js";
 import { resolveToolOutputRoot } from "../utils/tool-output-root.js";
-import { resetWarnedOnceMessages } from "../utils/warned-once.js";
-import { createOrphanSweepPlan, type OrphanSweepPlan } from "./orphan-sweep.js";
+import { resetRunWarningState } from "../utils/warned-once.js";
+import { createFoldRootOverwriteWatch } from "./fold-root-overwrite-watch.js";
+import {
+  createOrphanSweepPlan,
+  type DeletedPath,
+  type KeyOperation,
+  type OrphanSweepPlan,
+} from "./orphan-sweep.js";
+import { scheduleRetiredTargetSweeps } from "./retire-targets.js";
 import { deriveSharedWriteSteps } from "./shared-file-derive.js";
 
 export type GenerateResult = {
@@ -70,6 +85,8 @@ export type GenerateResult = {
   checksPaths: string[];
   activationCount: number;
   activationPaths: string[];
+  pluginManifestCount: number;
+  pluginManifestPaths: string[];
   skills: RulesyncSkill[];
   hasDiff: boolean;
   /**
@@ -83,6 +100,20 @@ export type GenerateResult = {
    * when `sourceLoadFailed` is false.
    */
   sourceLoadFailedFeatures: GenerationStepId[];
+  /**
+   * The paths the `--delete` orphan sweep removed — or, under `--dry-run` and
+   * `--check`, would remove — per feature, relative to the output root like
+   * the `*Paths` lists above and sorted. A feature that deleted nothing is
+   * absent.
+   */
+  deletedPathsByFeature: Partial<Record<GenerationStepId, readonly DeletedPath[]>>;
+  /**
+   * The top-level keys Rulesync owns outright in a shared config file (see
+   * `diffSharedConfigOwnedKeys`) that this run's writes added, changed or
+   * removed — or, under `--dry-run` and `--check`, would — per feature, sorted
+   * by path and then key. A feature that touched no such key is absent.
+   */
+  keyOperationsByFeature: Partial<Record<GenerationStepId, readonly KeyOperation[]>>;
 };
 
 /**
@@ -126,12 +157,15 @@ async function processFeatureGeneration<T extends AiFile>(params: {
   totalCount += writeResult.count;
   allPaths.push(...writeResult.paths);
   if (writeResult.count > 0) hasDiff = true;
+  sweepPlan.recordKeyOperations(writeResult.keyOperations ?? []);
 
   // Registered even when the write was a no-op (unchanged content), a dry run, or
   // skipped for root-file ownership: what protects a path from a sibling target's
   // sweep is that this run owns it, not that these particular bytes were flushed.
   // `toolFiles` rather than `filesToCheck` for exactly that reason.
-  sweepPlan.registerGenerated({ paths: toolFiles.map((f) => f.getFilePath()) });
+  sweepPlan.registerGenerated({
+    paths: toolFiles.flatMap((f) => [f.getFilePath(), ...f.getClaimedDirPaths()]),
+  });
 
   // A processor whose source failed to load has an incomplete picture of what
   // the run should produce, so the sweep cannot tell an orphan from a file
@@ -147,7 +181,7 @@ async function processFeatureGeneration<T extends AiFile>(params: {
         // equivalent today, because a path this run claims is a path that
         // processor also lists in `generatedFiles`.
         const orphanCount = await processor.removeOrphanAiFiles(
-          sweepPlan.rejectClaimed({
+          await sweepPlan.rejectClaimed({
             items: existingToolFiles,
             getPath: (f) => f.getFilePath(),
           }),
@@ -155,6 +189,7 @@ async function processFeatureGeneration<T extends AiFile>(params: {
         );
         return orphanCount > 0;
       },
+      reportDeleted: () => processor.getRemovedPaths(),
     });
   }
 
@@ -164,6 +199,44 @@ async function processFeatureGeneration<T extends AiFile>(params: {
     hasDiff,
     sourceLoadFailed: processor.hasRulesyncSourceLoadFailure(),
   };
+}
+
+/**
+ * Whether `aiDir` may claim everything below its directory as its own tree:
+ * true only when, once every link on the way is followed, the directory lands
+ * directly below its feature's output directory (`.claude/skills` for
+ * `.claude/skills/foo`), and that output directory lands inside the output
+ * root. A link to anything broader — the root itself, or an ancestor such as
+ * `.claude` that is still inside it — would otherwise exempt every sibling
+ * under that ancestor from the sweep.
+ *
+ * A cycle answers false, and so does a path whose links cannot be read (an
+ * `EACCES` on the way): the run goes on without the tree claim, the same way the
+ * sweep keeps a path it cannot follow, and the files this run wrote there stay
+ * claimed by name. Today `writeAiDirs` walks the same paths first and stops the
+ * run on such an error before this is reached, so the catch is defensive: it
+ * keeps a claim from being the one place a link walk aborts the run. Any other
+ * error is a bug and propagates.
+ */
+async function claimsOwnDirTree(aiDir: AiDir): Promise<boolean> {
+  const outputRoot = aiDir.getOutputRoot();
+  const featureDirPath = join(outputRoot, aiDir.getRelativeDirPath());
+  try {
+    const [featureDirFromRoot, dirFromFeatureDir] = await Promise.all([
+      relativeWriteLanding({ rootPath: outputRoot, targetPath: featureDirPath }),
+      relativeWriteLanding({ rootPath: featureDirPath, targetPath: aiDir.getDirPath() }),
+    ]);
+    if (featureDirFromRoot === null || dirFromFeatureDir === null) return false;
+    return (
+      !pathEscapesRoot(featureDirFromRoot) &&
+      dirFromFeatureDir !== "" &&
+      !pathEscapesRoot(dirFromFeatureDir) &&
+      dirname(dirFromFeatureDir) === "."
+    );
+  } catch (error) {
+    if (!isFileSystemError(error)) throw error;
+    return false;
+  }
 }
 
 async function processDirFeatureGeneration(params: {
@@ -193,8 +266,16 @@ async function processDirFeatureGeneration(params: {
   // `TaktSkill` overrides `getDirPath()` to drop `dirName` and return the shared
   // root every takt skill flattens into; claiming *that* as a tree would exempt
   // every sibling under the root from the sweep.
+  //
+  // Nor does a directory linked anywhere but directly below its feature's own
+  // output directory (see `claimsOwnDirTree`): a `.claude/skills/foo -> $HOME`
+  // link would otherwise claim the whole home directory, and `-> ..` all of
+  // `.claude`, silencing the sweeps of everything underneath.
   const ownedTrees = toolDirs.filter((d) => d.ownsDirTree());
-  sweepPlan.registerGeneratedTree({ paths: ownedTrees.map((d) => d.getDirPath()) });
+  const claimedTrees = await Promise.all(ownedTrees.map((d) => claimsOwnDirTree(d)));
+  sweepPlan.registerGeneratedTree({
+    paths: ownedTrees.filter((_, index) => claimedTrees[index]).map((d) => d.getDirPath()),
+  });
 
   // Claim the directory and the files inside it by name as well, so a feature
   // that flattens into a shared root — and therefore gets no tree claim — still
@@ -219,7 +300,7 @@ async function processDirFeatureGeneration(params: {
       sweep: async () => {
         const existingToolDirs = await processor.loadToolDirsToDelete();
         const orphanDirCount = await processor.removeOrphanAiDirs(
-          sweepPlan.rejectClaimed({
+          await sweepPlan.rejectClaimed({
             items: existingToolDirs,
             getPath: (d) => d.getDirPath(),
           }),
@@ -232,7 +313,7 @@ async function processDirFeatureGeneration(params: {
         // keyed on that same file path, registered by name just above.
         const existingFlatFiles = await processor.loadToolFlatFilesToDelete();
         const orphanFileCount = await processor.removeOrphanFlatFiles({
-          existingFlatFiles: sweepPlan.rejectClaimed({
+          existingFlatFiles: await sweepPlan.rejectClaimed({
             items: existingFlatFiles,
             // The directory stands in for a candidate that names no file, so
             // the key is always a real path. Nothing is lost by it: such a
@@ -243,8 +324,35 @@ async function processDirFeatureGeneration(params: {
           generatedDirs: toolDirs,
         });
 
-        return orphanDirCount + orphanFileCount > 0;
+        // The last of the three sweeps: the files left inside a directory this
+        // run still generates. Neither sweep above looks there — one removes
+        // whole directories that no longer correspond to an entry, the other
+        // only the files a flattening tool can name — so a companion file
+        // deleted from a source directory that is otherwise kept survived every
+        // generate.
+        //
+        // Run on `toolDirs` rather than on a re-enumeration, and last, so it
+        // sees the tree as this run left it: the directories the sweep above
+        // deleted are gone, and nothing here has to decide again whether one of
+        // them should have been. That costs one walk per generated directory
+        // per target, which is why it walks only the directories this run wrote
+        // rather than the whole output root.
+        //
+        // Files only: a directory left empty by the files it removes stays,
+        // since an empty directory is not something a previous run's output can
+        // be told apart from one a user made.
+        const orphanInDirCount = await processor.removeOrphanFilesInAiDirs({
+          generatedDirs: toolDirs,
+          // Claims are consulted per file, not per tree: this sweep looks
+          // inside a directory the run has claimed as a whole, so the tree
+          // claim covers every candidate it could ever consider. What has to
+          // survive is a file another target wrote into a root they share.
+          isClaimed: (path) => sweepPlan.isGeneratedExactly({ path }),
+        });
+
+        return orphanDirCount + orphanFileCount + orphanInDirCount > 0;
       },
+      reportDeleted: () => processor.getRemovedPaths(),
     });
   }
 
@@ -275,13 +383,17 @@ async function processEmptyFeatureGeneration(params: {
       sweep: async () => {
         const existingToolFiles = await processor.loadToolFiles({ forDeletion: true });
 
-        const filesToDelete = sweepPlan
-          .rejectClaimed({ items: existingToolFiles, getPath: (f) => f.getFilePath() })
-          .filter((f) => !skipFilePaths?.has(f.getRelativePathFromCwd()));
+        const filesToDelete = (
+          await sweepPlan.rejectClaimed({
+            items: existingToolFiles,
+            getPath: (f) => f.getFilePath(),
+          })
+        ).filter((f) => !skipFilePaths?.has(f.getRelativePathFromCwd()));
 
         const orphanCount = await processor.removeOrphanAiFiles(filesToDelete, []);
         return orphanCount > 0;
       },
+      reportDeleted: () => processor.getRemovedPaths(),
     });
   }
 
@@ -303,12 +415,19 @@ async function processFeatureWithRulesyncFiles(params: {
   rulesyncFiles: RulesyncFile[];
   sweepPlan: OrphanSweepPlan;
   skipFilePaths?: Set<string>;
+  /** Sees the converted tool files before anything is written. */
+  onToolFiles?: (toolFiles: AiFile[]) => void;
 }): Promise<FeatureGenerateResult> {
-  const { config, processor, rulesyncFiles, sweepPlan, skipFilePaths } = params;
-  if (rulesyncFiles.length === 0) {
+  const { config, processor, rulesyncFiles, sweepPlan, skipFilePaths, onToolFiles } = params;
+  // A source that failed to load also arrives empty, and "could not be read"
+  // is not "no longer wanted", so it never retracts anything.
+  const retractsForEmptySource =
+    processor.emitsToolFilesForEmptySource() && !processor.hasRulesyncSourceLoadFailure();
+  if (rulesyncFiles.length === 0 && !retractsForEmptySource) {
     return processEmptyFeatureGeneration({ config, processor, sweepPlan, skipFilePaths });
   }
   const toolFiles = await processor.convertRulesyncFilesToToolFiles(rulesyncFiles);
+  onToolFiles?.(toolFiles);
   return processFeatureGeneration({ config, processor, toolFiles, sweepPlan, skipFilePaths });
 }
 
@@ -335,6 +454,10 @@ function warnUnsupportedTargets(params: {
     oppositeScopeTargets = [];
   }
   for (const target of config.getTargets()) {
+    // Already reported once per run by `generate`.
+    if (config.getGlobal() && isPackagingToolTarget(target)) {
+      continue;
+    }
     if (!supportedTargets.includes(target) && config.getFeatures(target).includes(featureName)) {
       const simulateOption = SIMULATE_OPTION_MAP[featureName];
       if (simulateOption && simulatedTargets.includes(target)) {
@@ -609,7 +732,15 @@ export const GENERATION_STEP_GRAPH: readonly GenerationStepMeta[] = [
   // Checks reach a shared file only for Takt (`workflow_overrides` in
   // `.takt/config.yaml`), so this step carries shared-write metadata like the
   // rest and must run before the features that write the same file.
-  { id: "checks", ...sharedWriteMeta("checks") },
+  {
+    id: "checks",
+    ...sharedWriteMeta("checks"),
+    // Factory Droid's checks output is a file inside the skills tree
+    // (`.factory/skills/review-guidelines/SKILL.md`), which the derived
+    // shared-file edges cannot see: the skills step's settable path is a
+    // directory, not that file. Checks owns the path, so it writes last.
+    dependsOn: [...(sharedWriteMeta("checks").dependsOn ?? []), "skills"],
+  },
   { id: "permissions", ...sharedWriteMeta("permissions") },
   {
     id: "rules",
@@ -776,9 +907,17 @@ export async function generate(params: {
   // "Once per run" means once per generate, not once per process: `--watch` and
   // the MCP server keep one process alive across many runs, and a warning that
   // still applies has to be said again.
-  resetWarnedOnceMessages();
+  resetRunWarningState();
 
   for (const toolTarget of config.getTargets()) {
+    // In global mode the output root is the home directory, so the plugin root
+    // safety check would walk all of $HOME. No feature supports a packaging
+    // target in global mode, so report it once here and skip the check;
+    // `warnUnsupportedTargets` stays quiet about it.
+    if (config.getGlobal() && isPackagingToolTarget(toolTarget)) {
+      logger.warn(`${formatPackagingTargetGlobalMessage(toolTarget)} Skipping.`);
+      continue;
+    }
     for (const outputRoot of config.getOutputRoots(toolTarget)) {
       await assertPluginRootSafe({ toolTarget, outputRoot });
     }
@@ -792,21 +931,34 @@ export async function generate(params: {
   // One plan for the whole run: every step registers what it writes into it, and
   // every `--delete` sweep is held back until the last step has written, so no
   // target sweeps a directory it shares with a target that has not run yet.
-  const sweepPlan = createOrphanSweepPlan();
+  const sweepPlan = createOrphanSweepPlan({ logger });
 
   const runners: Record<GenerationStepId, () => Promise<FeatureGenerateResult>> = {
-    ignore: () => generateIgnoreCore({ config, logger, sweepPlan }),
-    mcp: () => generateMcpCore({ config, logger, sweepPlan }),
-    commands: () => generateCommandsCore({ config, logger, sweepPlan }),
-    subagents: () => generateSubagentsCore({ config, logger, sweepPlan }),
+    ignore: () => generateIgnoreCore({ config, logger, sweepPlan: sweepPlan.forFeature("ignore") }),
+    mcp: () => generateMcpCore({ config, logger, sweepPlan: sweepPlan.forFeature("mcp") }),
+    commands: () =>
+      generateCommandsCore({ config, logger, sweepPlan: sweepPlan.forFeature("commands") }),
+    subagents: () =>
+      generateSubagentsCore({ config, logger, sweepPlan: sweepPlan.forFeature("subagents") }),
     skills: async () => {
-      skillsResult = await generateSkillsCore({ config, logger, sweepPlan });
+      skillsResult = await generateSkillsCore({
+        config,
+        logger,
+        sweepPlan: sweepPlan.forFeature("skills"),
+      });
       return skillsResult;
     },
-    hooks: () => generateHooksCore({ config, logger, sweepPlan }),
-    permissions: () => generatePermissionsCore({ config, logger, sweepPlan }),
-    checks: () => generateChecksCore({ config, logger, sweepPlan }),
-    rules: () => generateRulesCore({ config, logger, sweepPlan, skills: skillsResult?.skills }),
+    hooks: () => generateHooksCore({ config, logger, sweepPlan: sweepPlan.forFeature("hooks") }),
+    permissions: () =>
+      generatePermissionsCore({ config, logger, sweepPlan: sweepPlan.forFeature("permissions") }),
+    checks: () => generateChecksCore({ config, logger, sweepPlan: sweepPlan.forFeature("checks") }),
+    rules: () =>
+      generateRulesCore({
+        config,
+        logger,
+        sweepPlan: sweepPlan.forFeature("rules"),
+        skills: skillsResult?.skills,
+      }),
   };
 
   const steps: GenerationStep[] = GENERATION_STEP_GRAPH.map((meta) => ({
@@ -821,6 +973,15 @@ export async function generate(params: {
     resultsById.set(step.id, await step.run());
   }
 
+  // Queued last so every claim of this run is registered before a retired
+  // target's outputs are compared against them.
+  scheduleRetiredTargetSweeps({
+    config,
+    logger,
+    sweepPlan,
+    sourceLoadFailed: [...resultsById.values()].some((result) => result.sourceLoadFailed),
+  });
+
   // Deletion runs only now, once every step has written: a sweep that ran inline
   // would remove files a later step is about to write, which is both destructive
   // for shared output directories and a permanent `--check` diff. A step that
@@ -830,6 +991,17 @@ export async function generate(params: {
 
   const activationResult = await activateHermesProjectPlugins({
     pluginNames: await collectHermesProjectPluginNames({ config, resultsById }),
+    dryRun: config.isPreviewMode(),
+    logger,
+  });
+
+  // Written after the sweep, which never claims the manifest, so `--delete`
+  // cannot remove one this run just created.
+  const pluginManifestResult = await ensureAntigravityPluginManifests({
+    outputRoots:
+      !config.getGlobal() && config.getTargets().includes("antigravity-plugin")
+        ? config.getOutputRoots("antigravity-plugin")
+        : [],
     dryRun: config.isPreviewMode(),
     logger,
   });
@@ -847,7 +1019,10 @@ export async function generate(params: {
   };
 
   const hasDiff =
-    sweepHasDiff || activationResult.hasDiff || orderedSteps.some((step) => get(step.id).hasDiff);
+    sweepHasDiff ||
+    activationResult.hasDiff ||
+    pluginManifestResult.hasDiff ||
+    orderedSteps.some((step) => get(step.id).hasDiff);
 
   // A step that could not read its source wrote nothing, which is counted the
   // same as "there was nothing to write". Carry the distinction out so the
@@ -878,24 +1053,29 @@ export async function generate(params: {
     checksPaths: get("checks").paths,
     activationCount: activationResult.count,
     activationPaths: activationResult.paths,
+    pluginManifestCount: pluginManifestResult.count,
+    pluginManifestPaths: pluginManifestResult.paths,
     skills: skillsResult.skills,
     hasDiff,
     sourceLoadFailed: sourceLoadFailedFeatures.length > 0,
     sourceLoadFailedFeatures,
+    deletedPathsByFeature: Object.fromEntries(sweepPlan.getDeletedPathsByFeature()),
+    keyOperationsByFeature: Object.fromEntries(sweepPlan.getKeyOperationsByFeature()),
   };
 }
 
 // Maps every root-rule file path a target actually emits to that target, so
-// `generate --check` can skip root files a (CLI-selected) target does not own.
+// `generate --check` can compare root files a (CLI-selected) target does not
+// own against the owner's output instead (see `createSkippedRootFileCheck`).
 //
 // Ownership is "last target in config order wins": the loop iterates the config
-// file's full target list and `Map.set` overwrites, so the final writer in
-// config order owns a shared path — consistent with generation write order,
+// file's rules-generating targets and `Map.set` overwrites, so the final writer
+// in config order owns a shared path — consistent with generation write order,
 // where the last target's content is what ends up on disk.
 //
-// Note: a single ownership decision is applied uniformly across all output
-// roots (paths are output-root-relative). Multi-output-root `--check` would
-// need per-output-root keying; that is out of scope here.
+// Note: the ownership decision itself is applied uniformly across all output
+// roots (paths are output-root-relative); the skipped-file comparison is keyed
+// per output root and falls back when the owner does not write to that root.
 function computeRootFileOwnership(params: {
   targets: ToolTarget[];
   global: boolean;
@@ -936,6 +1116,160 @@ function computeRootFileOwnership(params: {
   return ownerByPath;
 }
 
+type SkippedRootFile = { processor: RulesProcessor; toolFile: AiFile };
+
+// `generate --check` skips a shared root file for every target that does not
+// own it, but skipping alone would leave the file unchecked whenever its owner
+// is not part of the run (e.g. `--check -t codexcli` while `opencode` owns
+// `AGENTS.md`), so an edit to it went unnoticed (#3198). This records what was
+// skipped and then compares each such file against the owner's expected
+// content instead. When the owner already checked it in this run there is
+// nothing left to do; when the owner does not emit it at all, the last
+// non-owning writer's content is what a full `generate` leaves on disk, so that
+// is what gets compared. Everything is keyed per output root.
+function createSkippedRootFileCheck({
+  rootFileOwner,
+}: {
+  rootFileOwner: Map<string, ToolTarget>;
+}): {
+  observe: (params: {
+    toolTarget: ToolTarget;
+    outputRoot: string;
+    processor: RulesProcessor;
+    toolFiles: AiFile[];
+    skipFilePaths: Set<string>;
+  }) => void;
+  verify: (params: {
+    isOwnerProcessed: (owner: ToolTarget) => boolean;
+    createOwnerProcessor: (params: {
+      toolTarget: ToolTarget;
+      outputRoot: string;
+    }) => Promise<RulesProcessor | undefined>;
+  }) => Promise<FeatureGenerateResult>;
+} {
+  // outputRoot -> relative path -> last non-owning target's file.
+  const skippedByRoot = new Map<string, Map<string, SkippedRootFile>>();
+  // outputRoot -> "target\0relative path" for every shared root file emitted.
+  const emittedByRoot = new Map<string, Set<string>>();
+  const emittedKey = (toolTarget: ToolTarget, relativePath: string) =>
+    `${toolTarget}\0${relativePath}`;
+
+  const loadOwnerToolFiles = async (
+    processor: RulesProcessor,
+  ): Promise<{ toolFiles: AiFile[]; sourceLoadFailed: boolean }> => {
+    const rulesyncFiles = await processor.loadRulesyncFiles();
+    const toolFiles =
+      rulesyncFiles.length > 0
+        ? await processor.convertRulesyncFilesToToolFiles(rulesyncFiles)
+        : [];
+    return { toolFiles, sourceLoadFailed: processor.hasRulesyncSourceLoadFailure() };
+  };
+
+  return {
+    observe: ({ toolTarget, outputRoot, processor, toolFiles, skipFilePaths }) => {
+      // Outside check mode nothing is owned, so nothing is ever skipped.
+      if (rootFileOwner.size === 0) return;
+      for (const toolFile of toolFiles) {
+        const relativePath = toolFile.getRelativePathFromCwd();
+        if (!rootFileOwner.has(relativePath)) continue;
+        const emitted = emittedByRoot.get(outputRoot) ?? new Set<string>();
+        emittedByRoot.set(outputRoot, emitted);
+        emitted.add(emittedKey(toolTarget, relativePath));
+        if (!skipFilePaths.has(relativePath)) continue;
+        const skipped = skippedByRoot.get(outputRoot) ?? new Map<string, SkippedRootFile>();
+        skippedByRoot.set(outputRoot, skipped);
+        skipped.set(relativePath, { processor, toolFile });
+      }
+    },
+
+    verify: async ({ isOwnerProcessed, createOwnerProcessor }) => {
+      let count = 0;
+      const paths: string[] = [];
+      let sourceLoadFailed = false;
+
+      for (const [outputRoot, skipped] of skippedByRoot) {
+        const ownerOutputs = new Map<
+          ToolTarget,
+          { processor: RulesProcessor; toolFiles: AiFile[] } | undefined
+        >();
+        for (const [relativePath, fallback] of skipped) {
+          const owner = rootFileOwner.get(relativePath);
+          if (owner === undefined) continue;
+          if (emittedByRoot.get(outputRoot)?.has(emittedKey(owner, relativePath))) continue;
+
+          let expected = fallback;
+          if (!isOwnerProcessed(owner)) {
+            if (!ownerOutputs.has(owner)) {
+              const processor = await createOwnerProcessor({ toolTarget: owner, outputRoot });
+              if (processor === undefined) {
+                ownerOutputs.set(owner, undefined);
+              } else {
+                const loaded = await loadOwnerToolFiles(processor);
+                if (loaded.sourceLoadFailed) sourceLoadFailed = true;
+                ownerOutputs.set(owner, { processor, toolFiles: loaded.toolFiles });
+              }
+            }
+            const ownerOutput = ownerOutputs.get(owner);
+            // Matched on the resolved path too: a tool home override can put
+            // the owner's file elsewhere, and then it is not the skipped file.
+            const ownerFile = ownerOutput?.toolFiles.find(
+              (file) =>
+                file.getRelativePathFromCwd() === relativePath &&
+                file.getFilePath() === fallback.toolFile.getFilePath(),
+            );
+            if (ownerOutput !== undefined && ownerFile !== undefined) {
+              expected = { processor: ownerOutput.processor, toolFile: ownerFile };
+            }
+          }
+
+          const result = await expected.processor.writeAiFiles([expected.toolFile]);
+          count += result.count;
+          paths.push(...result.paths);
+        }
+      }
+
+      return { count, paths, hasDiff: count > 0, sourceLoadFailed };
+    },
+  };
+}
+
+/**
+ * The skills a full `rulesync generate` hands to the rules step: what the
+ * skills step collects for every config-file target that generates skills, in
+ * the same order. Simulated skill sections in a root file list these, so a
+ * narrowed check needs them to rebuild another target's root file.
+ */
+async function loadConfigFileSkills({
+  config,
+  logger,
+}: {
+  config: Config;
+  logger: Logger;
+}): Promise<RulesyncSkill[]> {
+  const supportedSkillsTargets = SkillsProcessor.getToolTargets({
+    global: config.getGlobal(),
+    includeSimulated: config.getSimulateSkills(),
+  });
+  const skills: RulesyncSkill[] = [];
+  for (const toolTarget of intersection(config.getConfigFileTargets(), supportedSkillsTargets)) {
+    if (!config.getConfigFileFeatures(toolTarget).includes("skills")) continue;
+    for (const outputRoot of config.getOutputRoots(toolTarget)) {
+      const processor = new SkillsProcessor({
+        outputRoot: resolveToolOutputRoot({ outputRoot, toolTarget, global: config.getGlobal() }),
+        inputRoots: config.getInputRoots(),
+        toolTarget,
+        global: config.getGlobal(),
+        dryRun: true,
+        logger,
+      });
+      for (const rulesyncDir of await processor.loadRulesyncDirs()) {
+        if (rulesyncDir instanceof RulesyncSkill) skills.push(rulesyncDir);
+      }
+    }
+  }
+  return skills;
+}
+
 async function generateRulesCore(params: {
   config: Config;
   logger: Logger;
@@ -953,13 +1287,66 @@ async function generateRulesCore(params: {
   const toolTargets = intersection(config.getTargets(), supportedTargets);
   warnUnsupportedTargets({ config, supportedTargets, featureName: "rules", logger });
 
+  const foldRootOverwriteWatch = createFoldRootOverwriteWatch({ logger });
+
+  let fullRunSkills: Promise<RulesyncSkill[]> | undefined;
+  const loadFullRunSkills = (): Promise<RulesyncSkill[]> => {
+    fullRunSkills ??= loadConfigFileSkills({ config, logger });
+    return fullRunSkills;
+  };
+
+  const createProcessor = ({
+    toolTarget,
+    outputRoot,
+    featureOptions,
+    skills: processorSkills,
+  }: {
+    toolTarget: ToolTarget;
+    outputRoot: string;
+    featureOptions: FeatureOptions | undefined;
+    skills: RulesyncSkill[] | undefined;
+  }): RulesProcessor =>
+    new RulesProcessor({
+      outputRoot: resolveToolOutputRoot({
+        outputRoot,
+        toolTarget,
+        global: config.getGlobal(),
+      }),
+      inputRoots: config.getInputRoots(),
+      toolTarget: toolTarget,
+      global: config.getGlobal(),
+      simulateCommands: config.getSimulateCommands(),
+      simulateSubagents: config.getSimulateSubagents(),
+      simulateSkills: config.getSimulateSkills(),
+      language: config.getLanguage(),
+      deriveSubprojectPathFromGlobs: config.getDeriveSubprojectPathFromGlobs(),
+      skills: processorSkills,
+      featureOptions,
+      delete: config.getDelete(),
+      dryRun: config.isPreviewMode(),
+      logger,
+    });
+
   const isCheck = config.getCheck();
   const rootFileOwner = isCheck
     ? computeRootFileOwnership({
-        targets: config.getConfigFileTargets(),
+        // Only a target that generates rules can own a root file; one
+        // configured for other features never writes it. A target in this run
+        // is judged by this run's features (#1894), any other target as a run
+        // without --targets would generate it (#3198).
+        targets: config
+          .getConfigFileTargets()
+          .filter((target) =>
+            (toolTargets.includes(target)
+              ? config.getFeatures(target)
+              : config.getConfigFileFeatures(target)
+            ).includes("rules"),
+          ),
         global: config.getGlobal(),
       })
     : new Map<string, ToolTarget>();
+
+  const skippedRootFileCheck = createSkippedRootFileCheck({ rootFileOwner });
 
   for (const toolTarget of toolTargets) {
     for (const outputRoot of config.getOutputRoots(toolTarget)) {
@@ -968,22 +1355,11 @@ async function generateRulesCore(params: {
         continue;
       }
 
-      const processor = new RulesProcessor({
-        outputRoot: resolveToolOutputRoot({
-          outputRoot,
-          toolTarget,
-          global: config.getGlobal(),
-        }),
-        inputRoots: config.getInputRoots(),
-        toolTarget: toolTarget,
-        global: config.getGlobal(),
-        simulateCommands: config.getSimulateCommands(),
-        simulateSubagents: config.getSimulateSubagents(),
-        simulateSkills: config.getSimulateSkills(),
-        skills: skills,
+      const processor = createProcessor({
+        toolTarget,
+        outputRoot,
         featureOptions: config.getFeatureOptions(toolTarget, "rules"),
-        dryRun: config.isPreviewMode(),
-        logger,
+        skills,
       });
 
       const rulesyncFiles = await processor.loadRulesyncFiles();
@@ -1003,6 +1379,16 @@ async function generateRulesCore(params: {
         rulesyncFiles,
         sweepPlan,
         skipFilePaths: skipFilePaths.size > 0 ? skipFilePaths : undefined,
+        onToolFiles: (toolFiles) => {
+          foldRootOverwriteWatch.observe({ toolTarget, toolFiles });
+          skippedRootFileCheck.observe({
+            toolTarget,
+            outputRoot,
+            processor,
+            toolFiles,
+            skipFilePaths,
+          });
+        },
       });
 
       totalCount += result.count;
@@ -1011,6 +1397,38 @@ async function generateRulesCore(params: {
       if (result.sourceLoadFailed) sourceLoadFailed = true;
     }
   }
+
+  if (isCheck) {
+    const skippedResult = await skippedRootFileCheck.verify({
+      isOwnerProcessed: (owner) =>
+        toolTargets.includes(owner) && config.getFeatures(owner).includes("rules"),
+      // The owner only writes into an output root it is configured for, and
+      // only in a scope it supports; otherwise the fallback is compared.
+      createOwnerProcessor: async (ownerParams) =>
+        supportedTargets.includes(ownerParams.toolTarget) &&
+        config.getOutputRoots(ownerParams.toolTarget).includes(ownerParams.outputRoot)
+          ? createProcessor({
+              ...ownerParams,
+              // CLI -t replaces the per-target options and narrows the skills
+              // step, so build the owner's output from the config file, as a
+              // run without --targets would.
+              featureOptions: config.getConfigFileFeatureOptions(ownerParams.toolTarget, "rules"),
+              // Only a simulated skills section lists skills in a root file.
+              skills:
+                config.getSimulateSkills() &&
+                SkillsProcessor.getToolTargetsSimulated().includes(ownerParams.toolTarget)
+                  ? await loadFullRunSkills()
+                  : undefined,
+            })
+          : undefined,
+    });
+    totalCount += skippedResult.count;
+    allPaths.push(...skippedResult.paths);
+    if (skippedResult.hasDiff) hasDiff = true;
+    if (skippedResult.sourceLoadFailed) sourceLoadFailed = true;
+  }
+
+  foldRootOverwriteWatch.report();
 
   return { count: totalCount, paths: allPaths, hasDiff, sourceLoadFailed };
 }
@@ -1051,8 +1469,9 @@ async function generateIgnoreCore(params: {
           // paths in `ConfigResolver`; with that change it is now consistent
           // to pass the same `outputRoot` value the other processors receive.
           // No `resolveToolOutputRoot` either: the tools with a home override
-          // (hermesagent, kimi-code) are not global ignore targets, so there is
-          // nothing to redirect. Route through it if that ever changes.
+          // (hermesagent, kimi-code, deepagents — see `TOOL_HOME_ENV_VARS`)
+          // are not global ignore targets, so there is nothing to redirect.
+          // Route through it if that ever changes.
           outputRoot,
           inputRoots: config.getInputRoots(),
           toolTarget,
@@ -1255,6 +1674,7 @@ async function generateSubagentsCore(params: {
         toolTarget: toolTarget,
         global: config.getGlobal(),
         dryRun: config.isPreviewMode(),
+        deleteOrphans: config.getDelete(),
         logger,
       });
 
@@ -1387,6 +1807,7 @@ async function generateHooksCore(params: {
         toolTarget,
         global: config.getGlobal(),
         dryRun: config.isPreviewMode(),
+        preserveUnownedHooks: config.getPreserveUnownedHooks(),
         logger,
       });
 

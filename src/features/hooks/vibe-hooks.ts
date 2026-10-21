@@ -12,6 +12,7 @@ import {
 } from "../../types/hooks.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
 import { isPrototypePollutionKey } from "../../utils/prototype-pollution.js";
 import type { RulesyncHooks } from "./rulesync-hooks.js";
 import { buildImportedHooksConfig } from "./tool-hooks-converter.js";
@@ -54,12 +55,20 @@ const SUPPORTED_VIBE_EVENTS: ReadonlySet<string> = new Set(VIBE_HOOK_EVENTS);
  * Build the flat `[[hooks]]` array for `.vibe/hooks.toml` from a canonical
  * hooks config. Vibe uses a flat array where each entry carries its own event
  * `type`, tool-name `match` glob/regex, and `command`. Only `type: "command"`
- * canonical hooks are emitted (Vibe hooks are always shell commands).
+ * canonical hooks are emitted: a Vibe hook is a shell command line. (v2.25.1
+ * to v2.25.4 briefly exec'd it without a shell under the unified harness and
+ * skipped any command containing a backslash; v2.25.5 restored shell
+ * execution — "Hook commands using pipes, `&&`, redirects, globs or `$VAR`
+ * now run through the shell" — and dropped the backslash skip.)
+ * @see https://github.com/mistralai/mistral-vibe/blob/v2.25.8/vibe/core/hooks/config.py
  */
-function canonicalToVibeHooks(
-  config: HooksConfig,
-  toolOverride: HooksConfig["hooks"] | undefined,
-): {
+function canonicalToVibeHooks({
+  config,
+  toolOverride,
+}: {
+  config: HooksConfig;
+  toolOverride: HooksConfig["hooks"] | undefined;
+}): {
   hooks: VibeHookEntry[];
 } {
   const shared: HooksConfig["hooks"] = {};
@@ -75,7 +84,7 @@ function canonicalToVibeHooks(
     if (!SUPPORTED_VIBE_EVENTS.has(event)) {
       continue;
     }
-    const vibeEvent = CANONICAL_TO_VIBE_EVENT_NAMES[event] ?? event;
+    const vibeEvent = lookupOwn({ record: CANONICAL_TO_VIBE_EVENT_NAMES, key: event }) ?? event;
     let index = 0;
     for (const def of defs) {
       const hookType = def.type ?? "command";
@@ -129,14 +138,16 @@ function vibeEntryToCanonicalDef(
   if (vibeEvent === undefined) {
     return null;
   }
-  // A crafted `type` (e.g. "__proto__") would otherwise make the bracket lookup
-  // below resolve to a prototype member instead of falling back to the raw name,
-  // keying the canonical record by that member. Skip such names, as
-  // `kiroIdeHooksToCanonical` does.
+  // The lookup below is own-property-only, so a crafted `type` such as
+  // "toString" falls back to the raw name instead of a prototype member. The
+  // raw name is still written as a key of the canonical record, so a
+  // prototype-pollution key is skipped outright, as `kiroIdeHooksToCanonical`
+  // does.
   if (isPrototypePollutionKey(vibeEvent)) {
     return null;
   }
-  const canonicalEvent = VIBE_TO_CANONICAL_EVENT_NAMES[vibeEvent] ?? vibeEvent;
+  const canonicalEvent =
+    lookupOwn({ record: VIBE_TO_CANONICAL_EVENT_NAMES, key: vibeEvent }) ?? vibeEvent;
   const def: HookDefinition = { type: "command" };
   if (typeof entry.command === "string") {
     def.command = entry.command;
@@ -177,7 +188,7 @@ function vibeHooksToCanonical(parsed: unknown): HooksConfig["hooks"] {
     if (result === null) {
       continue;
     }
-    const list = canonical[result.canonicalEvent] ?? [];
+    const list = lookupOwn({ record: canonical, key: result.canonicalEvent }) ?? [];
     list.push(result.def);
     canonical[result.canonicalEvent] = list;
   }
@@ -219,10 +230,10 @@ export class VibeHooks extends ToolHooks {
     validate = true,
     global = false,
   }: ToolHooksFromFileParams): Promise<VibeHooks> {
-    const paths = VibeHooks.getSettablePaths({ global });
+    const paths = this.getSettablePaths({ global });
     const filePath = join(outputRoot, paths.relativeDirPath, paths.relativeFilePath);
     const fileContent = (await readFileContentOrNull(filePath)) ?? smolToml.stringify({});
-    return new VibeHooks({
+    return new this({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath: paths.relativeFilePath,
@@ -237,12 +248,15 @@ export class VibeHooks extends ToolHooks {
     validate = true,
     global = false,
   }: ToolHooksFromRulesyncHooksParams & { global?: boolean }): Promise<VibeHooks> {
-    const paths = VibeHooks.getSettablePaths({ global });
+    const paths = this.getSettablePaths({ global });
     const config = rulesyncHooks.getJson();
-    const vibeHooks = canonicalToVibeHooks(config, config.vibe?.hooks);
+    const vibeHooks = canonicalToVibeHooks({
+      config,
+      toolOverride: config.vibe?.hooks,
+    });
     const fileContent = smolToml.stringify(vibeHooks);
 
-    return new VibeHooks({
+    return new this({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath: paths.relativeFilePath,
@@ -288,7 +302,7 @@ export class VibeHooks extends ToolHooks {
     relativeDirPath,
     relativeFilePath,
   }: ToolHooksForDeletionParams): VibeHooks {
-    return new VibeHooks({
+    return new this({
       outputRoot,
       relativeDirPath,
       relativeFilePath,

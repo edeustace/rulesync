@@ -1,3 +1,4 @@
+import { symlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -9,9 +10,11 @@ import {
 } from "../../constants/rulesync-paths.js";
 import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
+import { buildLanguageInstruction } from "../../types/language.js";
 import { ensureDir, readFileContent, writeFileContent } from "../../utils/file.js";
 import { AgentsMdRule } from "./agentsmd-rule.js";
 import { AugmentcodeLegacyRule } from "./augmentcode-legacy-rule.js";
+import { ClaudecodeLanguageSettings } from "./claudecode-language-settings.js";
 import { ClaudecodeLegacyRule } from "./claudecode-legacy-rule.js";
 import { ClaudecodeRule } from "./claudecode-rule.js";
 import { CopilotRule } from "./copilot-rule.js";
@@ -29,6 +32,10 @@ const logger = createMockLogger();
 
 const findLocalRule = (rulesyncFiles: { getRelativeFilePath(): string }[], fileName: string) =>
   rulesyncFiles.find((file) => file.getRelativeFilePath() === fileName);
+
+/** The block `language` appends to a generated root rule file, separator included. */
+const languageBlock = (language: "ja" | "en" | "fr") =>
+  `\n\n---\n\n${buildLanguageInstruction(language)}`;
 
 const globalFoldTargets = RulesProcessor.getToolTargets({ global: true }).filter(
   (target) => RulesProcessor.getFactory(target)?.meta.collisionPolicy === "fold",
@@ -91,6 +98,237 @@ describe("RulesProcessor", () => {
       expect(result[1]).toBeInstanceOf(CopilotRule);
     });
 
+    it("should warn that generating Junie's root file deactivates existing .junie/rules/*.md", async () => {
+      // Junie reads `.junie/AGENTS.md` exclusively once it exists, so the
+      // multi-file branch (`.junie/rules/*.md`) becomes unreachable the
+      // moment `generate` writes the root file. Unlike `loadToolFiles`
+      // (import), `convertRulesyncFilesToToolFiles` never scanned for this
+      // before, so a repo that only ever runs `generate` saw no warning.
+      await writeFileContent(join(testDir, ".junie", "rules", "style.md"), "# Style");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "junie" });
+      const rulesyncRules = [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { targets: ["*"], root: true },
+          body: "Shared team instructions",
+        }),
+      ];
+
+      await processor.convertRulesyncFilesToToolFiles(rulesyncRules);
+
+      const warning = logger.warn.mock.calls
+        .map(([message]) => String(message))
+        .find((message) => message.includes("will no longer be read"));
+      expect(warning).toBeDefined();
+      expect(warning).toContain(join(".junie", "AGENTS.md"));
+      expect(warning).toContain(join(".junie", "rules", "style.md"));
+      expect(warning).toContain("rulesync import --targets junie");
+    });
+
+    it("should not warn about deactivated import-only roots when none exist on disk", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "junie" });
+      const rulesyncRules = [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { targets: ["*"], root: true },
+          body: "Shared team instructions",
+        }),
+      ];
+
+      await processor.convertRulesyncFilesToToolFiles(rulesyncRules);
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("will no longer be read"),
+      );
+    });
+
+    it("should not warn about deactivated import-only roots in Junie's global mode, since global settable paths have none", async () => {
+      // Junie's global scope writes a single `~/.junie/AGENTS.md` root file
+      // and has no multi-file `importOnlyRoots` branch at all (see
+      // `JunieRule.getSettablePaths({ global: true })`), so this generate run
+      // must never warn here even though the exact same on-disk files that
+      // trigger the warning in project mode are present.
+      await writeFileContent(join(testDir, ".junie", "rules", "style.md"), "# Style");
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "junie",
+        global: true,
+      });
+      const rulesyncRules = [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { targets: ["*"], root: true },
+          body: "Shared team instructions",
+        }),
+      ];
+
+      await processor.convertRulesyncFilesToToolFiles(rulesyncRules);
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("will no longer be read"),
+      );
+    });
+
+    describe("Warp legacy WARP.md", () => {
+      const warpRules = () => [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "style.md",
+          frontmatter: { targets: ["*"] },
+          body: "Style guide",
+        }),
+      ];
+      const findWarning = () =>
+        logger.warn.mock.calls
+          .map(([message]) => String(message))
+          .find((message) => message.includes("Warp reads WARP.md instead of AGENTS.md"));
+
+      it("should warn that an existing WARP.md shadows the generated AGENTS.md", async () => {
+        // Warp gives `WARP.md` priority over `AGENTS.md` in the same directory,
+        // so the generated file would be silently ignored.
+        await writeFileContent(join(testDir, "WARP.md"), "# Legacy");
+        const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "warp" });
+
+        await processor.convertRulesyncFilesToToolFiles(warpRules());
+
+        const warning = findWarning();
+        expect(warning).toBeDefined();
+        expect(warning).toContain("WARP.md exists next to AGENTS.md");
+        expect(warning).toContain(RULESYNC_RULES_RELATIVE_DIR_PATH);
+        expect(await readFileContent(join(testDir, "WARP.md"))).toBe("# Legacy");
+      });
+
+      it("should warn that a WARP.md shadows a generated nested AGENTS.md", async () => {
+        // The precedence is per directory, so it applies to each nested
+        // `<subprojectPath>/AGENTS.md` as much as to the root file.
+        await writeFileContent(join(testDir, "packages", "api", "WARP.md"), "# Legacy");
+        const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "warp" });
+
+        await processor.convertRulesyncFilesToToolFiles([
+          ...warpRules(),
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+            relativeFilePath: "api.md",
+            frontmatter: { targets: ["*"], agentsmd: { subprojectPath: "packages/api" } },
+            body: "API rules",
+          }),
+        ]);
+
+        const warning = findWarning();
+        expect(warning).toBeDefined();
+        expect(warning).toContain(
+          `${join("packages", "api", "WARP.md")} exists next to ${join("packages", "api", "AGENTS.md")}`,
+        );
+        expect(
+          logger.warn.mock.calls.filter(([message]) =>
+            String(message).includes("Warp reads WARP.md"),
+          ),
+        ).toHaveLength(1);
+      });
+
+      it("should not warn when no WARP.md exists", async () => {
+        const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "warp" });
+
+        await processor.convertRulesyncFilesToToolFiles(warpRules());
+
+        expect(findWarning()).toBeUndefined();
+      });
+
+      it("should not warn when no rule targets warp", async () => {
+        await writeFileContent(join(testDir, "WARP.md"), "# Legacy");
+        const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "warp" });
+
+        await processor.convertRulesyncFilesToToolFiles([
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+            relativeFilePath: "cursor-rule.md",
+            frontmatter: { targets: ["cursor"] },
+            body: "Cursor specific rule",
+          }),
+        ]);
+
+        expect(findWarning()).toBeUndefined();
+      });
+
+      it("should not warn in global mode", async () => {
+        await writeFileContent(join(testDir, ".agents", "WARP.md"), "# Legacy");
+        await writeFileContent(join(testDir, "WARP.md"), "# Legacy");
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "warp",
+          global: true,
+        });
+
+        await processor.convertRulesyncFilesToToolFiles(warpRules());
+
+        expect(findWarning()).toBeUndefined();
+      });
+
+      it("should not warn for other targets", async () => {
+        await writeFileContent(join(testDir, "WARP.md"), "# Legacy");
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "agentsmd",
+        });
+
+        await processor.convertRulesyncFilesToToolFiles(warpRules());
+
+        expect(findWarning()).toBeUndefined();
+      });
+    });
+
+    it("should emit a Warp directory-scoped rule as a nested AGENTS.md without a reference list in the root", async () => {
+      // Warp loads the subdirectory's AGENTS.md itself, and folds topic rules
+      // into the root file. https://docs.warp.dev/agents/capabilities/rules/
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "warp" });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "overview.md",
+          frontmatter: { targets: ["*"], root: true },
+          body: "Project rules",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "style.md",
+          frontmatter: { targets: ["*"] },
+          body: "Style guide",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "api.md",
+          frontmatter: { targets: ["*"], agentsmd: { subprojectPath: "packages/api" } },
+          body: "API rules",
+        }),
+      ]);
+
+      const paths = result.map((file) =>
+        join(file.getRelativeDirPath(), file.getRelativeFilePath()),
+      );
+      expect(paths).toEqual(["AGENTS.md", join("packages", "api", "AGENTS.md")]);
+      expect(result[0]?.getFileContent()).toContain("Style guide");
+      expect(result[0]?.getFileContent()).not.toContain("TOON format");
+      expect(result[1]?.getFileContent()).toBe("API rules");
+    });
+
     it("should emit a localRoot rule to .qwen/QWEN.local.md for qwencode", async () => {
       const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "qwencode" });
 
@@ -118,6 +356,107 @@ describe("RulesProcessor", () => {
       expect(localRule?.getRelativeDirPath()).toBe(".qwen");
       expect(localRule?.getFileContent()).toBe("Personal overrides");
     });
+
+    it("should emit a localRoot rule to CRUSH.local.md for crush", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "crush" });
+
+      const rulesyncRules = [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { targets: ["*"], root: true },
+          body: "Shared team instructions",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "local.md",
+          frontmatter: { targets: ["*"], localRoot: true },
+          body: "Personal overrides",
+        }),
+      ];
+
+      const result = await processor.convertRulesyncFilesToToolFiles(rulesyncRules);
+
+      const localRule = result.find((rule) => rule.getRelativeFilePath() === "CRUSH.local.md");
+      expect(localRule).toBeDefined();
+      // Crush reads the `.local` context file from the working directory root,
+      // next to `CRUSH.md`; it has no tool directory to put it in.
+      expect(localRule?.getRelativeDirPath()).toBe(".");
+      expect(localRule?.getFileContent()).toBe("Personal overrides");
+      // The personal body must not also be folded into the shared root file,
+      // which is the committed one.
+      const rootRule = result.find((rule) => rule.getRelativeFilePath() === "CRUSH.md");
+      expect(rootRule?.getFileContent()).not.toContain("Personal overrides");
+    });
+
+    it("should emit a localRoot rule to REASONIX.local.md for reasonix", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "reasonix" });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { targets: ["*"], root: true },
+          body: "Shared team instructions",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "local.md",
+          frontmatter: { targets: ["*"], localRoot: true },
+          body: "Personal overrides",
+        }),
+      ]);
+
+      const localRule = result.find((rule) => rule.getRelativeFilePath() === "REASONIX.local.md");
+      expect(localRule?.getRelativeDirPath()).toBe(".");
+      expect(localRule?.getFileContent()).toBe("Personal overrides");
+      // The personal body must not also be folded into the committed root file.
+      const rootRule = result.find((rule) => rule.getRelativeFilePath() === "REASONIX.md");
+      expect(rootRule?.getFileContent()).not.toContain("Personal overrides");
+    });
+
+    // `buildLocalRootFile` dispatches on the rule class and returns `null` for
+    // any class it has no branch for, which drops the file silently. That is how
+    // `zoocode` (fixed by `isClassOrSubclassOf`) and later `codebuddy` ended up
+    // declaring `separate-local-file` while emitting nothing. Declaring the mode
+    // is the visible half; this asserts the invisible half actually happens.
+    it.each(
+      [...RulesProcessor.getToolTargets({ global: false })]
+        .map((target) => ({ target, meta: RulesProcessor.getFactory(target)?.meta }))
+        .filter(({ meta }) => meta?.localRootMode === "separate-local-file")
+        .map(({ target, meta }) => ({ target, fileName: meta?.localRootFileName ?? "" })),
+    )(
+      "should emit $fileName for $target, which declares separate-local-file",
+      async ({ target, fileName }) => {
+        const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: target });
+
+        const result = await processor.convertRulesyncFilesToToolFiles([
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+            relativeFilePath: "root.md",
+            frontmatter: { targets: ["*"], root: true },
+            body: "Shared team instructions",
+          }),
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+            relativeFilePath: "local.md",
+            frontmatter: { targets: ["*"], localRoot: true },
+            body: "Personal overrides",
+          }),
+        ]);
+
+        expect(fileName).not.toBe("");
+        const localRule = result.find((rule) => rule.getRelativeFilePath() === fileName);
+        expect(localRule).toBeDefined();
+        expect(localRule?.getFileContent()).toContain("Personal overrides");
+      },
+    );
 
     it("should return empty array when no rules match the tool target", async () => {
       const processor = new RulesProcessor({ logger, toolTarget: "warp" });
@@ -860,6 +1199,180 @@ describe("RulesProcessor", () => {
       expect(claudecodePaths).toContain(join("backend", "api-rule.md"));
     });
 
+    it.each(["antigravity-cli", "antigravity-ide"] as const)(
+      "should skip unreadable and nested files in the shared %s global rules directory",
+      async (toolTarget) => {
+        const rulesDir = join(testDir, ".gemini", "config", "rules");
+        await writeFileContent(join(rulesDir, "ok.md"), "---\ntrigger: always_on\n---\n\n# OK");
+        await writeFileContent(join(rulesDir, "broken.md"), "---\ntrigger: 1\n---\n\n# Broken");
+        await writeFileContent(
+          join(rulesDir, "sub", "nested.md"),
+          "---\ntrigger: always_on\n---\n\n# Nested",
+        );
+
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget,
+          global: true,
+        });
+
+        const files = await processor.loadToolFiles();
+        const paths = files.map((file) => file.getRelativeFilePath());
+
+        expect(paths).toContain("ok.md");
+        expect(paths).not.toContain("broken.md");
+        expect(paths).not.toContain(join("sub", "nested.md"));
+        expect(paths).not.toContain("nested.md");
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("broken.md"));
+      },
+    );
+
+    it.each(["antigravity-cli", "antigravity-ide"] as const)(
+      "should omit the rule reference section from the %s global root",
+      async (toolTarget) => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget,
+          global: true,
+        });
+        const rules = [
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: join(".rulesync", "rules"),
+            relativeFilePath: "overview.md",
+            frontmatter: { root: true, targets: ["*"] },
+            body: "# Overview",
+          }),
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: join(".rulesync", "rules"),
+            relativeFilePath: "style.md",
+            frontmatter: { root: false, targets: ["*"] },
+            body: "# Style",
+          }),
+        ];
+
+        const toolFiles = await processor.convertRulesyncFilesToToolFiles(rules);
+        const root = toolFiles.find((file) => file.getRelativeFilePath() === "GEMINI.md");
+        const nonRoot = toolFiles.find((file) => file.getRelativeFilePath() === "style.md");
+
+        expect(root?.getFileContent()).not.toContain("style.md");
+        expect(nonRoot?.getRelativeDirPath()).toBe(join(".gemini", "config", "rules"));
+      },
+    );
+
+    it("should write the same project AGENTS.md and rule files for antigravity-cli and antigravity-ide", async () => {
+      const rules = [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: join(".rulesync", "rules"),
+          relativeFilePath: "overview.md",
+          frontmatter: { root: true, targets: ["*"] },
+          body: "# Overview",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: join(".rulesync", "rules"),
+          relativeFilePath: "style.md",
+          frontmatter: { root: false, targets: ["*"], globs: ["src/**/*.ts"] },
+          body: "# Style",
+        }),
+      ];
+      const render = async (toolTarget: "antigravity-cli" | "antigravity-ide") => {
+        const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget });
+        const toolFiles = await processor.convertRulesyncFilesToToolFiles(rules);
+        return toolFiles
+          .map((file) => [file.getRelativePathFromCwd(), file.getFileContent()])
+          .toSorted(([a], [b]) => String(a).localeCompare(String(b)));
+      };
+
+      const cliFiles = await render("antigravity-cli");
+
+      expect(cliFiles).toEqual(await render("antigravity-ide"));
+      const root = cliFiles.find(([path]) => path === "AGENTS.md");
+      // Antigravity loads `.agents/rules/*.md` by itself, so the root carries
+      // no reference block for them.
+      expect(root?.[1]).not.toContain("style.md");
+    });
+
+    it("should import only top-level .md and .mdc oh-my-pi rules but delete nested .md ones", async () => {
+      await writeFileContent(
+        join(testDir, ".omp", "rules", "style.md"),
+        "---\nalwaysApply: true\n---\n# Style",
+      );
+      await writeFileContent(
+        join(testDir, ".omp", "rules", "legacy.mdc"),
+        "---\nalwaysApply: true\n---\n# Legacy",
+      );
+      await writeFileContent(join(testDir, ".omp", "rules", "frontend", "nested.md"), "# Nested");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "omp" });
+
+      // oh-my-pi reads `.omp/rules/` non-recursively, as `*.md` and `*.mdc`.
+      const imported = await processor.loadToolFiles();
+      expect(imported.map((file) => file.getRelativeFilePath()).toSorted()).toEqual([
+        "legacy.mdc",
+        "style.md",
+      ]);
+      const rulesyncFiles = await processor.convertToolFilesToRulesyncFiles(imported);
+      expect(rulesyncFiles.map((file) => file.getRelativeFilePath()).toSorted()).toEqual([
+        "legacy.md",
+        "style.md",
+      ]);
+
+      // Rulesync never writes `.mdc`, but earlier generations wrote nested files.
+      const forDeletion = await processor.loadToolFiles({ forDeletion: true });
+      expect(forDeletion.map((file) => file.getRelativeFilePath()).toSorted()).toEqual([
+        join("frontend", "nested.md"),
+        "style.md",
+      ]);
+    });
+
+    it("should warn when an oh-my-pi .md and .mdc rule import to the same rulesync rule", async () => {
+      await writeFileContent(
+        join(testDir, ".omp", "rules", "foo.md"),
+        "---\nalwaysApply: true\n---\n# Md",
+      );
+      await writeFileContent(
+        join(testDir, ".omp", "rules", "foo.mdc"),
+        "---\nalwaysApply: true\n---\n# Mdc",
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "omp" });
+      await processor.convertToolFilesToRulesyncFiles(await processor.loadToolFiles());
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining(`import to ${join(RULESYNC_RULES_RELATIVE_DIR_PATH, "foo.md")}`),
+      );
+    });
+
+    it("should warn when flattening a nested oh-my-pi rule collides with a top-level one", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "omp" });
+      const buildOmpRule = (relativeFilePath: string) =>
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath,
+          frontmatter: { root: false, targets: ["omp"], globs: ["**/*"] },
+          body: `# ${relativeFilePath}`,
+        });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([
+        buildOmpRule(join("frontend", "style.md")),
+        buildOmpRule("frontend-style.md"),
+      ]);
+
+      expect(result.map((file) => file.getRelativeFilePath())).toEqual([
+        "frontend-style.md",
+        "frontend-style.md",
+      ]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("; the last one wins wherever they collide."),
+      );
+    });
+
     it("should discover nested AGENTS.md files on import but never for deletion", async () => {
       await writeFileContent(join(testDir, "AGENTS.md"), "# Root");
       await writeFileContent(join(testDir, "packages", "api", "AGENTS.md"), "# API");
@@ -878,6 +1391,104 @@ describe("RulesProcessor", () => {
         forDeletion.map((file) => join(file.getRelativeDirPath(), file.getRelativeFilePath())),
       ).not.toContain(join("packages", "api", "AGENTS.md"));
     });
+
+    it.each([false, true])(
+      "should import factorydroid output styles but never enumerate them for deletion (global: %s)",
+      async (global) => {
+        await writeFileContent(join(testDir, "DESIGN.md"), "# Design");
+        await writeFileContent(
+          join(testDir, ".factory", "output-styles", "review-notes.md"),
+          "Start with findings.",
+        );
+        await writeFileContent(
+          join(testDir, ".factory", "output-styles", "nested", "deep.md"),
+          "# Nested",
+        );
+        await writeFileContent(join(testDir, ".factory", "output-styles", "notes.txt"), "text");
+
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "factorydroid",
+          global,
+        });
+
+        // Droid loads only direct `.md` children of `output-styles/`.
+        const imported = await processor.loadToolFiles();
+        const importedPaths = imported.map((file) =>
+          join(file.getRelativeDirPath(), file.getRelativeFilePath()),
+        );
+        expect(importedPaths).toContain(join(".factory", "output-styles", "review-notes.md"));
+        expect(importedPaths).not.toContain(join(".factory", "output-styles", "nested", "deep.md"));
+        expect(importedPaths).not.toContain(join(".factory", "output-styles", "notes.txt"));
+
+        // The directory also holds hand-written styles, so `--delete` never
+        // sweeps it — while the fixed project channels stay deletion targets.
+        const forDeletion = await processor.loadToolFiles({ forDeletion: true });
+        const deletionPaths = forDeletion.map((file) =>
+          join(file.getRelativeDirPath(), file.getRelativeFilePath()),
+        );
+        expect(deletionPaths).not.toContain(join(".factory", "output-styles", "review-notes.md"));
+        if (!global) {
+          expect(deletionPaths).toContain("DESIGN.md");
+        }
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should skip symbolic links when importing factorydroid output styles",
+      async () => {
+        await writeFileContent(join(testDir, "outside", "secret.md"), "Outside the project.");
+        await writeFileContent(
+          join(testDir, ".factory", "output-styles", "review-notes.md"),
+          "Start with findings.",
+        );
+        await symlink(
+          join(testDir, "outside", "secret.md"),
+          join(testDir, ".factory", "output-styles", "linked.md"),
+        );
+
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "factorydroid",
+        });
+
+        const imported = await processor.loadToolFiles();
+        const importedPaths = imported.map((file) =>
+          join(file.getRelativeDirPath(), file.getRelativeFilePath()),
+        );
+        expect(importedPaths).toContain(join(".factory", "output-styles", "review-notes.md"));
+        expect(importedPaths).not.toContain(join(".factory", "output-styles", "linked.md"));
+        expect(imported.map((file) => file.getFileContent())).not.toContain("Outside the project.");
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            `Skipping symbolic link ${join(".factory", "output-styles", "linked.md")}`,
+          ),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should skip factorydroid output styles reached through a linked directory",
+      async () => {
+        await writeFileContent(join(testDir, "outside", "secret.md"), "Outside the project.");
+        await ensureDir(join(testDir, ".factory"));
+        await symlink(join(testDir, "outside"), join(testDir, ".factory", "output-styles"), "dir");
+
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "factorydroid",
+        });
+
+        const imported = await processor.loadToolFiles();
+        expect(imported.map((file) => file.getFileContent())).not.toContain("Outside the project.");
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("Skipping symbolic link .factory/output-styles/secret.md"),
+        );
+      },
+    );
 
     it("should import Junie's .junie/rules and playbook but never delete them", async () => {
       // Junie combines a project-root `AGENTS.md` with `.junie/playbook.md`
@@ -909,6 +1520,62 @@ describe("RulesProcessor", () => {
       );
       expect(deletionPaths).not.toContain(join(".junie", "playbook.md"));
       expect(deletionPaths).not.toContain(join(".junie", "rules", "style.md"));
+    });
+
+    it("should import a legacy root WARP.md for warp when AGENTS.md is absent", async () => {
+      // Warp still reads a root `WARP.md`, and a repository that has not moved
+      // to `AGENTS.md` yet carries only that file.
+      await writeFileContent(join(testDir, "WARP.md"), "# Legacy Warp rules");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "warp" });
+      const imported = await processor.loadToolFiles();
+
+      expect(imported).toHaveLength(1);
+      const legacyRoot = imported[0] as WarpRule;
+      expect(legacyRoot.isRoot()).toBe(true);
+      expect(legacyRoot.getFileContent()).toBe("# Legacy Warp rules");
+      const rulesyncRule = legacyRoot.toRulesyncRule();
+      expect(rulesyncRule.getFrontmatter().root).toBe(true);
+
+      // Rulesync never writes or deletes `WARP.md`.
+      const forDeletion = await processor.loadToolFiles({ forDeletion: true });
+      expect(forDeletion.map((file) => file.getRelativeFilePath())).not.toContain("WARP.md");
+    });
+
+    it("should import AGENTS.md and warn that Warp reads WARP.md when both exist", async () => {
+      await writeFileContent(join(testDir, "AGENTS.md"), "# Generated");
+      await writeFileContent(join(testDir, "WARP.md"), "# Legacy");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "warp" });
+      const importedPaths = (await processor.loadToolFiles()).map((file) =>
+        file.getRelativeFilePath(),
+      );
+
+      expect(importedPaths).toEqual(["AGENTS.md"]);
+      const warning = logger.warn.mock.calls
+        .map(([message]) => String(message))
+        .find((message) => message.includes("Not importing WARP.md"));
+      expect(warning).toContain("warp reads that file in place of AGENTS.md");
+      expect(warning).not.toContain("reads that file exclusively");
+    });
+
+    it("should not say generating AGENTS.md stops Warp reading WARP.md", async () => {
+      await writeFileContent(join(testDir, "WARP.md"), "# Legacy");
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "warp" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { targets: ["*"], root: true },
+          body: "Shared team instructions",
+        }),
+      ]);
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("will no longer be read"),
+      );
     });
 
     it("should stop importing Junie's read-only roots once .junie/AGENTS.md exists", async () => {
@@ -1241,9 +1908,391 @@ describe("RulesProcessor", () => {
       expect(warnSpy.mock.calls.length).toBeGreaterThanOrEqual(2);
       warnSpy.mockRestore();
     });
+
+    it("should never warn about fold duplication on its own — only the explicit warnForFoldImportDuplicationRisk() call does", async () => {
+      // `loadToolFiles` is also the entry point `rulesync convert` and
+      // `rulesync fetch` share (neither writes to `.rulesync/rules/` and so
+      // carries none of this duplication risk), so the warning must not fire
+      // just from loading tool files — only the real `rulesync import` call
+      // site invokes warnForFoldImportDuplicationRisk() explicitly, and only
+      // once it has confirmed there is something to import.
+      await ensureDir(join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH));
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "root.md"),
+        `---\nroot: true\ntargets: ["codexcli"]\n---\n# Overview\n`,
+      );
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "style.md"),
+        `---\nroot: false\ntargets: ["codexcli"]\n---\nstyle body\n`,
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.loadToolFiles();
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("will re-add content already folded from"),
+      );
+    });
+  });
+
+  describe("warnForFoldImportDuplicationRisk with nested AGENTS.md", () => {
+    const writeRule = async (name: string, frontmatter: string) => {
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, name),
+        `---\n${frontmatter}\n---\nbody\n`,
+      );
+    };
+    const warnings = () => logger.warn.mock.calls.map(([message]) => String(message));
+
+    it("should not list a directory-scoped rule as folded into the root file", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule(
+        "svc1.md",
+        'root: false\ntargets: ["codexcli"]\nagentsmd:\n  subprojectPath: services/svc1',
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(warnings().some((message) => message.includes("already folded from"))).toBe(false);
+    });
+
+    it("should warn when a nested file will be imported under a different name than its source rule", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule(
+        "svc1.md",
+        'root: false\ntargets: ["codexcli"]\nagentsmd:\n  subprojectPath: services/svc1',
+      );
+      await writeFileContent(join(testDir, "services", "svc1", "AGENTS.md"), "body\n");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      const warning = warnings().find((message) => message.includes("files outside the root file"));
+      expect(warning).toBeDefined();
+      expect(warning).toContain("svc1.md");
+    });
+
+    it("should not warn when the nested file imports back onto its source rule", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule(
+        "services-svc1.md",
+        'root: false\ntargets: ["*"]\nagentsmd:\n  subprojectPath: services/svc1',
+      );
+      await writeFileContent(join(testDir, "services", "svc1", "AGENTS.md"), "body\n");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(warnings().some((message) => message.includes("files outside the root file"))).toBe(
+        false,
+      );
+    });
+
+    it("should warn about Pi's APPEND_SYSTEM.md instead of listing its rule as folded", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["pi"]');
+      await writeRule("append.md", 'root: false\ntargets: ["pi"]\npi:\n  systemPrompt: append');
+      await writeFileContent(join(testDir, ".pi", "APPEND_SYSTEM.md"), "body\n");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "pi" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(warnings().some((message) => message.includes("already folded from"))).toBe(false);
+      const warning = warnings().find((message) => message.includes("files outside the root file"));
+      expect(warning).toContain("APPEND_SYSTEM.md files");
+      expect(warning).toContain("append.md");
+    });
+
+    it("should list rules folded into Pi's AGENTS.override.md as folded", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["pi"]\npi:\n  contextFile: override');
+      await writeRule("style.md", 'root: false\ntargets: ["pi"]\npi:\n  contextFile: override');
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "pi" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      const warning = warnings().find((message) => message.includes("already folded from"));
+      expect(warning).toContain("style.md");
+    });
+
+    it("should list a non-root rule whose Pi contextFile the root rule overrides as folded", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["pi"]');
+      await writeRule("style.md", 'root: false\ntargets: ["pi"]\npi:\n  contextFile: override');
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "pi" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      const warning = warnings().find((message) => message.includes("already folded from"));
+      expect(warning).toContain("style.md");
+      expect(warnings().some((message) => message.includes("pi.contextFile is set"))).toBe(false);
+    });
+
+    it("should list a localRoot rule appended to the root file as folded despite its subprojectPath", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule(
+        "local.md",
+        'root: false\nlocalRoot: true\ntargets: ["codexcli"]\nagentsmd:\n  subprojectPath: services/svc1',
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      const warning = warnings().find((message) => message.includes("already folded from"));
+      expect(warning).toContain("local.md");
+    });
+
+    it("should list only one localRoot rule as folded, since generate rejects several", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule("local-a.md", 'root: false\nlocalRoot: true\ntargets: ["codexcli"]');
+      await writeRule("local-b.md", 'root: false\nlocalRoot: true\ntargets: ["codexcli"]');
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      const warning = warnings().find((message) => message.includes("already folded from"));
+      expect(warning).toContain("local-a.md");
+      expect(warning).not.toContain("local-b.md");
+    });
+
+    it("should not list a localRoot rule as folded when includeLocalRoot is false", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule("local.md", 'root: false\nlocalRoot: true\ntargets: ["codexcli"]');
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codexcli",
+        featureOptions: { includeLocalRoot: false },
+      });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(warnings().some((message) => message.includes("already folded from"))).toBe(false);
+    });
+
+    it("should treat subprojectPath './' as the root file", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule(
+        "here.md",
+        'root: false\ntargets: ["codexcli"]\nagentsmd:\n  subprojectPath: ./',
+      );
+      await writeFileContent(join(testDir, "AGENTS.md"), "body\n");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      const warning = warnings().find((message) => message.includes("already folded from"));
+      expect(warning).toContain("here.md");
+      expect(warnings().some((message) => message.includes("files outside the root file"))).toBe(
+        false,
+      );
+    });
+
+    it("should list a directory-scoped rule as folded in global mode", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule(
+        "svc1.md",
+        'root: false\ntargets: ["codexcli"]\nagentsmd:\n  subprojectPath: services/svc1',
+      );
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codexcli",
+        global: true,
+      });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      const warning = warnings().find((message) => message.includes("already folded from"));
+      expect(warning).toContain("svc1.md");
+    });
+
+    it("should not list a localRoot rule written to a separate local file as folded", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["crush"]');
+      await writeRule("local.md", 'root: false\nlocalRoot: true\ntargets: ["crush"]');
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "crush" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(warnings().some((message) => message.includes("already folded from"))).toBe(false);
+    });
+
+    it("should not warn when the nested file does not exist yet", async () => {
+      await writeRule("root.md", 'root: true\ntargets: ["codexcli"]');
+      await writeRule(
+        "svc1.md",
+        'root: false\ntargets: ["codexcli"]\nagentsmd:\n  subprojectPath: services/svc1',
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(warnings().some((message) => message.includes("files outside the root file"))).toBe(
+        false,
+      );
+    });
+  });
+
+  describe("warnForFoldImportDuplicationRisk", () => {
+    it("should warn that importing a fold target duplicates its already-folded non-root rules", async () => {
+      // codexcli concatenates every non-root rule into its single AGENTS.md
+      // root output (`collisionPolicy: "fold"`). Importing that root file
+      // back re-adds the folded content as one new rulesync rule while
+      // style.md stays untouched, so the next generate folds both together.
+      await ensureDir(join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH));
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "root.md"),
+        `---\nroot: true\ntargets: ["codexcli"]\n---\n# Overview\n`,
+      );
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "style.md"),
+        `---\nroot: false\ntargets: ["codexcli"]\n---\nstyle body\n`,
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      const warning = logger.warn.mock.calls
+        .map(([message]) => String(message))
+        .find((message) => message.includes("will re-add content already folded from"));
+      expect(warning).toBeDefined();
+      expect(warning).toContain("style.md");
+      expect(warning).toContain("rulesync generate --targets codexcli");
+    });
+
+    it("should not warn about fold duplication when no non-root rules exist", async () => {
+      await ensureDir(join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH));
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "root.md"),
+        `---\nroot: true\ntargets: ["codexcli"]\n---\n# Overview\n`,
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("will re-add content already folded from"),
+      );
+    });
+
+    it("should not warn about fold duplication for a non-fold target", async () => {
+      await ensureDir(join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH));
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "root.md"),
+        `---\nroot: true\ntargets: ["cursor"]\n---\n# Overview\n`,
+      );
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "style.md"),
+        `---\nroot: false\ntargets: ["cursor"]\n---\nstyle body\n`,
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "cursor" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("will re-add content already folded from"),
+      );
+    });
+
+    it("should not emit loadRulesyncFiles's 'no root rule found' warning, since this runs before the imported root file is written", async () => {
+      // `rulesync import` calls this before writing the imported root file to
+      // `.rulesync/rules/`, so at this point no rule targets codexcli yet —
+      // that's expected and not something to warn about here. A rule for an
+      // unrelated tool is present so `loadRulesyncFiles`'s "no root rule
+      // found" check (which fires whenever `.rulesync/rules/` is non-empty
+      // but has no root targeting this tool) would otherwise trip.
+      await ensureDir(join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH));
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "other-tool-root.md"),
+        `---\nroot: true\ntargets: ["cursor"]\n---\n# Overview\n`,
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("No root rulesync rule file found"),
+      );
+    });
+
+    it("should not throw on a pre-existing localRoot misconfiguration targeting this tool", async () => {
+      // `loadRulesyncFiles` throws when a `localRoot: true` rule exists for
+      // this target without an accompanying `root: true` rule. That
+      // validation is for `generate`-time correctness; a fold-duplication
+      // check during `import` must not fail the whole import over it.
+      await ensureDir(join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH));
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "orphaned-local-root.md"),
+        `---\nroot: false\nlocalRoot: true\ntargets: ["codexcli"]\n---\nlocal body\n`,
+      );
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await expect(processor.warnForFoldImportDuplicationRisk()).resolves.toBeUndefined();
+    });
+
+    it("should not warn about fold duplication for a localRoot rule in global mode, since generate ignores localRoot there", async () => {
+      // `loadRulesyncFiles`'s global-mode branch excludes `localRoot: true`
+      // rules from `nonRootRules` because `generate` ignores `localRoot`
+      // entirely in global mode, so such a rule is never actually folded
+      // into the global root output. This check must mirror that exclusion.
+      expect(globalFoldTargets).toContain("codexcli");
+
+      await ensureDir(join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH));
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "orphaned-local-root.md"),
+        `---\nroot: false\nlocalRoot: true\ntargets: ["codexcli"]\n---\nlocal body\n`,
+      );
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codexcli",
+        global: true,
+      });
+      await processor.warnForFoldImportDuplicationRisk();
+
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("will re-add content already folded from"),
+      );
+    });
   });
 
   describe("loadToolFiles with forDeletion: true", () => {
+    it.skipIf(process.platform === "win32").each([false, true])(
+      "should not follow linked non-root rule directories for deletion (global: %s)",
+      async (global) => {
+        const { testDir: outputRoot, cleanup: cleanupOutputRoot } = await setupTestDirectory({
+          home: global,
+        });
+        try {
+          const rulesDir = join(outputRoot, ".claude", "rules");
+          const sharedDir = join(outputRoot, "shared", "rules");
+          await writeFileContent(join(sharedDir, "shared.md"), "# Shared Rule");
+          await writeFileContent(join(rulesDir, "nested", "local.md"), "# Local Rule");
+          await symlink(sharedDir, join(rulesDir, "linked"), "dir");
+
+          const processor = new RulesProcessor({
+            logger,
+            outputRoot,
+            toolTarget: "claudecode",
+            global,
+          });
+
+          const imported = await processor.loadToolFiles();
+          expect(imported.map((file) => file.getRelativeFilePath()).toSorted()).toEqual([
+            join("linked", "shared.md"),
+            join("nested", "local.md"),
+          ]);
+
+          const filesToDelete = await processor.loadToolFiles({ forDeletion: true });
+          expect(filesToDelete.map((file) => file.getRelativeFilePath())).toEqual([
+            join("nested", "local.md"),
+          ]);
+        } finally {
+          await cleanupOutputRoot();
+        }
+      },
+    );
+
     it("should return nested non-root files for deletion", async () => {
       await ensureDir(join(testDir, ".cursor", "rules", "frontend"));
       await writeFileContent(
@@ -1292,20 +2341,25 @@ describe("RulesProcessor", () => {
         "agentsmd",
         "augmentcode",
         "augmentcode-legacy",
+        "bob",
         "claudecode",
         "claudecode-legacy",
         "cline",
         "copilot",
         "cursor",
         "codexcli",
+        "commandcode",
         "junie",
         "kiro",
         "opencode",
         "qwencode",
         "roo",
         "zoocode",
+        "tabnine",
         "takt",
+        "trae",
         "warp",
+        "xum",
         "devin",
       ];
 
@@ -1486,6 +2540,20 @@ Content that would fail parsing`;
       expect(filePaths).toContain("AGENTS.local.md");
     });
 
+    it("should include REASONIX.local.md for deletion for reasonix", async () => {
+      await writeFileContent(join(testDir, "REASONIX.md"), "# Root");
+      await writeFileContent(join(testDir, "REASONIX.local.md"), "# Local");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "reasonix" });
+
+      const filesToDelete = await processor.loadToolFiles({
+        forDeletion: true,
+      });
+
+      const filePaths = filesToDelete.map((f) => f.getRelativeFilePath());
+      expect(filePaths).toContain("REASONIX.local.md");
+    });
+
     it("should include AGENTS.local.md for deletion for roo (issue #2409)", async () => {
       await ensureDir(join(testDir, ".roo", "rules"));
       await writeFileContent(join(testDir, "AGENTS.local.md"), "# Local");
@@ -1567,15 +2635,24 @@ Content that would fail parsing`;
         "antigravity-cli",
         "antigravity-ide",
         "augmentcode",
+        "bob",
         "claudecode",
         "claudecode-legacy",
         "cline",
+        "codebuddy",
+        "codebuff",
+        "codewhale",
         "codexcli",
+        "commandcode",
+        "continue",
         "copilot",
         "copilotcli",
+        "crush",
         "deepagents",
         "factorydroid",
+        "firebender",
         "goose",
+        "gitlabduo",
         "grokcli",
         "junie",
         "kilo",
@@ -1583,28 +2660,42 @@ Content that would fail parsing`;
         "kiro",
         "kiro-cli",
         "kiro-ide",
+        "mimocode",
+        "omp",
         "opencode",
+        "openclaw",
         "pi",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "roo",
         "rovodev",
         "zoocode",
+        "tabnine",
         "takt",
         "vibe",
         "warp",
+        "xum",
         "devin",
+        "zcode",
         "zed",
+        "dsh",
       ]);
     });
 
-    it("should return a subset of regular tool targets", () => {
+    it("should return a subset of regular tool targets, except global-only ones", () => {
       const globalTargets = RulesProcessor.getToolTargets({ global: true });
       const regularTargets = RulesProcessor.getToolTargets();
 
-      // All global targets should be in regular targets
+      // All global targets but the global-only ones should be in regular targets
+      const globalOnlyTargets = ["codebuff"];
       for (const target of globalTargets) {
-        expect(regularTargets).toContain(target);
+        if (globalOnlyTargets.includes(target)) {
+          expect(regularTargets).not.toContain(target);
+        } else {
+          expect(regularTargets).toContain(target);
+        }
       }
 
       // Global targets should be fewer than regular targets
@@ -1619,12 +2710,16 @@ Content that would fail parsing`;
       expect(globalTargets).toContain("antigravity-cli");
       expect(globalTargets).toContain("antigravity-ide");
       expect(globalTargets).toContain("augmentcode");
+      expect(globalTargets).toContain("bob");
+      expect(globalTargets).toContain("tabnine");
       expect(globalTargets).toContain("claudecode");
       expect(globalTargets).toContain("claudecode-legacy");
       expect(globalTargets).toContain("cline");
+      expect(globalTargets).toContain("codebuddy");
       expect(globalTargets).toContain("codexcli");
       expect(globalTargets).toContain("copilot");
       expect(globalTargets).toContain("copilotcli");
+      expect(globalTargets).toContain("crush");
       expect(globalTargets).toContain("deepagents");
       expect(globalTargets).toContain("factorydroid");
       expect(globalTargets).toContain("junie");
@@ -1632,6 +2727,8 @@ Content that would fail parsing`;
       expect(globalTargets).toContain("kimi-code");
       expect(globalTargets).toContain("goose");
       expect(globalTargets).toContain("grokcli");
+      expect(globalTargets).toContain("gitlabduo");
+      expect(globalTargets).toContain("mimocode");
       expect(globalTargets).toContain("opencode");
       expect(globalTargets).toContain("pi");
       expect(globalTargets).toContain("roo");
@@ -1645,11 +2742,19 @@ Content that would fail parsing`;
       expect(globalTargets).toContain("kiro-ide");
       expect(globalTargets).toContain("reasonix");
       expect(globalTargets).toContain("warp");
-      expect(globalTargets.length).toBe(32);
+      expect(globalTargets).toContain("pool");
+      expect(globalTargets).toContain("dsh");
+      expect(globalTargets).toContain("continue");
+      expect(globalTargets).toContain("commandcode");
+      expect(globalTargets).toContain("openclaw");
+      expect(globalTargets).toContain("qoder");
+      expect(globalTargets).toContain("xum");
+      expect(globalTargets.length).toBe(50);
 
       // These targets should NOT be in global mode
       expect(globalTargets).not.toContain("cursor");
       expect(globalTargets).not.toContain("hermesagent");
+      expect(globalTargets).not.toContain("trae");
     });
   });
 
@@ -1825,6 +2930,33 @@ Content that would fail parsing`;
   });
 
   describe("convertRulesyncFilesToToolFiles collision handling", () => {
+    it("should compose antigravity-plugin root fragments under one trigger block", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "antigravity-plugin",
+      });
+      const rulesyncRules = ["10-first-root.md", "20-second-root.md"].map(
+        (relativeFilePath, index) =>
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+            relativeFilePath,
+            frontmatter: { root: true, targets: ["*"] },
+            body: `# Root Fragment ${index + 1}`,
+          }),
+      );
+
+      const result = await processor.convertRulesyncFilesToToolFiles(rulesyncRules);
+
+      expect(result).toHaveLength(1);
+      expect(result[0]?.getRelativeDirPath()).toBe("rules");
+      expect(result[0]?.getRelativeFilePath()).toBe("AGENTS.md");
+      expect(result[0]?.getFileContent()).toBe(
+        "---\ntrigger: always_on\n---\n# Root Fragment 1\n\n# Root Fragment 2\n",
+      );
+    });
+
     it.each(["devin", "antigravity-ide"] as const)(
       "should warn for metadata-bearing project rules normalized to the same %s path",
       async (toolTarget) => {
@@ -1951,6 +3083,86 @@ Content that would fail parsing`;
         );
       },
     );
+
+    it("should compose a derived subprojectPath with an explicit one exactly like two explicit ones", async () => {
+      // The path is resolved on the rulesync rule before any target sees it, so
+      // a rule that derived `packages/app` from its globs collides with a rule
+      // that spelled it out the same way two explicit rules do: composed in
+      // source order for `agentsmd`.
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "agentsmd",
+      });
+      const rulesyncRules = [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "first.md",
+          frontmatter: {
+            root: false,
+            targets: ["agentsmd"],
+            agentsmd: { subprojectPath: "packages/app" },
+          },
+          body: "# First Subproject Rule",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "second.md",
+          frontmatter: {
+            root: false,
+            targets: ["agentsmd"],
+            globs: ["packages/app/**/*"],
+            agentsmd: { subprojectPath: "auto" },
+          },
+          body: "# Second Subproject Rule",
+        }),
+      ];
+
+      const result = await processor.convertRulesyncFilesToToolFiles(rulesyncRules);
+      const composedRules = result.filter(
+        (file) => file.getRelativeDirPath() === join("packages", "app"),
+      );
+
+      expect(composedRules).toHaveLength(1);
+      expect(composedRules[0]?.getRelativeFilePath()).toBe("AGENTS.md");
+      expect(composedRules[0]?.getFileContent()).toBe(
+        "# First Subproject Rule\n\n# Second Subproject Rule",
+      );
+    });
+
+    it("should derive subprojectPath from globs for loaded rules when deriveSubprojectPathFromGlobs is on", async () => {
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "api.md"),
+        `---
+root: false
+targets: ["agentsmd"]
+globs: ["packages/api/**/*"]
+---
+# API scoped`,
+      );
+
+      const deriving = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "agentsmd",
+        deriveSubprojectPathFromGlobs: true,
+      });
+      const derived = await deriving.convertRulesyncFilesToToolFiles(
+        await deriving.loadRulesyncFiles(),
+      );
+      expect(
+        derived.map((file) => join(file.getRelativeDirPath(), file.getRelativeFilePath())),
+      ).toEqual([join("packages", "api", "AGENTS.md")]);
+
+      // Off by default: the same rule stays in the modular directory.
+      const plain = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "agentsmd" });
+      const kept = await plain.convertRulesyncFilesToToolFiles(await plain.loadRulesyncFiles());
+      expect(
+        kept.map((file) => join(file.getRelativeDirPath(), file.getRelativeFilePath())),
+      ).toEqual([join(".agents", "memories", "api.md")]);
+    });
 
     it("should not compose amp fragments that carry a globs frontmatter gate", async () => {
       // Amp gates non-root files on a leading `globs:` frontmatter block
@@ -2174,6 +3386,358 @@ Content that would fail parsing`;
     });
   });
 
+  describe("codexcli project instruction budget", () => {
+    const budgetWarnings = () =>
+      logger.warn.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes("project_doc_max_bytes"));
+
+    const rule = ({
+      name,
+      body,
+      root = false,
+      subprojectPath,
+    }: {
+      name: string;
+      body: string;
+      root?: boolean;
+      subprojectPath?: string;
+    }) =>
+      new RulesyncRule({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+        relativeFilePath: name,
+        frontmatter: {
+          root,
+          targets: ["*"],
+          ...(subprojectPath ? { agentsmd: { subprojectPath } } : {}),
+        },
+        body,
+      });
+
+    it("should warn when the folded root AGENTS.md exceeds 32 KiB", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(20000), root: true }),
+        rule({ name: "svc1.md", body: "b".repeat(20000) }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("root instruction file (AGENTS.md) is 40003 bytes");
+      expect(warnings[0]).toContain("32768");
+    });
+
+    it("should not warn when the written root AGENTS.md is exactly 32 KiB", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      // The writer appends a trailing newline, so this writes 32,768 bytes.
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(32767), root: true }),
+      ]);
+
+      expect(budgetWarnings()).toHaveLength(0);
+    });
+
+    it("should warn at one byte over 32 KiB", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(32768), root: true }),
+      ]);
+
+      expect(budgetWarnings()).toHaveLength(1);
+    });
+
+    it("should measure the budget in UTF-8 bytes, not characters", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      // 11,000 characters, but 33,000 bytes (plus the trailing newline): each
+      // character is 3 bytes in UTF-8.
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "\u3042".repeat(11000), root: true }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("33001 bytes");
+    });
+
+    it("should not warn in global mode, where the personal AGENTS.md is outside the project budget", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codexcli",
+        global: true,
+      });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(40000), root: true }),
+      ]);
+
+      expect(budgetWarnings()).toHaveLength(0);
+    });
+
+    it("should emit a directory-scoped rule as a nested AGENTS.md instead of folding it", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(20000), root: true }),
+        rule({ name: "svc1.md", body: "b".repeat(20000), subprojectPath: "services/svc1" }),
+      ]);
+
+      const paths = result.map((file) =>
+        join(file.getRelativeDirPath(), file.getRelativeFilePath()),
+      );
+      expect(paths).toEqual(["AGENTS.md", join("services", "svc1", "AGENTS.md")]);
+      expect(result[0]?.getFileContent()).toBe("a".repeat(20000));
+    });
+
+    it("should warn about a nested chain whose files together exceed 32 KiB", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(20000), root: true }),
+        rule({ name: "svc1.md", body: "b".repeat(20000), subprojectPath: "services/svc1" }),
+        rule({ name: "svc2.md", body: "c".repeat(1000), subprojectPath: "services/svc2" }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("'services/svc1'");
+      expect(warnings[0]).toContain("AGENTS.md, services/svc1/AGENTS.md");
+      expect(warnings[0]).toContain("40002 bytes");
+    });
+
+    it("should treat a trailing slash in subprojectPath as the same directory", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(20000), root: true }),
+        rule({ name: "svc1.md", body: "b".repeat(20000), subprojectPath: "services/svc1/" }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("'services/svc1'");
+      expect(warnings[0]).toContain("40002 bytes");
+    });
+
+    it("should name the output root when it is not the current directory", async () => {
+      const outputRoot = join(testDir, "packages", "app");
+      const processor = new RulesProcessor({ logger, outputRoot, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(40000), root: true }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(`under '${outputRoot}'`);
+    });
+
+    it("should report a nested chain once, at its shallowest over-budget directory", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(20000), root: true }),
+        rule({ name: "svc1.md", body: "b".repeat(20000), subprojectPath: "services/svc1" }),
+        rule({ name: "svc1-api.md", body: "c".repeat(100), subprojectPath: "services/svc1/api" }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("'services/svc1'");
+    });
+
+    it("should sum every file on a grandchild chain", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(12000), root: true }),
+        rule({ name: "svc1.md", body: "b".repeat(12000), subprojectPath: "services/svc1" }),
+        rule({ name: "svc1-api.md", body: "c".repeat(12000), subprojectPath: "services/svc1/api" }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("'services/svc1/api'");
+      expect(warnings[0]).toContain(
+        "AGENTS.md, services/svc1/AGENTS.md, services/svc1/api/AGENTS.md",
+      );
+      expect(warnings[0]).toContain("36003 bytes");
+    });
+
+    it("should count the language block appended to the root file", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codexcli",
+        language: "ja",
+      });
+
+      // Fits on its own; the appended language block pushes it over.
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(32767), root: true }),
+      ]);
+
+      expect(budgetWarnings()).toHaveLength(1);
+    });
+
+    it("should name the default limit when .codex/config.toml does not raise it", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(40000), root: true }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("over the 32768-byte default limit");
+      expect(warnings[0]).toContain("only if the project is trusted");
+      expect(warnings[0]).toContain(
+        "ignore this warning if you already raised `project_doc_max_bytes` there",
+      );
+    });
+
+    it("should use project_doc_max_bytes from .codex/config.toml as the budget", async () => {
+      await writeFileContent(
+        join(testDir, ".codex", "config.toml"),
+        'model = "gpt-5"\nproject_doc_max_bytes = 131072\n',
+      );
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(40000), root: true }),
+        rule({ name: "svc1.md", body: "b".repeat(40000), subprojectPath: "services/svc1" }),
+      ]);
+
+      expect(budgetWarnings()).toHaveLength(0);
+    });
+
+    it("should warn against the configured budget and name where it came from", async () => {
+      await writeFileContent(
+        join(testDir, ".codex", "config.toml"),
+        "project_doc_max_bytes = 50000\n",
+      );
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(60000), root: true }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(
+        "over the 50000-byte limit set by `project_doc_max_bytes` in `.codex/config.toml` (honored only if the project is trusted)",
+      );
+      expect(warnings[0]).not.toContain("~/.codex/config.toml");
+    });
+
+    it("should say project docs are disabled when project_doc_max_bytes is 0", async () => {
+      await writeFileContent(join(testDir, ".codex", "config.toml"), "project_doc_max_bytes = 0\n");
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "small", root: true }),
+        rule({ name: "svc1.md", body: "b".repeat(40000), subprojectPath: "services/svc1" }),
+      ]);
+
+      const warnings = budgetWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain(
+        "`project_doc_max_bytes` in `.codex/config.toml` (honored only if the project is trusted) is set to 0",
+      );
+      expect(warnings[0]).toContain("disables codexcli's project instruction files");
+      expect(warnings[0]).toContain("AGENTS.md, services/svc1/AGENTS.md will not be loaded");
+      expect(warnings[0]).not.toContain("byte default limit");
+    });
+
+    it("should not warn when project_doc_max_bytes is 0 and no rule is generated", async () => {
+      await writeFileContent(join(testDir, ".codex", "config.toml"), "project_doc_max_bytes = 0\n");
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([]);
+
+      expect(budgetWarnings()).toHaveLength(0);
+    });
+
+    it("should read the configured budget from the output root's .codex/config.toml", async () => {
+      const outputRoot = join(testDir, "packages", "app");
+      await writeFileContent(
+        join(outputRoot, ".codex", "config.toml"),
+        "project_doc_max_bytes = 131072\n",
+      );
+      const processor = new RulesProcessor({ logger, outputRoot, toolTarget: "codexcli" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(40000), root: true }),
+      ]);
+
+      expect(budgetWarnings()).toHaveLength(0);
+    });
+
+    it("should not warn for targets without an instruction budget", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "pool" });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(40000), root: true }),
+      ]);
+
+      expect(budgetWarnings()).toHaveLength(0);
+    });
+  });
+
+  describe("kimi-code-plugin SYSTEM.md size limit", () => {
+    const sizeWarnings = () =>
+      logger.warn.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes("systemPromptPath"));
+
+    const rule = ({ name, body, root = false }: { name: string; body: string; root?: boolean }) =>
+      new RulesyncRule({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+        relativeFilePath: name,
+        frontmatter: { root, targets: ["*"] },
+        body,
+      });
+
+    it("should warn when the folded SYSTEM.md exceeds 32 KiB", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "kimi-code-plugin",
+      });
+
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(20000), root: true }),
+        rule({ name: "style.md", body: "b".repeat(20000) }),
+      ]);
+
+      const warnings = sizeWarnings();
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain("root instruction file (SYSTEM.md)");
+      expect(warnings[0]).toContain("32768");
+    });
+
+    it("should not warn when the written SYSTEM.md is exactly 32 KiB", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "kimi-code-plugin",
+      });
+
+      // The writer appends a trailing newline, so this writes 32,768 bytes.
+      await processor.convertRulesyncFilesToToolFiles([
+        rule({ name: "overview.md", body: "a".repeat(32767), root: true }),
+      ]);
+
+      expect(sizeWarnings()).toHaveLength(0);
+    });
+  });
+
   describe("reasonix nested instruction files", () => {
     it("should import nested REASONIX.md files alongside the root", async () => {
       await writeFileContent(join(testDir, "REASONIX.md"), "# Root");
@@ -2372,6 +3936,67 @@ Content that would fail parsing`;
       const localRule = findLocalRule(rulesyncFiles, "AGENTS.local.md");
       expect(localRule).toBeInstanceOf(RulesyncRule);
       expect((localRule as RulesyncRule).getFrontmatter().localRoot).toBe(true);
+    });
+
+    it("should import AGENTS.local.md as a localRoot rulesync rule for dsh (issue #3526)", async () => {
+      await writeFileContent(join(testDir, "AGENTS.md"), "# Root");
+      await writeFileContent(join(testDir, "AGENTS.local.md"), "# Personal dsh rules");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "dsh" });
+      const rulesyncFiles = await processor.convertToolFilesToRulesyncFiles(
+        await processor.loadToolFiles(),
+      );
+
+      const localRule = findLocalRule(rulesyncFiles, "AGENTS.local.md");
+      expect(localRule).toBeInstanceOf(RulesyncRule);
+      expect((localRule as RulesyncRule).getFrontmatter().localRoot).toBe(true);
+      expect((localRule as RulesyncRule).getFrontmatter().targets).toEqual(["dsh"]);
+      expect((localRule as RulesyncRule).getBody()).toBe("# Personal dsh rules");
+    });
+
+    it("should round-trip the dsh AGENTS.local.md through import and generate (issue #3526)", async () => {
+      await writeFileContent(join(testDir, "AGENTS.md"), "# Root");
+      await writeFileContent(join(testDir, "AGENTS.local.md"), "# Personal dsh rules");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "dsh" });
+      const rulesyncFiles = await processor.convertToolFilesToRulesyncFiles(
+        await processor.loadToolFiles(),
+      );
+      const regenerated = await processor.convertRulesyncFilesToToolFiles(rulesyncFiles);
+
+      const localFile = regenerated.find((r) => r.getRelativeFilePath() === "AGENTS.local.md");
+      expect(localFile?.getRelativeDirPath()).toBe(".");
+      expect(localFile?.getFileContent().trim()).toBe("# Personal dsh rules");
+      const rootFile = regenerated.find((r) => r.getRelativeFilePath() === "AGENTS.md");
+      expect(rootFile?.getFileContent()).toContain("# Root");
+      expect(rootFile?.getFileContent()).not.toContain("# Personal dsh rules");
+    });
+
+    it("should list the dsh AGENTS.local.md as a deletion candidate (issue #3526)", async () => {
+      await writeFileContent(join(testDir, "AGENTS.md"), "# Root");
+      await writeFileContent(join(testDir, "AGENTS.local.md"), "# Personal dsh rules");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "dsh" });
+      const forDeletion = await processor.loadToolFiles({ forDeletion: true });
+      const deletionPaths = forDeletion.map((file) =>
+        join(file.getRelativeDirPath(), file.getRelativeFilePath()),
+      );
+      expect(deletionPaths).toContain("AGENTS.local.md");
+    });
+
+    it("should import REASONIX.local.md as a localRoot rulesync rule for reasonix", async () => {
+      await writeFileContent(join(testDir, "REASONIX.md"), "# Root");
+      await writeFileContent(join(testDir, "REASONIX.local.md"), "# Personal reasonix rules");
+
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "reasonix" });
+      const rulesyncFiles = await processor.convertToolFilesToRulesyncFiles(
+        await processor.loadToolFiles(),
+      );
+
+      const localRule = findLocalRule(rulesyncFiles, "REASONIX.local.md");
+      expect(localRule).toBeInstanceOf(RulesyncRule);
+      expect((localRule as RulesyncRule).getFrontmatter().localRoot).toBe(true);
+      expect((localRule as RulesyncRule).getFrontmatter().targets).toEqual(["reasonix"]);
     });
 
     it("should import .claude/CLAUDE.local.md from the alternative root directory", async () => {
@@ -2830,6 +4455,69 @@ targets: ["*"]
       expect(rootRule?.getFileContent()).not.toContain("# Personal overrides");
     });
 
+    it("should generate AGENTS.local.md for dsh instead of folding it into AGENTS.md (issue #3526)", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "dsh" });
+
+      const rulesyncRules = [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { root: true, targets: ["dsh"] },
+          body: "# Root",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "local.md",
+          frontmatter: { localRoot: true, targets: ["dsh"] },
+          body: "# Personal overrides",
+        }),
+      ];
+
+      const result = await processor.convertRulesyncFilesToToolFiles(rulesyncRules);
+
+      const localRule = result.find((r) => r.getRelativeFilePath() === "AGENTS.local.md");
+      expect(localRule).toBeDefined();
+      expect(localRule?.getRelativeDirPath()).toBe(".");
+      expect(localRule?.getFileContent()).toBe("# Personal overrides");
+      const rootRule = result.find((r) => r.getRelativeFilePath() === "AGENTS.md");
+      expect(rootRule?.getFileContent()).not.toContain("# Personal overrides");
+    });
+
+    it("should not emit AGENTS.local.md for dsh in global mode (issue #3526)", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "dsh",
+        global: true,
+      });
+
+      const rulesyncRules = [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { root: true, targets: ["dsh"] },
+          body: "# Root",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "local.md",
+          frontmatter: { localRoot: true, targets: ["dsh"] },
+          body: "# Personal overrides",
+        }),
+      ];
+
+      const result = await processor.convertRulesyncFilesToToolFiles(rulesyncRules);
+
+      expect(result.some((r) => r.getRelativeFilePath() === "AGENTS.local.md")).toBe(false);
+      const rootRule = result.find((r) => r.getRelativeFilePath() === "AGENTS.md");
+      expect(rootRule?.getRelativeDirPath()).toBe(".dsh");
+      expect(rootRule?.getFileContent()).not.toContain("# Personal overrides");
+    });
+
     it("should append localRoot content to root file for other tools", async () => {
       const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "copilot" });
 
@@ -2965,6 +4653,328 @@ targets: ["*"]
       await expect(processor.convertRulesyncFilesToToolFiles(rulesyncRules)).rejects.toThrow(
         /includeLocalRoot.*must be a boolean/,
       );
+    });
+
+    describe("includeRoot option", () => {
+      const buildRules = () => [
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "root.md",
+          frontmatter: { root: true, targets: ["*"] },
+          body: "# Root content",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "local.md",
+          frontmatter: { localRoot: true, targets: ["*"] },
+          body: "# Local content",
+        }),
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "testing.md",
+          frontmatter: { targets: ["*"], globs: ["**/*.test.ts"] },
+          body: "# Testing content",
+        }),
+      ];
+
+      it("should omit CLAUDE.md and CLAUDE.local.md but keep non-root rules for claudecode", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false },
+        });
+
+        const result = await processor.convertRulesyncFilesToToolFiles(buildRules());
+
+        const ruleFiles = result.filter((file) => file instanceof ClaudecodeRule);
+        expect(ruleFiles).toHaveLength(1);
+        expect(ruleFiles[0]?.isRoot()).toBe(false);
+        expect(ruleFiles[0]?.getRelativeDirPath()).toBe(join(".claude", "rules"));
+        expect(ruleFiles[0]?.getRelativeFilePath()).toBe("testing.md");
+        expect(ruleFiles[0]?.getFileContent()).toContain("# Testing content");
+        expect(
+          result.find((file) =>
+            ["CLAUDE.md", "CLAUDE.local.md"].includes(file.getRelativeFilePath()),
+          ),
+        ).toBeUndefined();
+      });
+
+      it("should keep CLAUDE.md when includeRoot is explicitly true", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: true },
+        });
+
+        const result = await processor.convertRulesyncFilesToToolFiles(buildRules());
+
+        expect(result.find((file) => file.getRelativeFilePath() === "CLAUDE.md")).toBeDefined();
+        expect(
+          result.find((file) => file.getRelativeFilePath() === "CLAUDE.local.md"),
+        ).toBeDefined();
+      });
+
+      it("should keep the root file in global mode and warn", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          global: true,
+          featureOptions: { includeRoot: false },
+        });
+
+        const result = await processor.convertRulesyncFilesToToolFiles(buildRules());
+
+        expect(
+          result.find((file) => file instanceof ClaudecodeRule && file.isRoot()),
+        ).toBeDefined();
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("global mode"));
+      });
+
+      it("should ignore includeRoot on other targets and warn", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "copilot",
+          featureOptions: { includeRoot: false },
+        });
+
+        const result = await processor.convertRulesyncFilesToToolFiles(buildRules());
+
+        expect(result.find((file) => file instanceof CopilotRule && file.isRoot())).toBeDefined();
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("only supported by the claudecode target"),
+        );
+      });
+
+      it("should throw when includeRoot is not a boolean", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: "false" as unknown as boolean },
+        });
+
+        await expect(processor.convertRulesyncFilesToToolFiles(buildRules())).rejects.toThrow(
+          /includeRoot.*must be a boolean/,
+        );
+      });
+
+      it("should warn that ruleDiscoveryMode has no effect without the root file", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false, ruleDiscoveryMode: "explicit" },
+        });
+
+        await processor.convertRulesyncFilesToToolFiles(buildRules());
+
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("ruleDiscoveryMode"));
+      });
+
+      it("should ignore includeRoot on claudecode-legacy, whose memories need the root file", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode-legacy",
+          featureOptions: { includeRoot: false },
+        });
+
+        const result = await processor.convertRulesyncFilesToToolFiles(buildRules());
+
+        expect(
+          result.find((file) => file instanceof ClaudecodeLegacyRule && file.isRoot()),
+        ).toBeDefined();
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("only supported by the claudecode target"),
+        );
+      });
+
+      it("should keep a hand-authored .claude/CLAUDE.md out of the sweep and warn about it", async () => {
+        await writeFileContent(join(testDir, ".claude", "CLAUDE.md"), "# Hand-authored root");
+        await writeFileContent(
+          join(testDir, ".claude", "CLAUDE.local.md"),
+          "# Hand-authored local",
+        );
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false },
+        });
+
+        const existing = await processor.loadToolFiles({ forDeletion: true });
+
+        expect(
+          existing
+            .filter((file) => file.getRelativeDirPath() === ".claude")
+            .map((file) => file.getRelativeFilePath()),
+        ).toEqual([]);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(join(".claude", "CLAUDE.md")),
+        );
+        // `.claude/CLAUDE.local.md` does not shadow AGENTS.md, so it is not reported.
+        expect(logger.warn).not.toHaveBeenCalledWith(
+          expect.stringContaining(join(".claude", "CLAUDE.local.md")),
+        );
+      });
+
+      it("should warn during conversion about leftover root files when delete is off", async () => {
+        await writeFileContent(join(testDir, "CLAUDE.md"), "# Stale root");
+        await writeFileContent(join(testDir, "CLAUDE.local.md"), "# Stale local");
+        await writeFileContent(join(testDir, ".claude", "CLAUDE.md"), "# Hand-authored root");
+        await writeFileContent(
+          join(testDir, ".claude", "CLAUDE.local.md"),
+          "# Hand-authored local",
+        );
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false },
+        });
+
+        await processor.convertRulesyncFilesToToolFiles(buildRules());
+
+        const shadowingWarnings = vi
+          .mocked(logger.warn)
+          .mock.calls.map(([message]) => String(message))
+          .filter((message) => message.includes("from reading AGENTS.md"));
+        expect(shadowingWarnings).toHaveLength(1);
+        expect(shadowingWarnings[0]).toContain("CLAUDE.md");
+        expect(shadowingWarnings[0]).toContain("CLAUDE.local.md");
+        expect(shadowingWarnings[0]).toContain(join(".claude", "CLAUDE.md"));
+        expect(shadowingWarnings[0]).not.toContain(join(".claude", "CLAUDE.local.md"));
+        expect(shadowingWarnings[0]).toContain("Enable `delete`");
+      });
+
+      it("should leave leftover root files to the sweep's warning when delete is on", async () => {
+        await writeFileContent(join(testDir, "CLAUDE.md"), "# Stale root");
+        await writeFileContent(join(testDir, ".claude", "CLAUDE.md"), "# Hand-authored root");
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false },
+          delete: true,
+        });
+
+        await processor.convertRulesyncFilesToToolFiles(buildRules());
+        expect(logger.warn).not.toHaveBeenCalledWith(
+          expect.stringContaining("from reading AGENTS.md"),
+        );
+
+        await processor.loadToolFiles({ forDeletion: true });
+        const shadowingWarnings = vi
+          .mocked(logger.warn)
+          .mock.calls.map(([message]) => String(message))
+          .filter((message) => message.includes("from reading AGENTS.md"));
+        expect(shadowingWarnings).toHaveLength(1);
+        expect(shadowingWarnings[0]).toContain(join(".claude", "CLAUDE.md"));
+        expect(shadowingWarnings[0]).not.toContain("Enable `delete`");
+      });
+
+      it("should not warn about shadowing when no root file exists", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false },
+        });
+
+        await processor.convertRulesyncFilesToToolFiles(buildRules());
+
+        expect(logger.warn).not.toHaveBeenCalledWith(
+          expect.stringContaining("from reading AGENTS.md"),
+        );
+      });
+
+      it("should warn with the file name when a dropped root rule targets only claudecode", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false },
+        });
+
+        await processor.convertRulesyncFilesToToolFiles([
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+            relativeFilePath: "claude-only-root.md",
+            frontmatter: { root: true, targets: ["claudecode"] },
+            body: "# Claude-only root",
+          }),
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+            relativeFilePath: "claude-only-local.md",
+            frontmatter: { localRoot: true, targets: ["claudecode"] },
+            body: "# Claude-only local",
+          }),
+        ]);
+
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            "claude-only-root.md is a root rule that targets only claudecode",
+          ),
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            "claude-only-local.md is a root rule that targets only claudecode",
+          ),
+        );
+      });
+
+      it("should not warn about dropped root rules that another target still emits", async () => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false },
+        });
+
+        await processor.convertRulesyncFilesToToolFiles([
+          ...buildRules(),
+          new RulesyncRule({
+            outputRoot: testDir,
+            relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+            relativeFilePath: "shared-root.md",
+            frontmatter: { root: true, targets: ["claudecode", "agentsmd"] },
+            body: "# Shared root",
+          }),
+        ]);
+
+        expect(logger.warn).not.toHaveBeenCalledWith(
+          expect.stringContaining("targets only claudecode"),
+        );
+      });
+
+      it("should sweep a previously generated CLAUDE.md as an orphan", async () => {
+        await writeFileContent(join(testDir, "CLAUDE.md"), "# Stale root");
+        await writeFileContent(join(testDir, "CLAUDE.local.md"), "# Stale local");
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+          featureOptions: { includeRoot: false },
+        });
+
+        const generated = await processor.convertRulesyncFilesToToolFiles(buildRules());
+        const existing = await processor.loadToolFiles({ forDeletion: true });
+        const generatedPaths = new Set(generated.map((file) => file.getFilePath()));
+        const orphanPaths = existing
+          .filter((file) => !generatedPaths.has(file.getFilePath()))
+          .map((file) => file.getRelativeFilePath());
+
+        expect(orphanPaths).toEqual(expect.arrayContaining(["CLAUDE.md", "CLAUDE.local.md"]));
+      });
     });
 
     it("should coexist with ruleDiscoveryMode option", async () => {
@@ -3743,18 +5753,207 @@ targets: ["claudecode"]
       );
     });
 
+    it("should keep factorydroid output-style rules in global mode and drop only the other non-root rules", async () => {
+      await ensureDir(join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH));
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "root.md"),
+        `---
+root: true
+targets: ["factorydroid"]
+---
+# Root`,
+      );
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "review-notes.md"),
+        `---
+targets: ["factorydroid"]
+factorydroid:
+  channel: output-style
+---
+Start with findings.`,
+      );
+      await writeFileContent(
+        join(testDir, RULESYNC_RULES_RELATIVE_DIR_PATH, "non-root.md"),
+        `---
+targets: ["factorydroid"]
+---
+# Non-root`,
+      );
+
+      const warnSpy = vi.spyOn(logger, "warn");
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "factorydroid",
+        global: true,
+      });
+
+      // Factory documents `~/.factory/output-styles/` as the user scope of the
+      // output-styles surface, so that rule survives; the plain non-root rule
+      // has no global home and is still reported as ignored.
+      const result = await processor.loadRulesyncFiles();
+      expect(result.map((r) => r.getRelativeFilePath()).toSorted()).toEqual([
+        "review-notes.md",
+        "root.md",
+      ]);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("1 non-root rulesync rules found, but it's in global mode"),
+      );
+      expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining("review-notes.md"));
+
+      const toolFiles = await processor.convertRulesyncFilesToToolFiles(result);
+      expect(
+        toolFiles.map((file) => join(file.getRelativeDirPath(), file.getRelativeFilePath())),
+      ).toEqual(expect.arrayContaining([join(".factory", "output-styles", "review-notes.md")]));
+    });
+
+    it("should warn about factorydroid options that leak to other tools or are ignored", async () => {
+      const rules = [
+        new RulesyncRule({
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "leaky-style.md",
+          frontmatter: { root: false, targets: ["*"], factorydroid: { channel: "output-style" } },
+          body: "Start with findings.",
+        }),
+        new RulesyncRule({
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "scoped-style.md",
+          frontmatter: {
+            root: false,
+            targets: ["factorydroid"],
+            factorydroid: { channel: "output-style", name: "Scoped" },
+          },
+          body: "Start with findings.",
+        }),
+        new RulesyncRule({
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "default-targets-style.md",
+          frontmatter: { root: false, factorydroid: { channel: "output-style" } },
+          body: "Start with findings.",
+        }),
+        // Never reaches factorydroid, so its factorydroid keys are not reported.
+        new RulesyncRule({
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "claudecode-only.md",
+          frontmatter: {
+            root: false,
+            targets: ["claudecode"],
+            factorydroid: { channel: "output-style", name: "Elsewhere" },
+          },
+          body: "Start with findings.",
+        }),
+        new RulesyncRule({
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "design.md",
+          frontmatter: {
+            root: false,
+            targets: ["factorydroid"],
+            factorydroid: { channel: "design", name: "Unused" },
+          },
+          body: "# Design",
+        }),
+      ];
+
+      await new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "factorydroid",
+      }).convertRulesyncFilesToToolFiles(rules);
+
+      const warnings = logger.warn.mock.calls.map(([message]) => String(message));
+      expect(warnings.filter((message) => message.includes("also targets other tools"))).toEqual([
+        expect.stringContaining("leaky-style.md"),
+        expect.stringContaining("default-targets-style.md"),
+      ]);
+      expect(warnings.find((message) => message.includes("also targets other tools"))).toContain(
+        "keep the output style to Factory Droid.",
+      );
+      expect(warnings.filter((message) => message.includes("sets factorydroid.name"))).toEqual([
+        expect.stringContaining("design.md"),
+      ]);
+
+      // Other targets do not repeat the factorydroid-specific warnings.
+      logger.warn.mockClear();
+      await new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "claudecode",
+      }).convertRulesyncFilesToToolFiles(rules);
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("factorydroid"));
+    });
+
+    it("should warn about qoder output-style options that leak to other tools or are ignored", async () => {
+      const rules = [
+        new RulesyncRule({
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "leaky-style.md",
+          frontmatter: { root: false, targets: ["*"], qoder: { channel: "output-style" } },
+          body: "Start with findings.",
+        }),
+        new RulesyncRule({
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "scoped-style.md",
+          frontmatter: {
+            root: false,
+            targets: ["qoder"],
+            qoder: { channel: "output-style", name: "Scoped" },
+          },
+          body: "Start with findings.",
+        }),
+        new RulesyncRule({
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "topic.md",
+          frontmatter: { root: false, targets: ["qoder"], qoder: { name: "Unused" } },
+          body: "Topic",
+        }),
+      ];
+
+      const toolFiles = await new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "qoder",
+      }).convertRulesyncFilesToToolFiles(rules);
+
+      const warnings = logger.warn.mock.calls.map(([message]) => String(message));
+      expect(warnings.filter((message) => message.includes("also targets other tools"))).toEqual([
+        expect.stringContaining("leaky-style.md"),
+      ]);
+      expect(warnings.find((message) => message.includes("also targets other tools"))).toContain(
+        "keep the output style to Qoder.",
+      );
+      expect(warnings.filter((message) => message.includes("sets qoder.name"))).toEqual([
+        expect.stringContaining("topic.md"),
+      ]);
+      expect(
+        toolFiles
+          .filter((file) => file.getRelativeDirPath() === join(".qoder", "output-styles"))
+          .map((file) => file.getRelativeFilePath()),
+      ).toEqual(["leaky-style.md", "scoped-style.md"]);
+    });
+
     it("should expose every global-capable folded target to the regression matrix", () => {
       expect(globalFoldTargets).toEqual([
+        "codebuff",
+        "codewhale",
         "codexcli",
+        "commandcode",
+        "crush",
         "deepagents",
         "goose",
+        "gitlabduo",
         // `grokcli` left this list when it gained `.grok/rules/`.
         "junie",
         "kimi-code",
+        "openclaw",
         "pi",
+        "pool",
         "reasonix",
         "vibe",
         "warp",
+        "xum",
+        "zcode",
+        "dsh",
       ]);
     });
 
@@ -4148,6 +6347,494 @@ targets: ["*"]
             f.getRelativeFilePath() === "opencode.json",
         ),
       ).toBeUndefined();
+    });
+  });
+  describe("output roots that hold glob metacharacters", () => {
+    // Every scan below spells the project root into `findFilesByGlobs`'s `cwd`
+    // rather than into the pattern. Spelled into the pattern, `project(glob)` is
+    // a picomatch group and matches nothing at all -- and an empty scan is not a
+    // visible failure: on the input side it reads as "every rule was deleted",
+    // so `--delete` removes generated files it can no longer regenerate and the
+    // run still reports success.
+
+    it("should load rulesync rules from a root that holds glob metacharacters", async () => {
+      const literalRoot = join(testDir, "project(glob)");
+      await writeFileContent(
+        join(literalRoot, RULESYNC_RULES_RELATIVE_DIR_PATH, "overview.md"),
+        '---\nroot: true\ntargets: ["*"]\n---\n\nRoot rule',
+      );
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: literalRoot,
+        inputRoots: [join(literalRoot, RULESYNC_RELATIVE_DIR_PATH)],
+        toolTarget: "claudecode",
+      });
+
+      const rulesyncFiles = await processor.loadRulesyncFiles();
+
+      expect(rulesyncFiles.map((file) => file.getRelativeFilePath())).toEqual(["overview.md"]);
+    });
+
+    it("should load root and non-root tool files for deletion from such a root", async () => {
+      const literalRoot = join(testDir, "project{a,b}");
+      await writeFileContent(join(literalRoot, "CLAUDE.md"), "# Root");
+      await writeFileContent(join(literalRoot, ".claude", "rules", "detail.md"), "# Detail");
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: literalRoot,
+        toolTarget: "claudecode",
+      });
+
+      const filesToDelete = await processor.loadToolFiles({ forDeletion: true });
+
+      expect(filesToDelete.map((file) => file.getRelativeFilePath()).toSorted()).toEqual([
+        "CLAUDE.md",
+        "detail.md",
+      ]);
+    });
+
+    it("should find the local root file from such a root", async () => {
+      // `getLocalRootFileGlob` overrides where this one is looked for, so it
+      // takes a different path through the processor than the root file above.
+      const literalRoot = join(testDir, "project(glob)");
+      await writeFileContent(join(literalRoot, ".rovodev", "AGENTS.md"), "# Root");
+      await writeFileContent(join(literalRoot, "AGENTS.local.md"), "# Local root");
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: literalRoot,
+        toolTarget: "rovodev",
+      });
+
+      const filesToDelete = await processor.loadToolFiles({ forDeletion: true });
+
+      expect(filesToDelete.map((file) => file.getRelativeFilePath())).toContain("AGENTS.local.md");
+    });
+
+    it("should find nested subproject files from such a root", async () => {
+      const literalRoot = join(testDir, "project(glob)");
+      await writeFileContent(join(literalRoot, "AGENTS.md"), "# Root");
+      await writeFileContent(join(literalRoot, "packages", "api", "AGENTS.md"), "# Nested");
+
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: literalRoot,
+        toolTarget: "agentsmd",
+      });
+
+      const toolFiles = await processor.loadToolFiles();
+
+      expect(toolFiles.map((file) => file.getRelativeDirPath())).toContain(join("packages", "api"));
+    });
+
+    // `*` is not a legal filename character on Windows.
+    it.skipIf(process.platform === "win32")(
+      "should not sweep a sibling project when the root ends in a wildcard",
+      async () => {
+        // The false-positive side: a root read as a pattern reaches into the
+        // sibling `projectOTHERx`. Here the stray path does not survive as far
+        // as the deletion list -- `checkPathTraversal` rejects it and the whole
+        // scan is discarded -- so the visible damage is that the sweep silently
+        // finds nothing, not that it deletes a stranger's file. Either way the
+        // root must be a directory, not a pattern.
+        const literalRoot = join(testDir, "project*x");
+        await writeFileContent(join(literalRoot, "CLAUDE.md"), "# Mine");
+        await writeFileContent(
+          join(testDir, "projectOTHERx", ".claude", "rules", "theirs.md"),
+          "# Theirs",
+        );
+
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: literalRoot,
+          toolTarget: "claudecode",
+        });
+
+        const filesToDelete = await processor.loadToolFiles({ forDeletion: true });
+
+        expect(filesToDelete.map((file) => file.getRelativeFilePath())).toEqual(["CLAUDE.md"]);
+      },
+    );
+  });
+  describe("language", () => {
+    const rootRule = (body = "# Overview\n\nProject rules.") =>
+      new RulesyncRule({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+        relativeFilePath: "overview.md",
+        frontmatter: { root: true, targets: ["*"] },
+        body,
+      });
+    const nestedRule = () =>
+      new RulesyncRule({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+        relativeFilePath: "details.md",
+        frontmatter: { root: false, targets: ["*"] },
+        body: "# Details\n\nMore rules.",
+      });
+    it("appends the block to the root file only for a root-marking target", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "agentsmd",
+        language: "ja",
+      });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([rootRule(), nestedRule()]);
+
+      const root = result.find((file) => file.getRelativeFilePath() === "AGENTS.md");
+      const nested = result.find((file) => file.getRelativeFilePath() === "details.md");
+      expect(root?.getFileContent().endsWith(languageBlock("ja"))).toBe(true);
+      expect(root?.getFileContent().split("---")).toHaveLength(2);
+      expect(nested?.getFileContent()).not.toContain("You must always answer in");
+    });
+
+    it("appends the block after the reference section so it closes the file", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "copilot",
+        language: "fr",
+      });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([rootRule(), nestedRule()]);
+
+      const root = result.find((file) => file.getRelativeFilePath() === "copilot-instructions.md");
+      const content = root?.getFileContent() ?? "";
+      expect(content.indexOf("Project rules.")).toBeLessThan(
+        content.indexOf(buildLanguageInstruction("fr")),
+      );
+      expect(content.endsWith(buildLanguageInstruction("fr"))).toBe(true);
+    });
+
+    it("appends the block to the file produced from the root source for Cursor, after its frontmatter", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "cursor",
+        language: "ja",
+      });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([rootRule(), nestedRule()]);
+
+      const root = result.find((file) => file.getRelativeFilePath() === "overview.mdc");
+      const nested = result.find((file) => file.getRelativeFilePath() === "details.mdc");
+      expect(root?.getFileContent().startsWith("---\n")).toBe(true);
+      expect(root?.getFileContent().endsWith(languageBlock("ja"))).toBe(true);
+      expect(nested?.getFileContent()).not.toContain("You must always answer in");
+    });
+
+    it.each(
+      RulesProcessor.getToolTargets().filter(
+        (target) => target !== "claudecode" && target !== "claudecode-legacy",
+      ),
+    )(
+      "closes every file built from the root source, and no other, with one block for %s",
+      async (toolTarget) => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget,
+          language: "en",
+        });
+
+        const result = await processor.convertRulesyncFilesToToolFiles([rootRule(), nestedRule()]);
+
+        // The root body may land in more than one file (Rovo Dev mirrors its
+        // root to ./AGENTS.md); each such file ends with exactly one block, and
+        // the nested rule's file carries none.
+        const rootFiles = result.filter((file) => file.getFileContent().includes("Project rules."));
+        expect(rootFiles.length).toBeGreaterThanOrEqual(1);
+        for (const file of rootFiles) {
+          expect(file.getFileContent().endsWith(buildLanguageInstruction("en"))).toBe(true);
+          expect(file.getFileContent().split("You must always answer in")).toHaveLength(2);
+        }
+        for (const otherFile of result.filter((file) => !rootFiles.includes(file))) {
+          expect(otherFile.getFileContent()).not.toContain("You must always answer in");
+        }
+      },
+    );
+
+    it("emits the instruction alone when the root body is empty", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codexcli",
+        language: "ja",
+      });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([rootRule("")]);
+
+      expect(result[0]?.getFileContent()).toBe(buildLanguageInstruction("ja"));
+    });
+
+    it("appends nothing when language is unset", async () => {
+      const processor = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([rootRule()]);
+
+      expect(result[0]?.getFileContent()).toBe("# Overview\n\nProject rules.");
+    });
+
+    it.each(["claudecode", "claudecode-legacy"] as const)(
+      "writes Claude Code's native setting instead of a block for %s",
+      async (toolTarget) => {
+        const processor = new RulesProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget,
+          language: "ja",
+        });
+
+        const result = await processor.convertRulesyncFilesToToolFiles([rootRule(), nestedRule()]);
+
+        const claudeMd = result.find((file) => file.getRelativeFilePath() === "CLAUDE.md");
+        expect(claudeMd?.getFileContent()).not.toContain("You must always answer in");
+        const settings = result.find((file) => file instanceof ClaudecodeLanguageSettings);
+        expect(settings?.getRelativeDirPath()).toBe(".claude");
+        expect(settings?.getRelativeFilePath()).toBe("settings.local.json");
+        expect(JSON.parse(settings?.getFileContent() ?? "{}").language).toBe("japanese");
+      },
+    );
+
+    it("writes the global Claude Code setting to ~/.claude/settings.json", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "claudecode",
+        language: "ja",
+        global: true,
+      });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([rootRule()]);
+
+      const settings = result.find((file) => file instanceof ClaudecodeLanguageSettings);
+      expect(settings?.getRelativeFilePath()).toBe("settings.json");
+    });
+
+    it("does not touch the Claude Code settings file when language is unset", async () => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "claudecode",
+      });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([rootRule()]);
+
+      expect(result.some((file) => file instanceof ClaudecodeLanguageSettings)).toBe(false);
+    });
+
+    it("strips a generated block on import so a regenerate yields exactly one block", async () => {
+      const body = "# Overview\n\nProject rules.";
+      const generator = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codexcli",
+        language: "ja",
+      });
+      const [generated] = await generator.convertRulesyncFilesToToolFiles([rootRule(body)]);
+      await writeFileContent(join(testDir, "AGENTS.md"), generated!.getFileContent());
+
+      const importer = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      const imported = await importer.convertToolFilesToRulesyncFiles(
+        await importer.loadToolFiles(),
+      );
+      const importedRule = imported.find(
+        (file): file is RulesyncRule => file instanceof RulesyncRule,
+      );
+      expect(importedRule?.getBody()).toBe(body);
+      expect(importedRule?.getFrontmatter().root).toBe(true);
+
+      const [regenerated] = await generator.convertRulesyncFilesToToolFiles([importedRule!]);
+      expect(regenerated?.getFileContent()).toBe(generated!.getFileContent());
+      expect(regenerated?.getFileContent().split("You must always answer in")).toHaveLength(2);
+    });
+
+    it("strips a block written for a different language than the current one", async () => {
+      await writeFileContent(
+        join(testDir, "AGENTS.md"),
+        `# Overview\n\nProject rules.${languageBlock("fr")}\n`,
+      );
+
+      const importer = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      const imported = await importer.convertToolFilesToRulesyncFiles(
+        await importer.loadToolFiles(),
+      );
+      const importedRule = imported.find(
+        (file): file is RulesyncRule => file instanceof RulesyncRule,
+      );
+      expect(importedRule?.getBody()).toBe("# Overview\n\nProject rules.");
+    });
+
+    it("strips the block from a Cursor import, whose root file imports as a non-root rule", async () => {
+      const generator = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "cursor",
+        language: "ja",
+      });
+      const [generated] = await generator.convertRulesyncFilesToToolFiles([rootRule()]);
+      await ensureDir(join(testDir, ".cursor", "rules"));
+      await writeFileContent(
+        join(testDir, ".cursor", "rules", "overview.mdc"),
+        generated!.getFileContent(),
+      );
+
+      const importer = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "cursor" });
+      const imported = await importer.convertToolFilesToRulesyncFiles(
+        await importer.loadToolFiles(),
+      );
+      const importedRule = imported.find(
+        (file): file is RulesyncRule => file instanceof RulesyncRule,
+      );
+      expect(importedRule?.getBody()).toBe("# Overview\n\nProject rules.");
+    });
+
+    it.each(
+      RulesProcessor.getToolTargets({ global: true }).filter(
+        (target) => target !== "claudecode" && target !== "claudecode-legacy",
+      ),
+    )("closes every global root-content file with one block for %s", async (toolTarget) => {
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget,
+        language: "en",
+        global: true,
+      });
+
+      // Root only: some global layouts (such as Rovo Dev) have no
+      // home for a nested rule and reject one.
+      const result = await processor.convertRulesyncFilesToToolFiles([rootRule()]);
+
+      const rootFiles = result.filter((file) => file.getFileContent().includes("Project rules."));
+      expect(rootFiles.length).toBeGreaterThanOrEqual(1);
+      for (const file of rootFiles) {
+        expect(file.getFileContent().endsWith(buildLanguageInstruction("en"))).toBe(true);
+        expect(file.getFileContent().split("You must always answer in")).toHaveLength(2);
+      }
+      for (const otherFile of result.filter((file) => !rootFiles.includes(file))) {
+        expect(otherFile.getFileContent()).not.toContain("You must always answer in");
+      }
+    });
+
+    it("appends the block to the file built from the first root source only when several are root", async () => {
+      const secondRoot = () =>
+        new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+          relativeFilePath: "second.md",
+          frontmatter: { root: true, targets: ["*"] },
+          body: "# Second\n\nAlso root.",
+        });
+      const processor = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "cursor",
+        language: "ja",
+      });
+
+      const result = await processor.convertRulesyncFilesToToolFiles([
+        rootRule(),
+        secondRoot(),
+        nestedRule(),
+      ]);
+      const contentOf = (name: string) =>
+        result.find((file) => file.getRelativeFilePath() === name)?.getFileContent() ?? "";
+      expect(contentOf("overview.mdc").endsWith(languageBlock("ja"))).toBe(true);
+      expect(contentOf("second.mdc")).not.toContain("You must always answer in");
+      expect(contentOf("details.mdc")).not.toContain("You must always answer in");
+
+      // Source order decides which root source is first.
+      const reordered = await processor.convertRulesyncFilesToToolFiles([secondRoot(), rootRule()]);
+      const reorderedContentOf = (name: string) =>
+        reordered.find((file) => file.getRelativeFilePath() === name)?.getFileContent() ?? "";
+      expect(reorderedContentOf("second.mdc").endsWith(languageBlock("ja"))).toBe(true);
+      expect(reorderedContentOf("overview.mdc")).not.toContain("You must always answer in");
+    });
+
+    it("neither appends the block to a separate local-root file nor strips one from it on import", async () => {
+      const localRootRule = new RulesyncRule({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
+        relativeFilePath: "personal.md",
+        frontmatter: { localRoot: true, targets: ["rovodev"] },
+        body: "# Personal\n\nMy own rules.",
+      });
+      const generator = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "rovodev",
+        language: "ja",
+      });
+
+      const generated = await generator.convertRulesyncFilesToToolFiles([
+        rootRule(),
+        localRootRule,
+      ]);
+      const localFile = generated.find((file) => file.getRelativeFilePath() === "AGENTS.local.md");
+      expect(localFile?.getFileContent()).toBe("# Personal\n\nMy own rules.");
+      const rootFiles = generated.filter((file) =>
+        file.getFileContent().includes("Project rules."),
+      );
+      expect(rootFiles.length).toBeGreaterThanOrEqual(1);
+      for (const file of rootFiles) {
+        expect(file.getFileContent().endsWith(languageBlock("ja"))).toBe(true);
+      }
+
+      const authoredLocal = `# Personal\n\nMy own rules.${languageBlock("ja")}\n`;
+      await ensureDir(join(testDir, ".rovodev"));
+      await writeFileContent(join(testDir, ".rovodev", "AGENTS.md"), "# Root");
+      await writeFileContent(join(testDir, "AGENTS.local.md"), authoredLocal);
+      const importer = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "rovodev" });
+      const imported = await importer.convertToolFilesToRulesyncFiles(
+        await importer.loadToolFiles(),
+      );
+      const localRule = findLocalRule(imported, "AGENTS.local.md") as RulesyncRule | undefined;
+      expect(localRule?.getFrontmatter().localRoot).toBe(true);
+      expect(localRule?.getBody()).toBe(authoredLocal);
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("Removed the answer-language block"),
+      );
+    });
+
+    it("warns once per file when a block is stripped on import, and stays quiet otherwise", async () => {
+      await writeFileContent(
+        join(testDir, "AGENTS.md"),
+        `# Overview\n\nProject rules.${languageBlock("ja")}\n`,
+      );
+
+      const importer = new RulesProcessor({ logger, outputRoot: testDir, toolTarget: "codexcli" });
+      await importer.convertToolFilesToRulesyncFiles(await importer.loadToolFiles());
+      // A second target reading the same file reports nothing more.
+      const secondImporter = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "agentsmd",
+      });
+      await secondImporter.convertToolFilesToRulesyncFiles(await secondImporter.loadToolFiles());
+
+      const stripWarnings = logger.warn.mock.calls.filter(([message]) =>
+        String(message).includes("Removed the answer-language block"),
+      );
+      expect(stripWarnings).toHaveLength(1);
+      expect(stripWarnings[0]?.[0]).toContain("AGENTS.md");
+      expect(stripWarnings[0]?.[0]).toContain('"language" in rulesync.jsonc');
+
+      logger.warn.mockClear();
+      await writeFileContent(join(testDir, "AGENTS.md"), "# Overview\n\nProject rules.\n");
+      const plainImporter = new RulesProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "codexcli",
+      });
+      await plainImporter.convertToolFilesToRulesyncFiles(await plainImporter.loadToolFiles());
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("Removed the answer-language block"),
+      );
     });
   });
 });

@@ -1,11 +1,31 @@
 import {
+  AUGMENTCODE_DIR,
+  AUGMENTCODE_SETTINGS_LOCAL_FILE_NAME,
+} from "../../constants/augmentcode-paths.js";
+import {
+  CLAUDECODE_AGENT_MEMORY_LOCAL_DIR_NAME,
   CLAUDECODE_DIR,
   CLAUDECODE_LOCAL_RULE_FILE_NAME,
   CLAUDECODE_MEMORIES_DIR_NAME,
   CLAUDECODE_SETTINGS_LOCAL_FILE_NAME,
 } from "../../constants/claudecode-paths.js";
+import { CODEBUDDY_DIR, CODEBUDDY_LOCAL_RULE_FILE_NAME } from "../../constants/codebuddy-paths.js";
 import { CODEXCLI_BASH_RULES_FILE_NAME, CODEXCLI_DIR } from "../../constants/codexcli-paths.js";
+import {
+  COMMANDCODE_DIR,
+  COMMANDCODE_SETTINGS_LOCAL_FILE_NAME,
+} from "../../constants/commandcode-paths.js";
+import { CRUSH_LOCAL_RULE_FILE_NAME } from "../../constants/crush-paths.js";
+import {
+  FACTORYDROID_DIR,
+  FACTORYDROID_SETTINGS_LOCAL_FILE_NAME,
+} from "../../constants/factorydroid-paths.js";
+import {
+  LETTACODE_DIR,
+  LETTACODE_SETTINGS_LOCAL_FILE_NAME,
+} from "../../constants/lettacode-paths.js";
 import { QWENCODE_DIR, QWENCODE_LOCAL_RULE_FILE_NAME } from "../../constants/qwencode-paths.js";
+import { REASONIX_LOCAL_RULE_FILE_NAME } from "../../constants/reasonix-paths.js";
 import {
   RULESYNC_CURATED_RULES_RELATIVE_DIR_PATH,
   RULESYNC_CURATED_SKILLS_RELATIVE_DIR_PATH,
@@ -77,6 +97,20 @@ export const HAND_MAINTAINED_GITIGNORE_ENTRIES: ReadonlyArray<GitignoreEntryTag>
     feature: "rules",
     entry: `**/${CLAUDECODE_DIR}/${CLAUDECODE_LOCAL_RULE_FILE_NAME}`,
   },
+  // CodeBuddy Code's personal project memory file, mirroring Claude Code's
+  // CLAUDE.local.md convention: materialized outside getSettablePaths for the
+  // "separate-local-file" localRootMode, at both the project root and the
+  // `.codebuddy/` alternative root.
+  { target: "codebuddy", feature: "rules", entry: `**/${CODEBUDDY_LOCAL_RULE_FILE_NAME}` },
+  {
+    target: "codebuddy",
+    feature: "rules",
+    entry: `**/${CODEBUDDY_DIR}/${CODEBUDDY_LOCAL_RULE_FILE_NAME}`,
+  },
+  // Crush's personal project context file. Unlike CodeBuddy Code, Crush does
+  // not add it to `.gitignore` itself, so the derived list has to.
+  { target: "crush", feature: "rules", entry: `**/${CRUSH_LOCAL_RULE_FILE_NAME}` },
+  { target: "reasonix", feature: "rules", entry: `**/${REASONIX_LOCAL_RULE_FILE_NAME}` },
 
   // Vibe subagent system prompts: written by the subagents feature next to the
   // agent TOML, but outside `getSettablePaths` (which names only
@@ -95,14 +129,70 @@ export const HAND_MAINTAINED_GITIGNORE_ENTRIES: ReadonlyArray<GitignoreEntryTag>
     feature: "general",
     entry: `**/${CLAUDECODE_DIR}/${CLAUDECODE_MEMORIES_DIR_NAME}/`,
   },
+  // Memory of a subagent with `memory: local`, which Claude Code documents as
+  // not checked into version control. `memory: project` (`.claude/agent-memory/`)
+  // is meant to be committed, so it is deliberately not listed.
+  {
+    target: "claudecode",
+    feature: "general",
+    entry: `**/${CLAUDECODE_DIR}/${CLAUDECODE_AGENT_MEMORY_LOCAL_DIR_NAME}/`,
+  },
   { target: "opencode", feature: "general", entry: "**/.opencode/package-lock.json" },
   // Devin's personal MCP override (documented as gitignored; never emitted by
   // rulesync). https://docs.devin.ai/cli/extensibility/mcp/configuration
   { target: "devin", feature: "mcp", entry: "**/.devin/mcp_config.local.json" },
+  // Factory Droid's personal settings overlay. Rulesync reads it when importing
+  // permissions and hooks, so a repository is likely to have one, but Factory
+  // documents it as machine-local and rulesync never writes it.
+  // https://docs.factory.ai/droid-cli/settings
+  {
+    target: "factorydroid",
+    feature: "general",
+    entry: `**/${FACTORYDROID_DIR}/${FACTORYDROID_SETTINGS_LOCAL_FILE_NAME}`,
+  },
+  // AugmentCode's personal settings overlay, read on import for the same reason
+  // and documented the same way as Factory Droid's above.
+  // https://docs.augmentcode.com/cli/configuration
+  {
+    target: "augmentcode",
+    feature: "general",
+    entry: `**/${AUGMENTCODE_DIR}/${AUGMENTCODE_SETTINGS_LOCAL_FILE_NAME}`,
+  },
+  // Command Code's personal settings overlay, documented as "personal,
+  // gitignored" (`--local` approvals are written there); never emitted by
+  // rulesync. https://commandcode.ai/docs/permissions
+  {
+    target: "commandcode",
+    feature: "general",
+    entry: `**/${COMMANDCODE_DIR}/${COMMANDCODE_SETTINGS_LOCAL_FILE_NAME}`,
+  },
+  // Letta Code's personal project settings, documented as "personal,
+  // gitignored"; never emitted by rulesync.
+  // https://docs.letta.com/reference/settings/index.md
+  {
+    target: "lettacode",
+    feature: "general",
+    entry: `**/${LETTACODE_DIR}/${LETTACODE_SETTINGS_LOCAL_FILE_NAME}`,
+  },
   { target: "rovodev", feature: "general", entry: "**/.rovodev/.rulesync/" },
+  // Qwen Code's per-run by-products under the project `.qwen/`, which Qwen Code
+  // never gitignores itself: the `/review` cache (its docs tell users to ignore
+  // it), saved review reports, the `/review` scratch worktrees and findings
+  // under `tmp/`, and the fixed `<repoRoot>/.qwen/worktrees/` location of
+  // general-purpose and agent worktrees. Listed per path rather than as `.qwen/`
+  // so the committed config there (and `.qwen/team-memory/`) stays trackable.
+  // https://qwenlm.github.io/qwen-code-docs/en/users/features/code-review/
+  // https://qwenlm.github.io/qwen-code-docs/en/users/features/worktree/
+  { target: "qwencode", feature: "general", entry: `**/${QWENCODE_DIR}/review-cache/` },
+  { target: "qwencode", feature: "general", entry: `**/${QWENCODE_DIR}/reviews/` },
+  { target: "qwencode", feature: "general", entry: `**/${QWENCODE_DIR}/tmp/` },
+  { target: "qwencode", feature: "general", entry: `**/${QWENCODE_DIR}/worktrees/` },
   { target: "takt", feature: "general", entry: "**/.takt/runs/" },
   { target: "takt", feature: "general", entry: "**/.takt/tasks/" },
   { target: "takt", feature: "general", entry: "**/.takt/.cache/" },
+  // `takt make` (0.64.0) keeps every Workflow Maker run under
+  // `.takt/make/<timestamp>/`, and completed and failed runs are never removed.
+  { target: "takt", feature: "general", entry: "**/.takt/make/" },
   { target: "takt", feature: "general", entry: "**/.takt/config.yaml" },
   // Meta Muse Code's subagent worktrees: `--subagent-worktree-isolation` checks
   // each child agent out into a repo-relative `.muse/worktrees/<child>` git
@@ -114,6 +204,18 @@ export const HAND_MAINTAINED_GITIGNORE_ENTRIES: ReadonlyArray<GitignoreEntryTag>
   // https://dev.meta.ai/docs/cookbook/subagent-fanout
   { target: "musecode", feature: "general", entry: "**/.muse/worktrees/" },
 
+  // Vibe Code's plugin data root: a plugin installed under the project's
+  // `.vibe/plugins/<name>/` gets its data root from
+  // `root.parent.parent / "plugin-data"` whenever no `data_root_base` override
+  // is supplied — and the session-open path, `PluginResolver.from_harness_files`,
+  // supplies none — so a project plugin materializes into
+  // `<project>/.vibe/plugin-data/<plugin>/`. It holds generated knowledge
+  // documents and vendored `libraries/` dependencies (node_modules, Python
+  // packages), all written by Vibe rather than by rulesync. Only that directory
+  // is ignored, not `.vibe/` as a whole, which carries committed project config.
+  // https://github.com/mistralai/mistral-vibe/blob/v2.25.0/vibe/core/plugins/_native.py
+  { target: "vibe", feature: "general", entry: "**/.vibe/plugin-data/" },
+
   // Augment Code's legacy single-file rules path: accepted on import but never
   // generated (so not in getSettablePaths), gitignored as a convenience.
   { target: "augmentcode", feature: "rules", entry: "**/.augment-guidelines" },
@@ -122,6 +224,14 @@ export const HAND_MAINTAINED_GITIGNORE_ENTRIES: ReadonlyArray<GitignoreEntryTag>
   // onto the skills surface, but outputs generated by earlier rulesync versions
   // may still exist there, so keep them gitignored as a convenience.
   { target: "devin", feature: "commands", entry: "**/.devin/workflows/" },
+
+  // Antigravity commands are emitted onto the shared `.agents/skills/` surface
+  // (workflows are retired), while their settable paths still point at the
+  // legacy workflows directory for import and cleanup, so the derived entries
+  // would miss the generated skills under the commands feature.
+  // https://antigravity.google/docs/migration/workflows-to-skills
+  { target: "antigravity-ide", feature: "commands", entry: "**/.agents/skills/" },
+  { target: "antigravity-cli", feature: "commands", entry: "**/.agents/skills/" },
 
   // Junie's undocumented memories directory: non-root rules are now folded
   // into the root `.junie/AGENTS.md`, but outputs generated by earlier
@@ -183,6 +293,8 @@ export const HAND_MAINTAINED_GITIGNORE_ENTRIES: ReadonlyArray<GitignoreEntryTag>
   { target: "cline", feature: "hooks", entry: "**/.clinerules/hooks/PreToolUse.ps1" },
   { target: "cline", feature: "hooks", entry: "**/.clinerules/hooks/SessionShutdown" },
   { target: "cline", feature: "hooks", entry: "**/.clinerules/hooks/SessionShutdown.ps1" },
+  { target: "cline", feature: "hooks", entry: "**/.clinerules/hooks/TaskCancel" },
+  { target: "cline", feature: "hooks", entry: "**/.clinerules/hooks/TaskCancel.ps1" },
   { target: "cline", feature: "hooks", entry: "**/.clinerules/hooks/TaskComplete" },
   { target: "cline", feature: "hooks", entry: "**/.clinerules/hooks/TaskComplete.ps1" },
   { target: "cline", feature: "hooks", entry: "**/.clinerules/hooks/TaskError" },
@@ -219,6 +331,27 @@ export const GITIGNORE_ENTRY_REGISTRY: ReadonlyArray<GitignoreEntryTag> = [
 
   // Keep this after ignore entries like Junie's "**/.aiignore" so the exception remains effective.
   { target: "common", feature: "general", entry: "!.rulesync/.aiignore" },
+];
+
+/**
+ * Entries an older rulesync wrote that this one no longer emits, each paired
+ * with the entry that took its place. They are still recognized so `rulesync
+ * gitignore` can take the old spelling back out of the file it manages.
+ *
+ * Leaving one behind is not harmless. A bare `.factory/skills/` directory
+ * pattern ignores the directory itself, and git never descends into an ignored
+ * directory — so the widened contents pattern and the negations that re-include
+ * the committed Factory Droid checks file would all be dead letters, and the
+ * reviewer would never see a file rulesync writes on every generate.
+ */
+export const RETIRED_GITIGNORE_ENTRIES: ReadonlyArray<{
+  readonly entry: string;
+  readonly replacedBy: string;
+}> = [
+  {
+    entry: `**/${FACTORYDROID_DIR}/skills/`,
+    replacedBy: `**/${FACTORYDROID_DIR}/skills/**`,
+  },
 ];
 
 export const ALL_GITIGNORE_ENTRIES: ReadonlyArray<string> = (() => {

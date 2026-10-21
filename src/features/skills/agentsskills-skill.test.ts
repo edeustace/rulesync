@@ -1,4 +1,4 @@
-import { open, symlink } from "node:fs/promises";
+import { chmod, open, symlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -10,6 +10,7 @@ import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { MAX_CARRIED_DEPTH, MAX_REPORTED_PATHS } from "../../types/ai-dir.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
 import { fallbackLogger } from "../../utils/logger.js";
+import { hasIncompleteCarriedFiles, resetRunWarningState } from "../../utils/warned-once.js";
 import { AgentsSkillsSkill } from "./agentsskills-skill.js";
 import { RulesyncSkill } from "./rulesync-skill.js";
 
@@ -963,6 +964,83 @@ Body.`;
     });
 
     it.skipIf(process.platform === "win32")(
+      "should carry the executable bit of a supporting script",
+      async () => {
+        // A skill that says `./scripts/run.sh` needs the copy to be runnable.
+        // Only an executable source records a mode; a plain file keeps the
+        // platform default, as it always has.
+        const skillDir = join(testDir, ".agents", "skills", "script-skill");
+        await ensureDir(skillDir);
+        await writeFileContent(
+          join(skillDir, SKILL_FILE_NAME),
+          ["---", "name: script-skill", "description: Runs", "---", "", "Body."].join("\n"),
+        );
+        const scriptPath = join(skillDir, "scripts", "run.sh");
+        await writeFileContent(scriptPath, "#!/bin/sh\necho hi\n");
+        await chmod(scriptPath, 0o755);
+        await writeFileContent(join(skillDir, "notes.md"), "plain\n");
+
+        const skill = await AgentsSkillsSkill.fromDir({
+          outputRoot: testDir,
+          dirName: "script-skill",
+        });
+
+        const byName = new Map(
+          skill.getOtherFiles().map((file) => [file.relativeFilePathToDirPath, file.fileMode]),
+        );
+        expect(byName.get(join("scripts", "run.sh"))).toBe(0o755);
+        expect(byName.has("notes.md")).toBe(true);
+        expect(byName.get("notes.md")).toBeUndefined();
+      },
+    );
+
+    it("should record that the run's picture of the source is incomplete", async () => {
+      // What the orphan sweep reads back: a run that dropped a file it wanted
+      // cannot tell a stale generated file from one whose source it failed to
+      // read, so it prunes nothing at all.
+      const skillDir = join(testDir, ".agents", "skills", "deep-flag-skill");
+      await ensureDir(skillDir);
+      await writeFileContent(
+        join(skillDir, SKILL_FILE_NAME),
+        ["---", "name: deep-flag-skill", "description: Nests", "---", "", "Body."].join("\n"),
+      );
+      const carriedDir = join(skillDir, ...Array.from({ length: MAX_CARRIED_DEPTH }, () => "d"));
+      await writeFileContent(join(carriedDir, "d", "dropped.md"), "dropped\n");
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+      resetRunWarningState();
+
+      await AgentsSkillsSkill.fromDir({ outputRoot: testDir, dirName: "deep-flag-skill" });
+
+      expect(hasIncompleteCarriedFiles()).toBe(true);
+      expect(warnSpy).toHaveBeenCalled();
+    });
+
+    it("should not call a deliberate refusal an incomplete read", async () => {
+      // A credential-shaped name is one Rulesync never carries, on every run.
+      // Treating that as a shortfall would stand the orphan sweep down for any
+      // project that keeps an `.npmrc` beside a skill.
+      const skillDir = join(testDir, ".agents", "skills", "refusing-skill");
+      await ensureDir(skillDir);
+      await writeFileContent(
+        join(skillDir, SKILL_FILE_NAME),
+        ["---", "name: refusing-skill", "description: Refuses", "---", "", "Body."].join("\n"),
+      );
+      await writeFileContent(join(skillDir, ".npmrc"), "//registry:_authToken=x\n");
+      await writeFileContent(join(skillDir, "notes.md"), "notes\n");
+      resetRunWarningState();
+
+      const skill = await AgentsSkillsSkill.fromDir({
+        outputRoot: testDir,
+        dirName: "refusing-skill",
+      });
+
+      expect(skill.getOtherFiles().map((file) => file.relativeFilePathToDirPath)).toEqual([
+        "notes.md",
+      ]);
+      expect(hasIncompleteCarriedFiles()).toBe(false);
+    });
+
+    it.skipIf(process.platform === "win32")(
       "should stay bounded when two symbolic links point back at an ancestor",
       async () => {
         // Two links per directory double the paths globby walks per level, and
@@ -1509,6 +1587,86 @@ Body.`;
       AgentsSkillsSkill.fromRulesyncSkill({ rulesyncSkill, logger });
 
       expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("should normalize root-level compatibility/metadata exactly like the agentsskills section", () => {
+      // A root-authored value must reach the file in the spec's scalar forms,
+      // not bypass the coercion the section value goes through.
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "root-fields",
+        frontmatter: {
+          name: "root-fields",
+          description: "Root-level standard fields",
+          license: "MIT",
+          compatibility: { runtime: "node" },
+          metadata: { version: 1 },
+        },
+        body: "Body",
+        validate: true,
+      });
+
+      expect(AgentsSkillsSkill.fromRulesyncSkill({ rulesyncSkill }).getFrontmatter()).toEqual({
+        name: "root-fields",
+        description: "Root-level standard fields",
+        license: "MIT",
+        compatibility: "runtime: node",
+        metadata: { version: "1" },
+      });
+    });
+
+    it("should let the agentsskills section override the root-level license/compatibility/metadata", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "section-wins",
+        frontmatter: {
+          name: "section-wins",
+          description: "Section overrides the root-level fields",
+          license: "MIT",
+          compatibility: "Requires git",
+          metadata: { author: "root" },
+          agentsskills: {
+            license: "Apache-2.0",
+            compatibility: "Requires jq",
+            metadata: { author: "section" },
+            "allowed-tools": ["Read"],
+          },
+        },
+        body: "Body",
+        validate: true,
+      });
+
+      expect(AgentsSkillsSkill.fromRulesyncSkill({ rulesyncSkill }).getFrontmatter()).toEqual({
+        name: "section-wins",
+        description: "Section overrides the root-level fields",
+        license: "Apache-2.0",
+        compatibility: "Requires jq",
+        metadata: { author: "section" },
+        "allowed-tools": "Read",
+      });
+    });
+
+    it("should report a spec violation for a root-level compatibility that is too long", () => {
+      const logger = createMockLogger();
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "root-too-long",
+        frontmatter: {
+          name: "root-too-long",
+          description: "Root-level compatibility over the limit",
+          compatibility: "x".repeat(501),
+        },
+        body: "Body",
+        validate: true,
+      });
+
+      AgentsSkillsSkill.fromRulesyncSkill({ rulesyncSkill, logger });
+
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn.mock.calls[0]?.[0]).toContain("`compatibility`");
     });
   });
 

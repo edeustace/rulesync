@@ -1,4 +1,4 @@
-import { symlink } from "node:fs/promises";
+import { chmod, stat, symlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -30,6 +30,7 @@ import {
   skillsProcessorToolTargetsGlobal,
 } from "./skills-processor.js";
 import { TaktSkill } from "./takt-skill.js";
+import { WarpSkill } from "./warp-skill.js";
 
 /**
  * Write a directory-form skill whose frontmatter `name` matches its directory
@@ -279,6 +280,61 @@ describe("SkillsProcessor", () => {
       expect(toolDirs[0]).toBeInstanceOf(ClaudecodeSkill);
     });
 
+    it("should not generate a skill into a directory another feature owns", async () => {
+      // `.factory/skills/review-guidelines/` is the checks feature's output, and
+      // `FactorydroidSkill.isDirOwned` keeps the skills feature from deleting it
+      // again, so writing it from a skill would outlive the skill.
+      const logger = createMockLogger();
+      const factorydroidProcessor = new SkillsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "factorydroid",
+      });
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "review-guidelines",
+        frontmatter: {
+          name: "review-guidelines",
+          description: "Our guidelines",
+        },
+        body: "Content",
+        validate: false,
+      });
+
+      const toolDirs = await factorydroidProcessor.convertRulesyncDirsToToolDirs([rulesyncSkill]);
+
+      expect(toolDirs).toEqual([]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("review-guidelines"));
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("checks"));
+    });
+
+    it("should generate that same skill in global mode", async () => {
+      // Factory's reviewer reads a repository, so checks has no user-level
+      // output and nothing else claims the name there.
+      const factorydroidProcessor = new SkillsProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        toolTarget: "factorydroid",
+        global: true,
+      });
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "review-guidelines",
+        frontmatter: {
+          name: "review-guidelines",
+          description: "Our guidelines",
+        },
+        body: "Content",
+        validate: false,
+      });
+
+      const toolDirs = await factorydroidProcessor.convertRulesyncDirsToToolDirs([rulesyncSkill]);
+
+      expect(toolDirs).toHaveLength(1);
+    });
+
     it("should not convert claudecode scheduled-task skills for non-claudecode targets", async () => {
       const cursorProcessor = new SkillsProcessor({
         logger: createMockLogger(),
@@ -304,6 +360,76 @@ describe("SkillsProcessor", () => {
 
       const toolDirs = await cursorProcessor.convertRulesyncDirsToToolDirs([scheduledTaskSkill]);
       expect(toolDirs).toEqual([]);
+    });
+
+    it("should skip a claudecode scheduled-task skill at project scope with a warning", async () => {
+      // Claude Code reads scheduled tasks only from ~/.claude/scheduled-tasks/,
+      // so a project-scope copy under <project>/.claude/scheduled-tasks/ would
+      // never fire; the processor warns and writes nothing instead.
+      const logger = createMockLogger();
+      const claudecodeProcessor = new SkillsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "claudecode",
+      });
+
+      const scheduledTaskSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "scheduled-task-only",
+        frontmatter: {
+          name: "scheduled-task-only",
+          description: "Scheduled task only",
+          targets: ["*"],
+          claudecode: {
+            "scheduled-task": true,
+          },
+        },
+        body: "Content",
+        validate: false,
+      });
+
+      const toolDirs = await claudecodeProcessor.convertRulesyncDirsToToolDirs([
+        scheduledTaskSkill,
+      ]);
+
+      expect(toolDirs).toEqual([]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("scheduled-task-only"));
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("--global"));
+    });
+
+    it("should still emit a claudecode scheduled-task skill in global mode", async () => {
+      const logger = createMockLogger();
+      const claudecodeProcessor = new SkillsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "claudecode",
+        global: true,
+      });
+
+      const scheduledTaskSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "scheduled-task-only",
+        frontmatter: {
+          name: "scheduled-task-only",
+          description: "Scheduled task only",
+          targets: ["*"],
+          claudecode: {
+            "scheduled-task": true,
+          },
+        },
+        body: "Content",
+        validate: false,
+      });
+
+      const toolDirs = await claudecodeProcessor.convertRulesyncDirsToToolDirs([
+        scheduledTaskSkill,
+      ]);
+
+      expect(toolDirs).toHaveLength(1);
+      expect(toolDirs[0]?.getRelativeDirPath()).toBe(join(".claude", "scheduled-tasks"));
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("scheduled-task-only"));
     });
 
     it("should skip a directory it cannot name, or a hidden one, when importing", async () => {
@@ -846,6 +972,28 @@ Body from inputRoots[0]`;
       );
     });
 
+    it("should skip a cursor category folder without SKILL.md instead of aborting the import", async () => {
+      // Cursor treats a folder grouping skills as "purely organizational"; it
+      // holds no SKILL.md of its own. https://cursor.com/docs/skills
+      const processor = new SkillsProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        toolTarget: "cursor",
+      });
+      await writeFileContent(
+        join(testDir, ".cursor", "skills", "shipping", "land-it", "SKILL.md"),
+        "---\nname: land-it\ndescription: Nested skill\n---\nNested body",
+      );
+      await writeFileContent(
+        join(testDir, ".cursor", "skills", "flat-skill", "SKILL.md"),
+        "---\nname: flat-skill\ndescription: Flat skill\n---\nFlat body",
+      );
+
+      const toolDirs = await processor.loadToolDirs();
+
+      expect(toolDirs.map((dir) => dir.getDirName())).toEqual(["flat-skill"]);
+    });
+
     it("should load rovodev skills from .agents/skills when .rovodev/skills is absent", async () => {
       const processor = new SkillsProcessor({
         logger: createMockLogger(),
@@ -938,6 +1086,47 @@ Skill body`,
         ]),
       );
       expect(byName.get("dup-skill")).toEqual([join(".junie", "skills"), "from-junie"]);
+      expect(byName.get("shared-only")).toEqual([join(".agents", "skills"), "from-agents"]);
+    });
+
+    it("should prefer .warp/skills over the import-only .agents/skills for the same skill name", async () => {
+      // warp declares `.agents/skills` under `importOnlySkillRoots` (Warp's
+      // recommended location, shared with other tools). The Warp-specific root
+      // wins and the shared tree only fills in names it does not already cover.
+      const processor = new SkillsProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        toolTarget: "warp",
+      });
+      await writeSkill({
+        testDir,
+        base: join(".warp", "skills"),
+        dirName: "dup-skill",
+        body: "from-warp",
+      });
+      await writeSkill({
+        testDir,
+        base: join(".agents", "skills"),
+        dirName: "dup-skill",
+        body: "from-agents",
+      });
+      await writeSkill({
+        testDir,
+        base: join(".agents", "skills"),
+        dirName: "shared-only",
+        body: "from-agents",
+      });
+
+      const toolDirs = await processor.loadToolDirs();
+
+      expect(toolDirs).toHaveLength(2);
+      const byName = new Map(
+        toolDirs.map((toolDir) => [
+          toolDir.getDirName(),
+          [(toolDir as WarpSkill).getRelativeDirPath(), (toolDir as WarpSkill).getBody()],
+        ]),
+      );
+      expect(byName.get("dup-skill")).toEqual([join(".warp", "skills"), "from-warp"]);
       expect(byName.get("shared-only")).toEqual([join(".agents", "skills"), "from-agents"]);
     });
 
@@ -1381,6 +1570,471 @@ Broken YAML`,
       ).toBeUndefined();
     });
 
+    it.skipIf(process.platform === "win32")(
+      "should report a nested skills directory the scan cannot name",
+      async () => {
+        // The nested scan is a recursive glob, and globby reads a backslash as
+        // a path separator: the directory below `back\\slash` comes back as
+        // `back/slash/...`, which nothing on disk answers to. The import cannot
+        // recover the root from that, but it says so rather than dropping the
+        // skills in it without a word.
+        const logger = createMockLogger();
+        const nestedDir = join(testDir, "back\\slash", ".claude", "skills", "deploy");
+        await writeFileContent(
+          join(nestedDir, "SKILL.md"),
+          "---\nname: deploy\ndescription: Deploy description\n---\nDeploy body",
+        );
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        expect(toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName())).not.toContain(
+          "deploy",
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("could not be read under the path the scan reports"),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse a nested skills directory whose reported path leaves the project",
+      async () => {
+        // The same rewrite can also land somewhere real: a directory named
+        // `x\\..\\..\\outside` is reported at `x/../../outside`, which resolves
+        // through a real sibling `x/` and out of the project entirely.
+        // Following it would import somebody else's skills.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await ensureDir(join(outputRoot, "x"));
+        await writeFileContent(
+          join(outputRoot, "x\\..\\..\\outside", ".claude", "skills", "nested-skill", "SKILL.md"),
+          "---\nname: nested-skill\ndescription: Nested description\n---\nNested body",
+        );
+        await writeFileContent(
+          join(testDir, "outside", ".claude", "skills", "leaked", "SKILL.md"),
+          "---\nname: leaked\ndescription: Leaked description\n---\nLeaked body",
+        );
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        expect(toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName())).not.toContain(
+          "leaked",
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("it resolves outside the project"),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should still import a directory the scan reports under a rewritten spelling",
+      async () => {
+        // `x\\..\\y` is reported at `x/../y`, which resolves to the real `y`
+        // inside the project -- and the scan reports `y` under that spelling
+        // *instead of* its own, so refusing the path would lose `y`'s own
+        // skills. What is unreachable either way is `x\\..\\y` itself.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await ensureDir(join(outputRoot, "x"));
+        await writeFileContent(
+          join(outputRoot, "x\\..\\y", ".claude", "skills", "shadowed", "SKILL.md"),
+          "---\nname: shadowed\ndescription: Shadowed description\n---\nShadowed body",
+        );
+        await writeFileContent(
+          join(outputRoot, "y", ".claude", "skills", "sibling", "SKILL.md"),
+          "---\nname: sibling\ndescription: Sibling description\n---\nSibling body",
+        );
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        const dirNames = toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName());
+        expect(dirNames).toContain("sibling");
+        expect(dirNames).not.toContain("shadowed");
+        expect(logger.warn).not.toHaveBeenCalled();
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should still import a directory the rewritten spelling reaches through no real name",
+      async () => {
+        // The same substitution, with nothing named `x` on disk: `x/../y` then
+        // answers to nothing, so asking whether the path is there would refuse
+        // it -- and `y`, which the scan reports under no other spelling, would
+        // go with it. Folding the `..` away first is what keeps `y`.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await writeFileContent(
+          join(outputRoot, "x\\..\\y", ".claude", "skills", "shadowed", "SKILL.md"),
+          "---\nname: shadowed\ndescription: Shadowed description\n---\nShadowed body",
+        );
+        await writeFileContent(
+          join(outputRoot, "y", ".claude", "skills", "sibling", "SKILL.md"),
+          "---\nname: sibling\ndescription: Sibling description\n---\nSibling body",
+        );
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        expect(toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName())).toContain("sibling");
+        expect(logger.warn).not.toHaveBeenCalled();
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse a nested skills directory the scan reports at a link out of the project",
+      async () => {
+        // The rewrite needs no `..` to move the path. A directory named `a\\b` is
+        // reported at `a/b`, every segment of which is a name a directory can
+        // have, and `a/b` here is a symbolic link out of the project. The scan
+        // sets `followSymbolicLinks: false`, so it never meant to reach it.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await ensureDir(join(outputRoot, "a"));
+        await writeFileContent(
+          join(outputRoot, "a\\b", ".claude", "skills", "decoy", "SKILL.md"),
+          "---\nname: decoy\ndescription: Decoy description\n---\nDecoy body",
+        );
+        const outsideDir = join(testDir, "outside-home");
+        await writeFileContent(
+          join(outsideDir, ".claude", "skills", "private-skill", "SKILL.md"),
+          "---\nname: private-skill\ndescription: Private description\n---\nPrivate body",
+        );
+        await symlink(outsideDir, join(outputRoot, "a", "b"));
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        expect(toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName())).not.toContain(
+          "private-skill",
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("it resolves outside the project"),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse a nested skills directory the scan reports inside an excluded tree",
+      async () => {
+        // The exclusions are glob `ignore` patterns, matched against the path the
+        // scan reports. `x\\..\\node_modules` is reported at `x/../node_modules`,
+        // which matches none of them and then resolves to the dependency tree
+        // they name -- somebody else's project.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await ensureDir(join(outputRoot, "x"));
+        await writeFileContent(
+          join(outputRoot, "node_modules", ".claude", "skills", "dep-skill", "SKILL.md"),
+          "---\nname: dep-skill\ndescription: Dependency description\n---\nDependency body",
+        );
+        await writeFileContent(
+          join(outputRoot, "dist", ".claude", "skills", "built-skill", "SKILL.md"),
+          "---\nname: built-skill\ndescription: Built description\n---\nBuilt body",
+        );
+        // The decoys have to hold a skills directory of their own, because that is
+        // what makes the scan report the rewritten path in the first place.
+        await writeFileContent(
+          join(outputRoot, "x\\..\\node_modules", ".claude", "skills", "decoy-a", "SKILL.md"),
+          "---\nname: decoy-a\ndescription: Decoy description\n---\nDecoy body",
+        );
+        await writeFileContent(
+          join(outputRoot, "x\\..\\dist", ".claude", "skills", "decoy-b", "SKILL.md"),
+          "---\nname: decoy-b\ndescription: Decoy description\n---\nDecoy body",
+        );
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        const dirNames = toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName());
+        expect(dirNames).not.toContain("dep-skill");
+        expect(dirNames).not.toContain("built-skill");
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'it resolves inside "node_modules", which the nested scan excludes',
+          ),
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining('it resolves inside "dist", which the nested scan excludes'),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse a nested skills directory that reaches an excluded tree through a link",
+      async () => {
+        // No `..` is needed to reach the dependency tree: `a\\b` is reported at
+        // `a/b`, and `a/b` here is a link into `node_modules`. Folding the path
+        // is not enough -- the exclusion has to be judged on what it resolves to.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await ensureDir(join(outputRoot, "a"));
+        await writeFileContent(
+          join(outputRoot, "node_modules", "pkg", ".claude", "skills", "dep-skill", "SKILL.md"),
+          "---\nname: dep-skill\ndescription: Dependency description\n---\nDependency body",
+        );
+        await writeFileContent(
+          join(outputRoot, "a\\b", ".claude", "skills", "decoy", "SKILL.md"),
+          "---\nname: decoy\ndescription: Decoy description\n---\nDecoy body",
+        );
+        await symlink(join(outputRoot, "node_modules", "pkg"), join(outputRoot, "a", "b"));
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        expect(toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName())).not.toContain(
+          "dep-skill",
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'it resolves inside "node_modules", which the nested scan excludes',
+          ),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should not read the project's own skills directory as a nested root",
+      async () => {
+        // A directory named `x\\..` is reported at `x/..`, which folds onto the
+        // project root and so names the tool's own skills directory. A nested
+        // root is imported leniently, which would downgrade an invalid skill of
+        // the project's own from an error to a warning.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await writeFileContent(
+          join(outputRoot, ".claude", "skills", "own-skill", "SKILL.md"),
+          "---\nname: own-skill\ndescription: Own description\n---\nOwn body",
+        );
+        await writeFileContent(
+          join(outputRoot, "x\\..", ".claude", "skills", "decoy", "SKILL.md"),
+          "---\nname: decoy\ndescription: Decoy description\n---\nDecoy body",
+        );
+
+        const roots = await ClaudecodeSkill.getConfiguredImportRoots({ outputRoot, logger });
+
+        expect(roots.map((root) => root.relativeDirPath)).not.toContain(join(".claude", "skills"));
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should not read a nested root that resolves onto the project's own linked skills directory",
+      async () => {
+        // The project's own `.claude/skills` is itself a link into the project.
+        // The directory it stands for is then reported by the scan under its
+        // own name, and telling it apart from a nested root by where it
+        // resolves only works if the tool's own root is seeded under that
+        // resolved spelling too -- not only under its literal one.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await writeFileContent(
+          join(outputRoot, "shared", ".claude", "skills", "own-skill", "SKILL.md"),
+          "---\nname: own-skill\ndescription: Own description\n---\nOwn body",
+        );
+        await ensureDir(join(outputRoot, ".claude"));
+        await symlink(
+          join(outputRoot, "shared", ".claude", "skills"),
+          join(outputRoot, ".claude", "skills"),
+        );
+        await writeFileContent(
+          join(outputRoot, "apps", "web", ".claude", "skills", "deploy", "SKILL.md"),
+          "---\nname: deploy\ndescription: Deploy description\n---\nDeploy body",
+        );
+
+        const roots = await ClaudecodeSkill.getConfiguredImportRoots({ outputRoot, logger });
+
+        expect(roots.map((root) => root.relativeDirPath)).toEqual([
+          join("apps", "web", ".claude", "skills"),
+        ]);
+        expect(logger.warn).not.toHaveBeenCalled();
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should import each skill once when the project's own skills directory is a link",
+      async () => {
+        // Same layout as above, taken through the processor: the project's own
+        // skill is read once through the link, unscoped, and the genuine nested
+        // root's skill is read once and scoped to where it was found. This pins
+        // the processor-level outcome only; without the seed the duplicate read
+        // of own-skill would be absorbed as a quiet same-name overlay, so the
+        // seed itself is pinned by the getConfiguredImportRoots test above.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await writeFileContent(
+          join(outputRoot, "shared", ".claude", "skills", "own-skill", "SKILL.md"),
+          "---\nname: own-skill\ndescription: Own description\n---\nOwn body",
+        );
+        await ensureDir(join(outputRoot, ".claude"));
+        await symlink(
+          join(outputRoot, "shared", ".claude", "skills"),
+          join(outputRoot, ".claude", "skills"),
+        );
+        await writeFileContent(
+          join(outputRoot, "apps", "web", ".claude", "skills", "deploy", "SKILL.md"),
+          "---\nname: deploy\ndescription: Deploy description\n---\nDeploy body",
+        );
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        const dirNames = toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName());
+        expect(dirNames.filter((name) => name === "own-skill")).toHaveLength(1);
+        expect(dirNames.filter((name) => name === "deploy")).toHaveLength(1);
+        const byName = new Map(
+          toolDirs.map((dir) => [(dir as ClaudecodeSkill).getDirName(), dir as ClaudecodeSkill]),
+        );
+        expect(
+          byName.get("own-skill")?.toRulesyncSkill().getFrontmatter().claudecode,
+        ).toBeUndefined();
+        expect(byName.get("deploy")?.toRulesyncSkill().getFrontmatter().claudecode).toEqual({
+          paths: ["apps/web/**"],
+        });
+        expect(logger.warn).not.toHaveBeenCalled();
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should record a nested root reached through a link under the spelling the scan reports",
+      async () => {
+        // `a\\b` is reported at `a/b`, which here is a link to a directory whose
+        // own name the scan cannot report either. The root is judged by where it
+        // resolves, but recorded -- and its `paths` derived -- under the spelling
+        // that is read: the location the skill was found at is the one it is
+        // scoped to, not the one it resolves to.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await writeFileContent(
+          join(outputRoot, "a\\b", ".claude", "skills", "decoy", "SKILL.md"),
+          "---\nname: decoy\ndescription: Decoy description\n---\nDecoy body",
+        );
+        await writeFileContent(
+          join(outputRoot, "real\\c", ".claude", "skills", "linked", "SKILL.md"),
+          "---\nname: linked\ndescription: Linked description\n---\nLinked body",
+        );
+        await ensureDir(join(outputRoot, "a"));
+        await symlink(join(outputRoot, "real\\c"), join(outputRoot, "a", "b"));
+
+        const roots = await ClaudecodeSkill.getConfiguredImportRoots({ outputRoot, logger });
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        expect(roots.map((root) => root.relativeDirPath)).toEqual([
+          join("a", "b", ".claude", "skills"),
+        ]);
+        const linked = toolDirs.find((dir) => (dir as ClaudecodeSkill).getDirName() === "linked");
+        expect((linked as ClaudecodeSkill).toRulesyncSkill().getFrontmatter().claudecode).toEqual({
+          paths: ["a/b/**"],
+        });
+        // The directory's own spelling is still reported, and still refused.
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("could not be read under the path the scan reports"),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse a nested skills directory that resolves to no skills directory at all",
+      async () => {
+        // `a\\b` is reported at `a/b`, and `a/b/.claude/skills` here is a link
+        // into the dependency tree. What it resolves to no longer ends with the
+        // `.claude/skills` tail, so the segments above that tail -- the ones the
+        // exclusion rules judge -- are not the ones a fixed-length strip takes.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await writeFileContent(
+          join(outputRoot, "node_modules", "skills", "evil-skill", "SKILL.md"),
+          "---\nname: evil-skill\ndescription: Evil description\n---\nEvil body",
+        );
+        await writeFileContent(
+          join(outputRoot, "a\\b", ".claude", "skills", "decoy", "SKILL.md"),
+          "---\nname: decoy\ndescription: Decoy description\n---\nDecoy body",
+        );
+        await ensureDir(join(outputRoot, "a", "b", ".claude"));
+        await symlink(
+          join(outputRoot, "node_modules", "skills"),
+          join(outputRoot, "a", "b", ".claude", "skills"),
+        );
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        expect(toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName())).not.toContain(
+          "evil-skill",
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            'it resolves to "node_modules/skills", which is not a .claude/skills directory',
+          ),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse a nested skills directory that resolves onto the project root",
+      async () => {
+        // The shallowest shape of the same link: the project root's own relative
+        // path is empty, so it escapes nothing, and reading it as a skills tree
+        // would hand every directory in the project to the importer as a skill.
+        const logger = createMockLogger();
+        const outputRoot = join(testDir, "project");
+        await writeFileContent(join(outputRoot, "some-dir", "notes.md"), "Not a skill at all");
+        await writeFileContent(
+          join(outputRoot, "a\\b", ".claude", "skills", "decoy", "SKILL.md"),
+          "---\nname: decoy\ndescription: Decoy description\n---\nDecoy body",
+        );
+        await ensureDir(join(outputRoot, "a", "b", ".claude"));
+        await symlink(outputRoot, join(outputRoot, "a", "b", ".claude", "skills"));
+
+        const toolDirs = await new SkillsProcessor({
+          logger,
+          outputRoot,
+          toolTarget: "claudecode",
+        }).loadToolDirs();
+
+        expect(toolDirs.map((dir) => (dir as ClaudecodeSkill).getDirName())).not.toContain(
+          "some-dir",
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(
+            "it resolves to the project root, which is not a .claude/skills directory",
+          ),
+        );
+      },
+    );
+
     it("should still abort import for non-lenient tools when a declared-root skill is invalid", async () => {
       const processor = new SkillsProcessor({
         logger: createMockLogger(),
@@ -1517,7 +2171,15 @@ Second content`;
       expect(names).toEqual(["skill-1", "skill-2"]);
     });
 
-    it("should throw error when directory fails to load", async () => {
+    it("should skip a skill directory that fails to load with a warning", async () => {
+      // Claude Code keeps loading the other skills when one SKILL.md is
+      // broken, so import skips that one instead of aborting the run.
+      const logger = createMockLogger();
+      const lenientProcessor = new SkillsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "claudecode",
+      });
       const skillsDir = join(testDir, ".claude", "skills");
       await ensureDir(skillsDir);
 
@@ -1530,7 +2192,50 @@ Second content`;
         "Invalid format without frontmatter",
       );
 
-      await expect(processor.loadToolDirs()).rejects.toThrow();
+      const toolDirs = await lenientProcessor.loadToolDirs();
+
+      expect(toolDirs).toHaveLength(0);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining(join(".claude", "skills", "invalid")),
+      );
+    });
+
+    it("should keep importing the other skills when one SKILL.md has unparseable YAML", async () => {
+      const logger = createMockLogger();
+      const lenientProcessor = new SkillsProcessor({
+        logger,
+        outputRoot: testDir,
+        toolTarget: "claudecode",
+      });
+      const skillsDir = join(testDir, ".claude", "skills");
+      await ensureDir(join(skillsDir, "broken"));
+      await ensureDir(join(skillsDir, "fix-issue"));
+      // `[filename] [format]` unquoted is not valid YAML.
+      await writeFileContent(
+        join(skillsDir, "broken", "SKILL.md"),
+        `---
+name: broken
+description: Broken skill
+argument-hint: [filename] [format]
+---
+Body`,
+      );
+      await writeFileContent(
+        join(skillsDir, "fix-issue", "SKILL.md"),
+        `---
+name: fix-issue
+description: Fix a GitHub issue
+argument-hint: [issue-number]
+---
+Fix issue $ARGUMENTS.`,
+      );
+
+      const toolDirs = await lenientProcessor.loadToolDirs();
+
+      expect(toolDirs.map((dir) => dir.getDirName())).toEqual(["fix-issue"]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining(join(".claude", "skills", "broken")),
+      );
     });
 
     describe("global mode", () => {
@@ -1605,6 +2310,96 @@ Test skill content`;
       expect(dirsToDelete).toHaveLength(1);
       expect(dirsToDelete[0]).toBeInstanceOf(ClaudecodeSkill);
       expect(dirsToDelete[0]?.getDirName()).toBe("test-skill");
+    });
+
+    it.skipIf(process.platform === "win32")(
+      "should warn and skip a skills root that is a symbolic link, even one inside the output root",
+      async () => {
+        // A dotfiles checkout linked from inside the home directory. Sweeping
+        // through the link could delete entries rulesync does not manage, and
+        // the writes already landed, so the root is skipped rather than
+        // failing the run.
+        const logger = createMockLogger();
+        const processor = new SkillsProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "claudecode",
+        });
+        const linkedSkillsDir = join(testDir, "dotfiles", "claude-skills");
+        await writeFileContent(
+          join(linkedSkillsDir, "stale", "SKILL.md"),
+          "---\nname: stale\ndescription: Test skill\n---\nContent",
+        );
+        await ensureDir(join(testDir, ".claude"));
+        await symlink(linkedSkillsDir, join(testDir, ".claude", "skills"));
+
+        expect(await processor.loadToolDirsToDelete()).toEqual([]);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("Skipping the orphan sweep"),
+        );
+      },
+    );
+
+    it("should sweep gitlabduo's .agents/skills but never its import-only skills/ root", async () => {
+      // GitLab Duo also reads the repository-root `skills/`, which routinely
+      // holds hand-authored skills rulesync never generated, so only the
+      // `.agents/skills/` root rulesync writes is swept.
+      const processor = new SkillsProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        toolTarget: "gitlabduo",
+      });
+      await writeFileContent(
+        join(testDir, "skills", "hand-authored", "SKILL.md"),
+        "---\nname: hand-authored\ndescription: Test skill\n---\nContent",
+      );
+      await writeFileContent(
+        join(testDir, ".agents", "skills", "orphan", "SKILL.md"),
+        "---\nname: orphan\ndescription: Test skill\n---\nContent",
+      );
+
+      const dirsToDelete = await processor.loadToolDirsToDelete();
+
+      expect(dirsToDelete.map((dir) => dir.getRelativePathFromCwd())).toEqual([
+        ".agents/skills/orphan",
+      ]);
+    });
+
+    it("should not sweep a cursor category folder without SKILL.md", async () => {
+      const processor = new SkillsProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        toolTarget: "cursor",
+      });
+      await writeFileContent(
+        join(testDir, ".cursor", "skills", "shipping", "land-it", "SKILL.md"),
+        "---\nname: land-it\ndescription: Test skill\n---\nContent",
+      );
+      await writeFileContent(
+        join(testDir, ".cursor", "skills", "orphan", "SKILL.md"),
+        "---\nname: orphan\ndescription: Test skill\n---\nContent",
+      );
+
+      const dirsToDelete = await processor.loadToolDirsToDelete();
+
+      expect(dirsToDelete.map((dir) => dir.getDirName())).toEqual(["orphan"]);
+    });
+
+    it("should still sweep the global gitlabduo skills root", async () => {
+      const processor = new SkillsProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        toolTarget: "gitlabduo",
+        global: true,
+      });
+      await writeFileContent(
+        join(testDir, ".gitlab", "duo", "skills", "orphan", "SKILL.md"),
+        "---\nname: orphan\ndescription: Test skill\n---\nContent",
+      );
+
+      const dirsToDelete = await processor.loadToolDirsToDelete();
+
+      expect(dirsToDelete.map((dir) => dir.getDirName())).toEqual(["orphan"]);
     });
 
     it("should report a skill directory whose name contains a backslash", async () => {
@@ -1906,6 +2701,28 @@ Content that would fail parsing`;
       expect(dirsToDelete.map((d) => d.getRelativeDirPath())).toEqual([join(".junie", "skills")]);
       expect(dirsToDelete.map((d) => d.getDirName())).toEqual(["own-skill"]);
     });
+
+    it("should never list the import-only .agents/skills root for warp deletion", async () => {
+      // warp shares the `.agents/skills/` tree with every other Agent Skills
+      // client (and, in global mode, `~/.agents/skills/`), so `--delete` for
+      // the warp target must only ever prune `.warp/skills/`.
+      const processor = new SkillsProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        toolTarget: "warp",
+      });
+      const warpDir = join(testDir, ".warp", "skills", "own-skill");
+      const sharedDir = join(testDir, ".agents", "skills", "foreign-skill");
+      await ensureDir(warpDir);
+      await ensureDir(sharedDir);
+      await writeFileContent(join(warpDir, "SKILL.md"), "x");
+      await writeFileContent(join(sharedDir, "SKILL.md"), "y");
+
+      const dirsToDelete = await processor.loadToolDirsToDelete();
+
+      expect(dirsToDelete.map((d) => d.getRelativeDirPath())).toEqual([join(".warp", "skills")]);
+      expect(dirsToDelete.map((d) => d.getDirName())).toEqual(["own-skill"]);
+    });
   });
 
   describe("getToolTargets", () => {
@@ -1915,43 +2732,68 @@ Content that would fail parsing`;
         new Set([
           "agentsskills",
           "aiassistant",
+          "androidstudio",
           "amp",
           "antigravity-cli",
           "antigravity-ide",
           "antigravity-plugin",
           "augmentcode",
+          "augmentcode-plugin",
+          "bob",
           "claudecode",
           "claudecode-plugin",
           "claudecode-legacy",
           "cline",
+          "codebuddy",
+          "codewhale",
           "codexcli",
+          "commandcode",
+          "continue",
           "copilot",
           "copilotcli",
+          "cortexcode",
+          "crush",
           "cursor",
           "deepagents",
           "factorydroid",
+          "firebender",
           "goose",
+          "gitlabduo",
           "grokcli",
           "junie",
           "kilo",
           "kimi-code",
+          "kimi-code-plugin",
           "kiro",
           "kiro-cli",
           "kiro-ide",
+          "lettacode",
           "musecode",
+          "mimocode",
+          "omp",
           "opencode",
           "pi",
+          "pool",
+          "qoder",
           "qwencode",
           "reasonix",
           "replit",
           "roo",
           "zoocode",
           "rovodev",
+          "tabnine",
           "takt",
+          "trae",
           "vibe",
+          "vibe-plugin",
           "warp",
+          "xum",
           "devin",
+          "devin-plugin",
           "zed",
+          "zcode",
+          "zcode-plugin",
+          "dsh",
         ]),
       );
     });
@@ -1963,43 +2805,68 @@ Content that would fail parsing`;
           "agentsmd",
           "agentsskills",
           "aiassistant",
+          "androidstudio",
           "amp",
           "antigravity-cli",
           "antigravity-ide",
           "antigravity-plugin",
           "augmentcode",
+          "augmentcode-plugin",
+          "bob",
           "claudecode",
           "claudecode-plugin",
           "claudecode-legacy",
           "cline",
+          "codebuddy",
+          "codewhale",
           "codexcli",
+          "commandcode",
+          "continue",
           "copilot",
           "copilotcli",
+          "cortexcode",
+          "crush",
           "cursor",
           "deepagents",
           "factorydroid",
+          "firebender",
           "goose",
+          "gitlabduo",
           "grokcli",
           "junie",
           "kilo",
           "kimi-code",
+          "kimi-code-plugin",
           "kiro",
           "kiro-cli",
           "kiro-ide",
+          "lettacode",
           "musecode",
+          "mimocode",
+          "omp",
           "opencode",
           "pi",
+          "pool",
+          "qoder",
           "qwencode",
           "reasonix",
           "replit",
           "roo",
           "zoocode",
           "rovodev",
+          "tabnine",
           "takt",
+          "trae",
           "vibe",
+          "vibe-plugin",
           "warp",
+          "xum",
           "devin",
+          "devin-plugin",
           "zed",
+          "zcode",
+          "zcode-plugin",
+          "dsh",
         ]),
       );
     });
@@ -2010,43 +2877,68 @@ Content that would fail parsing`;
         new Set([
           "agentsskills",
           "aiassistant",
+          "androidstudio",
           "amp",
           "antigravity-cli",
           "antigravity-ide",
           "antigravity-plugin",
           "augmentcode",
+          "augmentcode-plugin",
+          "bob",
           "claudecode",
           "claudecode-plugin",
           "claudecode-legacy",
           "cline",
+          "codebuddy",
+          "codewhale",
           "codexcli",
+          "commandcode",
+          "continue",
           "copilot",
           "copilotcli",
+          "cortexcode",
+          "crush",
           "cursor",
           "deepagents",
           "factorydroid",
+          "firebender",
           "goose",
+          "gitlabduo",
           "grokcli",
           "junie",
           "kilo",
           "kimi-code",
+          "kimi-code-plugin",
           "kiro",
           "kiro-cli",
           "kiro-ide",
+          "lettacode",
           "musecode",
+          "mimocode",
+          "omp",
           "opencode",
           "pi",
+          "pool",
+          "qoder",
           "qwencode",
           "reasonix",
           "replit",
           "roo",
           "zoocode",
           "rovodev",
+          "tabnine",
           "takt",
+          "trae",
           "vibe",
+          "vibe-plugin",
           "warp",
+          "xum",
           "devin",
+          "devin-plugin",
           "zed",
+          "zcode",
+          "zcode-plugin",
+          "dsh",
         ]),
       );
     });
@@ -2068,40 +2960,61 @@ Content that would fail parsing`;
       const targets = SkillsProcessor.getToolTargetsGlobal();
       expect(targets).toEqual([
         "agentsskills",
+        "androidstudio",
         "amp",
         "antigravity-cli",
         "antigravity-ide",
         "augmentcode",
+        "bob",
         "claudecode",
         "claudecode-legacy",
         "cline",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
+        "continue",
         "copilot",
         "copilotcli",
+        "cortexcode",
+        "crush",
         "cursor",
         "deepagents",
         "factorydroid",
+        "firebender",
+        "goose",
         "hermesagent",
+        "gitlabduo",
         "grokcli",
         "junie",
         "kilo",
+        "lettacode",
         "kimi-code",
         "kiro-cli",
         "kiro-ide",
+        "mimocode",
         "musecode",
+        "omp",
         "opencode",
         "pi",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "replit",
         "roo",
         "zoocode",
         "rovodev",
+        "tabnine",
         "takt",
+        "trae",
         "vibe",
         "warp",
+        "xum",
         "devin",
+        "zcode",
         "zed",
+        "dsh",
       ]);
       expect(targets).toEqual(skillsProcessorToolTargetsGlobal);
     });
@@ -2112,40 +3025,61 @@ Content that would fail parsing`;
       const targets = SkillsProcessor.getToolTargets({ global: true });
       expect(targets).toEqual([
         "agentsskills",
+        "androidstudio",
         "amp",
         "antigravity-cli",
         "antigravity-ide",
         "augmentcode",
+        "bob",
         "claudecode",
         "claudecode-legacy",
         "cline",
+        "codebuddy",
+        "codewhale",
         "codexcli",
+        "commandcode",
+        "continue",
         "copilot",
         "copilotcli",
+        "cortexcode",
+        "crush",
         "cursor",
         "deepagents",
         "factorydroid",
+        "firebender",
+        "goose",
         "hermesagent",
+        "gitlabduo",
         "grokcli",
         "junie",
         "kilo",
+        "lettacode",
         "kimi-code",
         "kiro-cli",
         "kiro-ide",
+        "mimocode",
         "musecode",
+        "omp",
         "opencode",
         "pi",
+        "pool",
+        "qoder",
         "qwencode",
         "reasonix",
         "replit",
         "roo",
         "zoocode",
         "rovodev",
+        "tabnine",
         "takt",
+        "trae",
         "vibe",
         "warp",
+        "xum",
         "devin",
+        "zcode",
         "zed",
+        "dsh",
       ]);
       expect(targets).toEqual(skillsProcessorToolTargetsGlobal);
     });
@@ -2280,5 +3214,46 @@ Content that would fail parsing`;
       const secondWrite = await processor.writeAiDirs(toolDirs);
       expect(secondWrite.count).toBe(0);
     });
+
+    it.skipIf(process.platform === "win32")(
+      "should write an executable supporting script executable, and restore a stripped bit",
+      async () => {
+        const rulesyncSkill = new RulesyncSkill({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+          dirName: "script-skill",
+          frontmatter: {
+            name: "script-skill",
+            description: "Skill with a script",
+          },
+          body: "Skill body",
+          otherFiles: [
+            {
+              relativeFilePathToDirPath: join("scripts", "run.sh"),
+              fileBuffer: Buffer.from("#!/bin/sh\necho hi\n"),
+              fileMode: 0o755,
+            },
+            { relativeFilePathToDirPath: "notes.md", fileBuffer: Buffer.from("plain\n") },
+          ],
+          validate: false,
+        });
+
+        const toolDirs = await processor.convertRulesyncDirsToToolDirs([rulesyncSkill]);
+        const firstWrite = await processor.writeAiDirs(toolDirs);
+        expect(firstWrite.count).toBe(1);
+
+        const skillDir = join(testDir, ".claude", "skills", "script-skill");
+        const scriptPath = join(skillDir, "scripts", "run.sh");
+        expect((await stat(scriptPath)).mode & 0o777).toBe(0o755);
+        expect((await stat(join(skillDir, "notes.md"))).mode & 0o111).toBe(0);
+
+        // A copy whose bit was stripped is repaired even though its bytes
+        // match, and that repair is not reported as a change.
+        await chmod(scriptPath, 0o644);
+        const secondWrite = await processor.writeAiDirs(toolDirs);
+        expect(secondWrite.count).toBe(0);
+        expect((await stat(scriptPath)).mode & 0o777).toBe(0o755);
+      },
+    );
   });
 });

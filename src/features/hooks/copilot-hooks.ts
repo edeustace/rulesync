@@ -20,6 +20,7 @@ import {
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
 import type { RulesyncHooks } from "./rulesync-hooks.js";
 import { buildImportedHooksConfig } from "./tool-hooks-converter.js";
 import {
@@ -37,14 +38,23 @@ import {
  * portable `command` field is written, which upstream copies to both when
  * neither is present. Note the cloud agent runs hooks in a Linux sandbox and
  * honors only `bash` and `command` — a `powershell` entry is ignored there.
+ * VS Code reads the same file and maps `bash` to `osx` / `linux` and
+ * `powershell` to `windows`; it also documents its own per-OS overrides
+ * (`windows`, `linux`, `osx`) next to `command`, which are typed here so an
+ * entry that uses them instead of a shell field is not mistaken for one
+ * without a command.
  *
  * @see https://docs.github.com/en/copilot/reference/hooks-reference
+ * @see https://code.visualstudio.com/docs/agents/reference/hooks-reference
  */
 const CopilotHookEntrySchema = z.looseObject({
   type: z.string(),
   bash: z.optional(z.string()),
   powershell: z.optional(z.string()),
   command: z.optional(z.string()),
+  windows: z.optional(z.string()),
+  linux: z.optional(z.string()),
+  osx: z.optional(z.string()),
   cwd: z.optional(z.string()),
   env: z.optional(z.record(z.string(), z.string())),
   timeoutSec: z.optional(z.number()),
@@ -83,12 +93,15 @@ function canonicalToCopilotHooks(config: HooksConfig): Record<string, CopilotHoo
   };
   const copilot: Record<string, CopilotHookEntry[]> = {};
   for (const [eventName, definitions] of Object.entries(effectiveHooks)) {
-    const copilotEventName = CANONICAL_TO_COPILOT_EVENT_NAMES[eventName] ?? eventName;
+    const copilotEventName =
+      lookupOwn({ record: CANONICAL_TO_COPILOT_EVENT_NAMES, key: eventName }) ?? eventName;
     const entries: CopilotHookEntry[] = [];
     for (const def of definitions) {
       const hookType = def.type ?? "command";
 
-      // Not supported
+      // Not supported. VS Code documents that it ignores `matcher` values
+      // ("hooks run on all tool invocations regardless of the matcher"), so an
+      // entry that depends on one is dropped rather than emitted unscoped.
       if (def.matcher) continue;
       if (hookType !== "command") continue;
 
@@ -155,16 +168,29 @@ function resolveImportCommand(
  *
  * Generate re-emits any non-canonical key verbatim through `rest`, so a key
  * dropped here does not survive an import → generate round trip. `cwd` is a
- * documented Copilot hook field and was previously lost that way.
+ * documented Copilot hook field and was previously lost that way, as were the
+ * VS Code per-OS overrides `windows` / `linux` / `osx`: an entry authored with
+ * only those (no `command`) imported as a hook with no command at all and was
+ * regenerated empty.
  *
  * @see https://docs.github.com/en/copilot/reference/hooks-reference
  * @see https://docs.github.com/en/copilot/concepts/agents/coding-agent/about-hooks
+ * @see https://code.visualstudio.com/docs/agents/reference/hooks-reference
  */
 function importPassthrough(entry: CopilotHookEntry): Record<string, unknown> {
   const passthrough: Record<string, unknown> = {};
   if (entry.cwd !== undefined) passthrough.cwd = entry.cwd;
   if (entry.env !== undefined) passthrough.env = entry.env;
+  for (const key of OS_OVERRIDE_KEYS) {
+    if (entry[key] !== undefined) passthrough[key] = entry[key];
+  }
   return passthrough;
+}
+
+const OS_OVERRIDE_KEYS = ["windows", "linux", "osx"] as const;
+
+function hasOsOverride(passthrough: Record<string, unknown>): boolean {
+  return OS_OVERRIDE_KEYS.some((key) => passthrough[key] !== undefined);
 }
 
 /**
@@ -178,7 +204,9 @@ function copilotHooksToCanonical(copilotHooks: unknown, logger?: Logger): HooksC
 
   const canonical: HooksConfig["hooks"] = {};
   for (const [copilotEventName, hookEntries] of Object.entries(copilotHooks)) {
-    const eventName = COPILOT_TO_CANONICAL_EVENT_NAMES[copilotEventName] ?? copilotEventName;
+    const eventName =
+      lookupOwn({ record: COPILOT_TO_CANONICAL_EVENT_NAMES, key: copilotEventName }) ??
+      copilotEventName;
     if (!Array.isArray(hookEntries)) continue;
     const defs: HooksConfig["hooks"][string] = [];
     for (const rawEntry of hookEntries) {
@@ -187,13 +215,21 @@ function copilotHooksToCanonical(copilotHooks: unknown, logger?: Logger): HooksC
       const entry = parseResult.data;
       const { command, shell } = resolveImportCommand(entry, logger);
       const timeout = entry.timeoutSec ?? entry.timeout;
+      const passthrough = importPassthrough(entry);
+      if (command === undefined && hasOsOverride(passthrough)) {
+        // Imported into the shared `hooks` block, where every other target
+        // reads the canonical `command` and would emit a hook without one.
+        logger?.warn(
+          `Copilot hook on '${copilotEventName}' has only VS Code per-OS overrides (windows/linux/osx) and no portable command; it is preserved for copilot, but other targets will generate it without a command until a \`command\` is added.`,
+        );
+      }
 
       defs.push({
         type: "command",
         ...(command !== undefined && { command }),
         ...(shell !== undefined && { shell }),
         ...(timeout !== undefined && { timeout }),
-        ...importPassthrough(entry),
+        ...passthrough,
       });
     }
     if (defs.length > 0) {

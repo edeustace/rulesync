@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
+import { fallbackLogger } from "../../utils/logger.js";
 import { AntigravityIdePermissions } from "./antigravity-ide-permissions.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
 
@@ -67,15 +68,101 @@ describe("AntigravityIdePermissions", () => {
       const json = JSON.parse(perms.getFileContent());
       expect(json.permissions.allow).toEqual(
         expect.arrayContaining([
-          "read_file(src/**)",
-          "write_file(src/**)",
-          "command(git *)",
+          "read_file(src)",
+          "write_file(src)",
+          "command(git)",
           "read_url(example.com)",
           "mcp(linter/*)",
         ]),
       );
-      expect(json.permissions.deny).toContain("command(rm *)");
+      expect(json.permissions.deny).toContain("command(rm)");
       expect(json.permissions.ask).toContain("command");
+    });
+
+    it("writes globs Antigravity can match: literal words or a per-word regex", async () => {
+      const perms = await AntigravityIdePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: rulesyncPermissions({
+          bash: {
+            "npm run *": "allow",
+            "npm test:*": "allow",
+            "git push * --force": "deny",
+            "git push -f*": "deny",
+          },
+        }),
+      });
+      const json = JSON.parse(perms.getFileContent());
+      expect(json.permissions.allow).toEqual([
+        "command(npm run)",
+        "command(regex:^npm$ ^test:.*$)",
+      ]);
+      // `git push * --force` has no word-by-word spelling, so the deny is
+      // widened to its literal words.
+      expect(json.permissions.deny).toEqual([
+        "command(git push)",
+        "command(regex:^git$ ^push$ ^-f.*$)",
+      ]);
+    });
+
+    it("keeps a deny that overlaps a translated allow in force (#3324)", async () => {
+      const perms = await AntigravityIdePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: rulesyncPermissions({
+          bash: { "git push *": "allow", "git push * --force": "deny" },
+        }),
+      });
+      const json = JSON.parse(perms.getFileContent());
+      // Antigravity applies deny over allow, so `git push origin main --force`
+      // is blocked rather than run unprompted by the allow.
+      expect(json.permissions.allow).toEqual(["command(git push)"]);
+      expect(json.permissions.deny).toEqual(["command(git push)"]);
+    });
+
+    it("drops entries that two patterns translate to", async () => {
+      const perms = await AntigravityIdePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: rulesyncPermissions({
+          edit: { "src/**": "allow" },
+          write: { "src/**": "allow" },
+          bash: {
+            "npm run *": "allow",
+            "npm   run *": "allow",
+            "git push * --force": "deny",
+            "git push * -f": "deny",
+          },
+        }),
+      });
+      const json = JSON.parse(perms.getFileContent());
+      expect(json.permissions.allow).toEqual(["command(npm run)", "write_file(src)"]);
+      expect(json.permissions.deny).toEqual(["command(git push)"]);
+    });
+
+    it("still skips a deny with no literal word to widen to", async () => {
+      const perms = await AntigravityIdePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: rulesyncPermissions({ bash: { "* --force": "deny" } }),
+      });
+      const json = JSON.parse(perms.getFileContent());
+      expect(json.permissions?.deny ?? []).toEqual([]);
+    });
+
+    // Earlier releases wrote these patterns verbatim.
+    it("translates unsandboxed and execute_url patterns instead of copying them", async () => {
+      const perms = await AntigravityIdePermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: rulesyncPermissions({
+          unsandboxed: { "npm run *": "allow", "git push": "allow", "rm -rf *": "deny" },
+          execute_url: { "https://example.com/*": "allow" },
+        }),
+      });
+
+      const json = JSON.parse(perms.getFileContent());
+      expect(json.permissions.allow.toSorted()).toEqual([
+        "execute_url(example.com)",
+        "unsandboxed(git push)",
+        "unsandboxed(npm run)",
+      ]);
+      expect(json.permissions.deny).toEqual(["unsandboxed(rm -rf)"]);
     });
 
     it("uses a bare action name for the catch-all '*' pattern", async () => {
@@ -106,7 +193,7 @@ describe("AntigravityIdePermissions", () => {
 
       expect(json["antigravity.someSetting"]).toBe(true);
       expect(json.permissions.allow).toContain("execute_url(localhost)");
-      expect(json.permissions.allow).toContain("command(git *)");
+      expect(json.permissions.allow).toContain("command(git)");
       expect(json.permissions.deny).toContain("unsandboxed");
     });
   });
@@ -119,8 +206,8 @@ describe("AntigravityIdePermissions", () => {
         relativeFilePath: "settings.json",
         fileContent: JSON.stringify({
           permissions: {
-            allow: ["read_file(src/**)", "write_file(src/**)", "command(git *)", "read_url(x.com)"],
-            deny: ["command(rm *)"],
+            allow: ["read_file(src/**)", "write_file(src/**)", "command(git)", "read_url(x.com)"],
+            deny: ["command(rm)"],
             ask: ["mcp(server/*)"],
           },
         }),
@@ -135,6 +222,25 @@ describe("AntigravityIdePermissions", () => {
       expect(config.permission.mcp["server/*"]).toBe("ask");
     });
 
+    it("reads a per-word regex it could have written back as a glob", () => {
+      const perms = new AntigravityIdePermissions({
+        outputRoot: testDir,
+        relativeDirPath: ".antigravity",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          permissions: {
+            deny: ["command(regex:^git$ ^push$ ^-f.*$)", "command(regex:^git push .* --force$)"],
+          },
+        }),
+      });
+      const config = JSON.parse(perms.toRulesyncPermissions().getFileContent());
+      expect(config.permission.bash).toEqual({
+        "git push -f*": "deny",
+        // `.*` matches one word here, which a glob cannot say.
+        "regex:^git push .* --force$": "deny",
+      });
+    });
+
     it("round-trips patterns containing parentheses", () => {
       const perms = new AntigravityIdePermissions({
         outputRoot: testDir,
@@ -145,7 +251,47 @@ describe("AntigravityIdePermissions", () => {
         }),
       });
       const config = JSON.parse(perms.toRulesyncPermissions().getFileContent());
-      expect(config.permission.bash["npm run (build|test)"]).toBe("allow");
+      expect(config.permission.bash["npm run (build|test) *"]).toBe("allow");
+    });
+
+    it("warns when an imported command target may lose its meaning", () => {
+      const perms = new AntigravityIdePermissions({
+        outputRoot: testDir,
+        relativeDirPath: ".antigravity",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          permissions: { deny: ["command(regex:rm)", "command(rm -rf *)", "command(git push)"] },
+        }),
+      });
+
+      const warnSpy = vi.spyOn(fallbackLogger, "warn");
+      const config = JSON.parse(perms.toRulesyncPermissions().getFileContent());
+      expect(config.permission.bash).toEqual({
+        "rm *": "deny",
+        "regex:^rm$ ^-rf$ ^\\*$": "deny",
+        "git push *": "deny",
+      });
+      // `regex:rm` is anchored by Antigravity, so only the legacy target warns.
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      const message = warnSpy.mock.calls[0]?.[0];
+      expect(message).toContain("Antigravity IDE permissions: importing command(rm -rf *)");
+      expect(message).toContain("NOT enforced by the other tools");
+      warnSpy.mockRestore();
+    });
+
+    it("imports an unsandboxed target the way it imports a command target", () => {
+      const perms = new AntigravityIdePermissions({
+        outputRoot: testDir,
+        relativeDirPath: ".antigravity",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          permissions: { allow: ["unsandboxed(npm run)", "execute_url(example.com)"] },
+        }),
+      });
+
+      const config = JSON.parse(perms.toRulesyncPermissions().getFileContent());
+      expect(config.permission.unsandboxed).toEqual({ "npm run *": "allow" });
+      expect(config.permission.execute_url).toEqual({ "example.com": "allow" });
     });
   });
 });

@@ -1,101 +1,231 @@
 import matter from "gray-matter";
 import { dump } from "js-yaml";
 
+import { type BoundedWalk, createBoundedWalk } from "./bounded-walk.js";
 import { stripControlCharacters } from "./control-characters.js";
 import { formatError } from "./error.js";
 import { toPosixPath } from "./file.js";
 import { warnOnceWithFallback } from "./logger.js";
+import { isPrototypePollutionKey } from "./prototype-pollution.js";
 import { isPlainObject } from "./type-guards.js";
 import { loadYaml } from "./yaml.js";
 
-function deepRemoveNullishValue(value: unknown): unknown {
-  if (value === null || value === undefined) {
-    return undefined;
-  }
+/**
+ * Upper bound on the number of values a frontmatter document may expand to
+ * once every YAML alias is written out.
+ *
+ * A YAML alias makes one parsed container reachable from many keys, and the
+ * cleaners below copy each reachable value, so a small file with a few levels
+ * of nested aliases (an "alias bomb") can expand into megabytes of output or
+ * exhaust the heap. Counting every visited value against this budget turns
+ * that into an error instead. Real frontmatter is a handful of keys; even a
+ * generous skill manifest stays orders of magnitude below the limit.
+ */
+export const MAX_FRONTMATTER_VALUES = 100_000;
 
-  if (Array.isArray(value)) {
-    const cleanedArray = value
-      .map((item) => deepRemoveNullishValue(item))
-      .filter((item) => item !== undefined);
-    return cleanedArray;
-  }
+/**
+ * Upper bound on the total character count of string leaves a frontmatter
+ * document may expand to.
+ *
+ * {@link MAX_FRONTMATTER_VALUES} bounds how many values are visited, but a
+ * single long string aliased thousands of times still fits that budget while
+ * the duplicated output balloons: one scalar of a few KB, chained through a
+ * handful of aliases within the value budget, can multiply into a document
+ * many megabytes larger than it started. Charging every visited string's
+ * length against this separate budget bounds that output regardless of how
+ * many aliases point at it.
+ */
+export const MAX_FRONTMATTER_STRING_CHARS = 4_000_000;
 
-  if (isPlainObject(value)) {
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value)) {
-      const cleaned = deepRemoveNullishValue(val);
-      if (cleaned !== undefined) {
-        result[key] = cleaned;
-      }
-    }
-    return result;
-  }
+/**
+ * Upper bound on how many containers deep a frontmatter document may nest.
+ *
+ * Both budgets above cap the *breadth* of the walk, but a chain of aliases
+ * that each wrap the previous one (`a1: [*a0]`, `a2: [*a1]`, ...) is deep
+ * rather than wide: it stays a small handful of values per level while
+ * recursing one more stack frame per level. That overflows the JS call stack
+ * well before either budget trips, turning a bounded document into an
+ * unhandled `RangeError` instead of the intended refusal. Capping nesting
+ * depth explicitly, far below where the stack would actually overflow, keeps
+ * that failure mode a clear, recognizable error.
+ *
+ * The cap is also the only thing bounding an otherwise-uncharged cost: YAML
+ * output indents every level, so a document sitting near the limit costs
+ * several times more emitted bytes per value than a shallow one. Keeping this
+ * cap itself small — well below the previous, far more generous limit — is
+ * what bounds that worst case, since indentation width is not separately
+ * charged against {@link MAX_FRONTMATTER_STRING_CHARS}. Real frontmatter
+ * nests at most a few levels deep, so this still leaves generous headroom
+ * while staying comfortably under js-yaml's own 100-level cap on raw
+ * (non-aliased) nesting.
+ */
+export const MAX_FRONTMATTER_DEPTH = 64;
 
-  return value;
+/**
+ * Upper bound on the raw character length of the `---`-delimited frontmatter
+ * block itself, checked before it is ever handed to the YAML parser.
+ *
+ * The budgets above only bound the *parsed* document — the walk over
+ * `matter()`'s output — but a complex YAML key (an array or mapping used as a
+ * mapping key) is joined into a string by js-yaml while it parses, and a
+ * mapping with many such keys can cost real memory before that walk ever
+ * starts, or even before `matter()` returns. Capping the raw block size keeps
+ * that parse-time cost bounded regardless of what the block contains. Real
+ * frontmatter blocks are a few hundred bytes at most; even a large project
+ * manifest stays well under this.
+ */
+export const MAX_FRONTMATTER_RAW_CHARS = 65_536;
+
+type DeepCleanOptions = {
+  /** Applied to every string leaf; the default keeps strings as they are. */
+  transformString?: (value: string) => string;
+  /**
+   * The budgets, depth cap and descent path of this walk. A reference back
+   * to a container on the path (a YAML anchor that aliases its own ancestor)
+   * is a cycle and is dropped rather than walked until the stack overflows.
+   */
+  walk: BoundedWalk;
+};
+
+/**
+ * Estimate the serialized character cost of a leaf that is not a string (a
+ * string leaf is charged by its own length instead).
+ *
+ * js-yaml's default schema resolves `!!binary` scalars to a `Uint8Array`, and
+ * its dumper writes one back out as base64 — roughly 4 output characters per
+ * 3 input bytes. Without this, an aliased binary blob would walk the budget
+ * for free even though it can dominate the emitted document's size.
+ */
+function estimateLeafChars(value: unknown): number {
+  if (value instanceof Uint8Array) {
+    return Math.ceil(value.byteLength / 3) * 4;
+  }
+  return 0;
 }
 
-function deepRemoveNullishObject(
-  obj: Record<string, unknown> | null | undefined,
-): Record<string, unknown> {
-  if (!obj || typeof obj !== "object") {
-    return {};
-  }
+/**
+ * Copy one parsed value, dropping nullish leaves and cyclic references.
+ *
+ * Every alias is still written out as an independent copy, as gray-matter's
+ * default YAML engine would otherwise serialize shared references as `&ref_0`
+ * anchors that simplified frontmatter parsers cannot read; the expansion is
+ * bounded by {@link MAX_FRONTMATTER_VALUES} instead.
+ */
+function deepCleanValue(value: unknown, options: DeepCleanOptions): unknown {
+  // Charge nullish leaves too: an aliased array of nulls would otherwise be
+  // walked for free, and the walk is the work being bounded.
+  const leafChars = typeof value === "string" ? value.length : estimateLeafChars(value);
+  options.walk.chargeValue(leafChars);
 
-  const result: Record<string, unknown> = {};
-  for (const [key, val] of Object.entries(obj)) {
-    const cleaned = deepRemoveNullishValue(val);
-    if (cleaned !== undefined) {
-      result[key] = cleaned;
-    }
-  }
-  return result;
-}
-
-function deepFlattenStringsValue(value: unknown): unknown {
   if (value === null || value === undefined) {
     return undefined;
   }
 
   if (typeof value === "string") {
-    return value.replace(/\n+/g, " ").trim();
+    return options.transformString ? options.transformString(value) : value;
   }
 
   if (Array.isArray(value)) {
-    const cleanedArray = value
-      .map((item) => deepFlattenStringsValue(item))
-      .filter((item) => item !== undefined);
+    if (options.walk.isAncestor(value)) {
+      return undefined;
+    }
+    options.walk.enter(value);
+    const cleanedArray: unknown[] = [];
+    for (const item of value) {
+      const cleaned = deepCleanValue(item, options);
+      if (cleaned !== undefined) {
+        cleanedArray.push(cleaned);
+      }
+    }
+    options.walk.leave(value);
     return cleanedArray;
   }
 
   if (isPlainObject(value)) {
-    const result: Record<string, unknown> = {};
-    for (const [key, val] of Object.entries(value)) {
-      const cleaned = deepFlattenStringsValue(val);
-      if (cleaned !== undefined) {
-        result[key] = cleaned;
-      }
+    if (options.walk.isAncestor(value)) {
+      return undefined;
     }
+    options.walk.enter(value);
+    const result = cleanOwnEntries(value, options);
+    options.walk.leave(value);
     return result;
   }
 
   return value;
 }
 
-function deepFlattenStringsObject(
-  obj: Record<string, unknown> | null | undefined,
+/**
+ * Copy the cleaned own entries of a parsed object into a fresh record.
+ *
+ * A YAML parser defines a `__proto__:` key as an own property, and assigning
+ * it back with bracket notation would instead replace the new record's
+ * prototype, whose members zod's loose object schemas then promote to real
+ * keys. So a fetched skill could hide `allowed-tools` under an innocuous
+ * looking `__proto__:` block. That key, `constructor` and `prototype` are
+ * therefore dropped rather than copied, and cannot be used as frontmatter
+ * keys.
+ */
+function cleanOwnEntries(
+  obj: Record<string, unknown>,
+  options: DeepCleanOptions,
 ): Record<string, unknown> {
-  if (!obj || typeof obj !== "object") {
-    return {};
-  }
-
   const result: Record<string, unknown> = {};
   for (const [key, val] of Object.entries(obj)) {
-    const cleaned = deepFlattenStringsValue(val);
+    // A YAML mapping key can itself be an alias, so its length has to be
+    // charged against the character budget the same as a string leaf's; the
+    // key is written into the output regardless of whether its value survives.
+    options.walk.chargeChars(key.length);
+    // Walk the value — and so charge its budget — even under a dropped
+    // prototype-pollution key. Skipping the walk for `__proto__:` and its
+    // siblings would let them hide an unbudgeted alias chain: free space to
+    // build the rest of an attack cheaply, since nothing charged for visiting it.
+    const cleaned = deepCleanValue(val, options);
+    if (isPrototypePollutionKey(key)) {
+      continue;
+    }
     if (cleaned !== undefined) {
       result[key] = cleaned;
     }
   }
   return result;
+}
+
+function deepCleanObject(
+  obj: Record<string, unknown> | null | undefined,
+  options: Omit<DeepCleanOptions, "walk">,
+): Record<string, unknown> {
+  if (!obj || typeof obj !== "object") {
+    return {};
+  }
+  return cleanOwnEntries(obj, {
+    ...options,
+    walk: createBoundedWalk({
+      subject: "Frontmatter",
+      limits: {
+        maxValues: MAX_FRONTMATTER_VALUES,
+        maxStringChars: MAX_FRONTMATTER_STRING_CHARS,
+        maxDepth: MAX_FRONTMATTER_DEPTH,
+      },
+      // The root object is itself one level of nesting.
+      root: obj,
+    }),
+  });
+}
+
+/** Drop null and undefined values, recursively. */
+function deepRemoveNullishObject(
+  obj: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  return deepCleanObject(obj, {});
+}
+
+/** Drop nullish values and collapse every string onto a single line. */
+function deepFlattenStringsObject(
+  obj: Record<string, unknown> | null | undefined,
+): Record<string, unknown> {
+  return deepCleanObject(obj, {
+    transformString: (value) => value.replace(/\n+/g, " ").trim(),
+  });
 }
 
 export type StringifyFrontmatterOptions = {
@@ -118,11 +248,22 @@ export function stringifyFrontmatter(
     ? deepFlattenStringsObject(frontmatter)
     : deepRemoveNullishObject(frontmatter);
 
+  // Pass a pre-split file object rather than the raw body string. When
+  // gray-matter's `file` argument is a string, `matter.stringify` re-parses
+  // that whole string as a document and merges the result's `data` under
+  // `cleanFrontmatter` before turning the result into a string — so a body that itself contains a
+  // `---`-delimited block (a fenced YAML example inside a skill's
+  // instructions, say) would inject its own frontmatter keys into the output
+  // unsanitized, bypassing every budget above. Passing `{ content: body }`
+  // skips that re-parse: `file.data` is left `undefined`, so gray-matter
+  // merges nothing extra in and the body is carried through byte-for-byte.
+  const file = { content: body };
+
   if (avoidBlockScalars) {
     // Use a custom YAML engine with lineWidth disabled to prevent js-yaml from
     // emitting block scalars (>- or |-). Some tools use simplified frontmatter
     // parsers that interpret these indicators as literal string values.
-    return matter.stringify(body, cleanFrontmatter, {
+    return matter.stringify(file, cleanFrontmatter, {
       engines: {
         yaml: {
           parse: (input: string) => loadYaml(input) ?? {},
@@ -132,7 +273,128 @@ export function stringifyFrontmatter(
     });
   }
 
-  return matter.stringify(body, cleanFrontmatter);
+  return matter.stringify(file, cleanFrontmatter);
+}
+
+/**
+ * Thrown in place of gray-matter's built-in JavaScript engine.
+ *
+ * gray-matter picks the parser from the text after the opening fence, so a
+ * file that opens with `---js` or `---javascript` has its frontmatter handed
+ * to `eval()`. Frontmatter here comes from third-party skills, fetched sources
+ * and untrusted repositories, so that would run arbitrary code on the machine
+ * of whoever generates or imports it. Every engine name that resolves to code
+ * execution is mapped to this refusal; {@link assertYamlFrontmatterLanguage}
+ * refuses those fences earlier still, so this is the second line of defense.
+ */
+function refuseExecutableFrontmatter(): never {
+  throw new Error(
+    "Frontmatter written in an executable language (JavaScript / CoffeeScript) is not supported; use YAML",
+  );
+}
+
+const REFUSED_FRONTMATTER_ENGINE = {
+  parse: refuseExecutableFrontmatter,
+  stringify: refuseExecutableFrontmatter,
+};
+
+/**
+ * Engines passed to every gray-matter parse. Supplying them merges over
+ * gray-matter's defaults, so the JavaScript engine (and the CoffeeScript names
+ * a plugin could register) can never be reached through an alias.
+ *
+ * `patches/gray-matter@4.0.3.patch` also deletes the JavaScript engine, but a
+ * pnpm patch only applies inside this repository: gray-matter is an external
+ * dependency of the published package, so an installed rulesync runs the
+ * unpatched gray-matter, and this override plus the language check are what
+ * protect it. Exported for the test that pins that.
+ */
+export const FRONTMATTER_PARSE_OPTIONS = {
+  engines: {
+    javascript: REFUSED_FRONTMATTER_ENGINE,
+    js: REFUSED_FRONTMATTER_ENGINE,
+    coffee: REFUSED_FRONTMATTER_ENGINE,
+    coffeescript: REFUSED_FRONTMATTER_ENGINE,
+    cson: REFUSED_FRONTMATTER_ENGINE,
+  },
+};
+
+/** Frontmatter languages accepted after the opening `---` fence. */
+const ALLOWED_FRONTMATTER_LANGUAGE_PATTERN = /^(?:ya?ml)?$/i;
+
+type FrontmatterFence = {
+  /** The language named after the opening `---`, trimmed (`""` for none). */
+  language: string;
+  /**
+   * Offset in `content` of the fence line's line break, or `undefined` when
+   * the content has no line break at all. gray-matter looks for the closing
+   * `\n---` from here, so an empty block (`---\n---`) closes on this very
+   * line break.
+   */
+  lineBreakStart: number | undefined;
+  /** Offset in `content` just past that line break. */
+  lineEnd: number | undefined;
+};
+
+/**
+ * Read the opening frontmatter fence the way gray-matter does, or return
+ * `undefined` when gray-matter would see no frontmatter at all.
+ *
+ * gray-matter strips one byte order mark, treats `---` as a fence only when a
+ * fourth `-` does not follow, and takes the language from the text between the
+ * fence and the first `\r?\n`, trimmed — dropping the last character when
+ * there is no line break at all. Every check below that has to agree with
+ * gray-matter on where the block is (the language check, the size guard, the
+ * repair pass) goes through this one reading, so none of them can be bypassed
+ * by a fence line gray-matter accepts and a stricter pattern would not (a
+ * stray `\r` before the line break, say).
+ */
+function readFrontmatterFence(content: string): FrontmatterFence | undefined {
+  const offset = content.startsWith("\uFEFF") ? 1 : 0;
+  const text = content.slice(offset);
+  if (!text.startsWith("---") || text.charAt(3) === "-") {
+    return undefined;
+  }
+
+  const afterFence = text.slice(3);
+  const lineBreak = /\r?\n/.exec(afterFence);
+  const language = afterFence.slice(0, lineBreak ? lineBreak.index : -1).trim();
+  const lineBreakStart = lineBreak ? offset + 3 + lineBreak.index : undefined;
+  const lineEnd =
+    lineBreak && lineBreakStart !== undefined ? lineBreakStart + lineBreak[0].length : undefined;
+  return { language, lineBreakStart, lineEnd };
+}
+
+/**
+ * Refuse a frontmatter fence that names any language other than YAML.
+ *
+ * Only YAML is ever written by rulesync or by the tools it targets, so anything
+ * else — `---js` above all, whose block gray-matter would `eval()` — is
+ * rejected before gray-matter sees the content.
+ */
+function assertYamlFrontmatterLanguage(content: string): void {
+  const fence = readFrontmatterFence(content);
+  if (fence && !ALLOWED_FRONTMATTER_LANGUAGE_PATTERN.test(fence.language)) {
+    throw new Error(
+      `Unsupported frontmatter language ${JSON.stringify(fence.language.slice(0, 40))}; only YAML frontmatter is supported`,
+    );
+  }
+}
+
+/**
+ * The number of characters gray-matter would hand to the YAML parser as the
+ * frontmatter block. Unlike {@link findFrontmatterBlockBounds}, a missing
+ * closing fence does not make this zero: gray-matter then parses everything
+ * after the fence line, so that is what the size guard has to measure.
+ */
+function measureFrontmatterBlockChars(content: string): number {
+  const fence = readFrontmatterFence(content);
+  if (fence?.lineBreakStart === undefined) {
+    return 0;
+  }
+  const rest = content.slice(fence.lineBreakStart);
+  const closeIndex = rest.indexOf("\n---");
+  return closeIndex === -1 ? rest.length : closeIndex;
 }
 
 export function parseFrontmatter(
@@ -147,16 +409,34 @@ export function parseFrontmatter(
   let body: string;
   let hasFrontmatter: boolean;
   try {
-    // The empty options object is what turns gray-matter's content cache off,
-    // and it has to stay off. The cache is written *before* the YAML is
+    assertYamlFrontmatterLanguage(content);
+    if (measureFrontmatterBlockChars(content) > MAX_FRONTMATTER_RAW_CHARS) {
+      // A complex YAML key (an array or mapping used as a mapping key) costs
+      // real memory inside js-yaml while it parses, before any post-parse
+      // budget above ever runs. Refusing an oversized block outright keeps
+      // that cost bounded regardless of what the block contains.
+      throw new Error(
+        `Frontmatter block is larger than ${MAX_FRONTMATTER_RAW_CHARS} characters; refusing to parse it (a complex YAML key can cost memory while parsing, before any post-parse budget applies)`,
+      );
+    }
+
+    // Passing an options object is what turns gray-matter's content cache
+    // off, and it has to stay off. The cache is written *before* the YAML is
     // parsed, so a file that throws leaves an entry behind whose `data` is
     // empty and whose `content` is the whole unparsed file; the next parse of
     // identical content — the same malformed skill vendored under two
     // directories, say — hits that entry and returns empty frontmatter with the
     // frontmatter text spilled into the body, instead of reporting the error
     // again. Caching a parse this cheap is not worth failing silently.
-    const result = matter(content, {});
-    frontmatter = result.data;
+    // The options also replace the executable engines; see
+    // FRONTMATTER_PARSE_OPTIONS.
+    const result = matter(content, FRONTMATTER_PARSE_OPTIONS);
+    // Strip null/undefined values from parsed frontmatter for consistency.
+    // YAML parses bare keys (e.g. "description:") as null, which would fail
+    // Zod validation (z.optional(z.string()) does not accept null). The same
+    // walk drops cyclic aliases and prototype keys and refuses a document that
+    // expands past MAX_FRONTMATTER_VALUES, so it belongs with the parse errors.
+    frontmatter = deepRemoveNullishObject(result.data);
     body = result.content;
     // gray-matter returns an empty .matter string and sets .content equal to
     // the original input when no YAML frontmatter fence (---) is present.
@@ -171,12 +451,7 @@ export function parseFrontmatter(
     throw error;
   }
 
-  // Strip null/undefined values from parsed frontmatter for consistency.
-  // YAML parses bare keys (e.g. "description:") as null, which would fail
-  // Zod validation (z.optional(z.string()) does not accept null).
-  const cleanFrontmatter = deepRemoveNullishObject(frontmatter);
-
-  return { frontmatter: cleanFrontmatter, body, hasFrontmatter };
+  return { frontmatter, body, hasFrontmatter };
 }
 
 /**
@@ -248,6 +523,44 @@ function repairFrontmatterLine(line: string): RepairedLine {
 }
 
 /**
+ * Locate a raw `---`-delimited frontmatter block's bounds within `content`,
+ * without parsing it, for the YAML repair pass below and the rule loaders that
+ * pre-process `globs:`. The opening fence is read exactly as gray-matter reads
+ * it ({@link readFrontmatterFence}); an explicit `yaml` / `yml` language is
+ * still YAML, any other language yields no bounds. gray-matter ends the block
+ * at the first `\n---`, with no requirement that the delimiter be alone on its
+ * line, so a stricter pattern here would run past gray-matter's delimiter and
+ * act on text that is really the body. A block with no closing fence has no
+ * bounds; the size guard measures that case separately.
+ */
+export function findFrontmatterBlockBounds(
+  content: string,
+): { blockStart: number; blockEnd: number } | undefined {
+  const fence = readFrontmatterFence(content);
+  if (
+    fence?.lineBreakStart === undefined ||
+    fence.lineEnd === undefined ||
+    !ALLOWED_FRONTMATTER_LANGUAGE_PATTERN.test(fence.language)
+  ) {
+    return undefined;
+  }
+
+  const blockStart = fence.lineEnd;
+  // Search from the fence line's own line break, as gray-matter does, so an
+  // empty block (`---\n---`) closes there instead of at a later `---` in the
+  // body.
+  const closing = /\r?\n---/.exec(content.slice(fence.lineBreakStart));
+  if (!closing) {
+    return undefined;
+  }
+  if (closing.index === 0) {
+    return { blockStart, blockEnd: blockStart };
+  }
+
+  return { blockStart, blockEnd: fence.lineBreakStart + closing.index };
+}
+
+/**
  * Quote the unquoted scalars that make a frontmatter block unparseable, or
  * return `undefined` when there is nothing to repair. Only the frontmatter
  * block is rewritten; the body is passed through untouched.
@@ -255,22 +568,12 @@ function repairFrontmatterLine(line: string): RepairedLine {
 function repairMalformedFrontmatterYaml(
   content: string,
 ): { content: string; droppedComment: boolean } | undefined {
-  const opening = /^\uFEFF?---[^\S\r\n]*\r?\n/.exec(content);
-  if (!opening) {
+  const bounds = findFrontmatterBlockBounds(content);
+  if (!bounds) {
     return undefined;
   }
 
-  const blockStart = opening[0].length;
-  // gray-matter ends the block at the first `\n---`, with no requirement that
-  // the delimiter be alone on its line. Matching that exactly matters: a
-  // stricter pattern here would run past gray-matter's delimiter and rewrite
-  // lines that are really body text.
-  const closing = /\r?\n---/.exec(content.slice(blockStart));
-  if (!closing) {
-    return undefined;
-  }
-
-  const blockEnd = blockStart + closing.index;
+  const { blockStart, blockEnd } = bounds;
   const block = content.slice(blockStart, blockEnd);
   const repairedLines = block.split("\n").map(repairFrontmatterLine);
   const repairedBlock = repairedLines.map(({ line }) => line).join("\n");
@@ -295,8 +598,9 @@ function repairMalformedFrontmatterYaml(
  * narrow — one pass, top-level entries only, and the original error is what
  * surfaces if it does not help, so a genuinely broken file still fails with the
  * message that describes what is actually wrong with it. A file with no closing
- * `---`, or one whose opening fence carries a language tag, is not repaired at
- * all: neither is a frontmatter block gray-matter would have read.
+ * `---` is not repaired at all, and one whose opening fence names a language
+ * other than YAML is refused outright (an explicit `---yaml` / `---yml` fence
+ * is repaired like a plain one).
  *
  * @see https://agentskills.io/client-implementation/adding-skills-support
  */

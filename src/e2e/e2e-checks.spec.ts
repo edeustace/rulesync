@@ -30,8 +30,28 @@ const checksGenerateTargets = [
     outputPath: join(".cursor", "BUGBOT.md"),
   },
   {
+    // Factory's reviewer reads repository review guidelines from a skill.
+    target: "factorydroid",
+    outputPath: join(".factory", "skills", "review-guidelines", "SKILL.md"),
+  },
+  {
+    // GitLab Duo Code Review Flow reads one YAML list of instruction groups.
+    target: "gitlabduo",
+    outputPath: join(".gitlab", "duo", "mr-review-instructions.yaml"),
+  },
+  {
     target: "hermesagent",
     outputPath: join(".hermes", "plugins", "rulesync-checks", "checks", "security.json"),
+  },
+  {
+    // Kilo Code Reviews reads one plain-Markdown guidance file at the root.
+    target: "kilo",
+    outputPath: "REVIEW.md",
+  },
+  {
+    // Qwen Code's `/review` reads one plain-Markdown project rules file.
+    target: "qwencode",
+    outputPath: join(".qwen", "review-rules.md"),
   },
   {
     // Rovo Dev reads one plain-Markdown instruction file for code reviews.
@@ -49,6 +69,11 @@ const checksGlobalTargets = [
   {
     target: "amp",
     outputPath: join(".config", "amp", "checks", "security.md"),
+  },
+  {
+    // `goose review` reads user-wide checks from ~/.config/goose/checks/.
+    target: "goose",
+    outputPath: join(".config", "goose", "checks", "security.md"),
   },
   {
     target: "takt",
@@ -101,6 +126,14 @@ Look for injection vulnerabilities.
         expect(generatedContent).toContain("Look for injection vulnerabilities.");
         return;
       }
+      if (target === "gitlabduo") {
+        // One instruction group per check, named after the source file basename.
+        expect(generatedContent).toContain("instructions:");
+        expect(generatedContent).toContain("name: security");
+        expect(generatedContent).toContain("Look for injection vulnerabilities.");
+        expect(generatedContent).not.toContain("severity");
+        return;
+      }
       if (target === "takt") {
         // One quality gate per check, in the shared config's owned block.
         expect(generatedContent).toContain("workflow_overrides:");
@@ -108,7 +141,13 @@ Look for injection vulnerabilities.
         expect(generatedContent).toContain("Look for injection vulnerabilities.");
         return;
       }
-      if (target === "cursor" || target === "rovodev") {
+      if (
+        target === "cursor" ||
+        target === "rovodev" ||
+        target === "factorydroid" ||
+        target === "qwencode" ||
+        target === "kilo"
+      ) {
         // One marked-up section per check, keyed by the source file basename.
         expect(generatedContent).toContain("<!-- rulesync:check:security -->");
         expect(generatedContent).toContain("## security");
@@ -154,6 +193,59 @@ Look for injection vulnerabilities.
       join(testDir, RULESYNC_CHECKS_RELATIVE_DIR_PATH, "review-agent.md"),
     );
     expect(importedContent).toContain("Prefer small, well-named functions.");
+  });
+
+  it("should round-trip qwencode checks through import", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".qwen", "review-rules.md"),
+      "Prefer small, well-named functions.\n",
+    );
+
+    await runImport({ target: "qwencode", features: "checks" });
+
+    const importedContent = await readFileContent(
+      join(testDir, RULESYNC_CHECKS_RELATIVE_DIR_PATH, "review-rules.md"),
+    );
+    expect(importedContent).toContain("Prefer small, well-named functions.");
+  });
+
+  it("should round-trip gitlabduo checks through import", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".gitlab", "duo", "mr-review-instructions.yaml"),
+      "instructions:\n  - name: Ruby Style Guide\n    fileFilters:\n      - '*.rb'\n    instructions: |\n      Use Ruby style.\n",
+    );
+
+    await runImport({ target: "gitlabduo", features: "checks" });
+
+    const importedContent = await readFileContent(
+      join(testDir, RULESYNC_CHECKS_RELATIVE_DIR_PATH, "ruby-style-guide.md"),
+    );
+    expect(importedContent).toContain("name: Ruby Style Guide");
+    expect(importedContent).toContain("Use Ruby style.");
+  });
+
+  it("should round-trip factorydroid checks through import", async () => {
+    const testDir = getTestDir();
+
+    // A `review-guidelines` skill someone wrote by hand: Factory reads the path
+    // as a skill, so the file may carry skill frontmatter the checks feature
+    // never writes. It must not survive into the check.
+    await writeFileContent(
+      join(testDir, ".factory", "skills", "review-guidelines", "SKILL.md"),
+      "---\nname: review-guidelines\ndescription: Ours\n---\n\nCheck Prisma query performance.\n",
+    );
+
+    await runImport({ target: "factorydroid", features: "checks" });
+
+    const importedContent = await readFileContent(
+      join(testDir, RULESYNC_CHECKS_RELATIVE_DIR_PATH, "review-guidelines.md"),
+    );
+    expect(importedContent).toContain("Check Prisma query performance.");
+    expect(importedContent).not.toContain("name:");
   });
 
   it("should round-trip checks through import", async () => {

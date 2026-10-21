@@ -1,0 +1,785 @@
+// cspell:ignore forrnat -- a lookalike spelling named in the documentation below
+import { hasEnclosingMarkOutsideKeycap, stripHiddenCharacters } from "./control-characters.js";
+
+/**
+ * The scripts a name is checked against. A character that belongs to none of
+ * them is counted as `Other`, which is deliberately one bucket rather than one
+ * per script.
+ *
+ * Two groups are named. The first is the alphabets that share letter shapes
+ * with Latin: Cyrillic and Greek, and the less obvious Armenian, Cherokee,
+ * Coptic, Lisu, Canadian Aboriginal Syllabics, Osage, Deseret, Vai and
+ * Tifinagh, each of which UTS #39 records as confusable with Latin. Naming them
+ * is what keeps them out of the `Other` bucket, where a mixture with Latin
+ * counts as ordinary — `rules` with an Osage letter for the r has to be
+ * reported, while `rules` with a Thai one is a name in two writing systems and
+ * is not.
+ *
+ * The second group is the scripts the East Asian writing systems are built
+ * from, named so that a Japanese, Korean or Chinese name is recognized as the
+ * ordinary mixture it is rather than a suspicious one.
+ */
+const SCRIPT_PATTERNS = [
+  ["Latin", /\p{Script=Latin}/u],
+  ["Cyrillic", /\p{Script=Cyrillic}/u],
+  ["Greek", /\p{Script=Greek}/u],
+  ["Armenian", /\p{Script=Armenian}/u],
+  ["Cherokee", /\p{Script=Cherokee}/u],
+  ["Coptic", /\p{Script=Coptic}/u],
+  ["Lisu", /\p{Script=Lisu}/u],
+  ["Canadian Aboriginal", /\p{Script=Canadian_Aboriginal}/u],
+  ["Osage", /\p{Script=Osage}/u],
+  ["Deseret", /\p{Script=Deseret}/u],
+  ["Vai", /\p{Script=Vai}/u],
+  ["Tifinagh", /\p{Script=Tifinagh}/u],
+  ["Han", /\p{Script=Han}/u],
+  ["Hiragana", /\p{Script=Hiragana}/u],
+  ["Katakana", /\p{Script=Katakana}/u],
+  ["Hangul", /\p{Script=Hangul}/u],
+  ["Bopomofo", /\p{Script=Bopomofo}/u],
+] as const;
+
+/**
+ * The Latin letter each non-Latin character is drawn as, for the characters
+ * where that is true of nearly every font.
+ *
+ * This is the confusable table of UTS #39, cut down to the pairs that carry the
+ * attack: the Cyrillic and Greek letters that spell Latin words, and the few
+ * Armenian ones that join them. Being a table rather than a rule is the point —
+ * "different script" alone says nothing about whether two names look alike, and
+ * a check built on that marks `rules` against a five-letter Greek word while
+ * the two share not one letter shape.
+ *
+ * The Latin letters that are drawn as other Latin letters belong here too. A
+ * name does not have to leave the alphabet to read as another one: `c0py` with
+ * a zero, `git` with the script g (U+0261) and `git` with the dotless i are all
+ * spelled in characters this project's own names are spelled in.
+ *
+ * Keyed by the lowercase form, because the names are compared in their display
+ * form, which is already lowercased. The pairs that only exist before the case
+ * is dropped — a capital I drawn as an l — are in the table below instead.
+ */
+const LATIN_LOOKALIKES: ReadonlyMap<string, string> = new Map([
+  // Cyrillic
+  ["а", "a"],
+  ["в", "b"],
+  ["е", "e"],
+  ["к", "k"],
+  ["м", "m"],
+  ["н", "h"],
+  ["о", "o"],
+  ["р", "p"],
+  ["с", "c"],
+  ["т", "t"],
+  ["у", "y"],
+  ["х", "x"],
+  ["ѕ", "s"],
+  ["і", "i"],
+  ["ј", "j"],
+  ["ѵ", "v"],
+  ["һ", "h"],
+  ["ӏ", "l"],
+  ["ԁ", "d"],
+  ["ԛ", "q"],
+  ["ԝ", "w"],
+  ["ү", "y"],
+  ["ұ", "y"],
+  ["ө", "o"],
+  ["ҽ", "e"],
+  ["ҫ", "c"],
+  ["ҭ", "t"],
+  ["ҳ", "x"],
+  ["ӽ", "x"],
+  ["ԍ", "g"],
+  ["ԃ", "d"],
+  ["ѡ", "w"],
+  // Greek
+  ["α", "a"],
+  ["β", "b"],
+  ["γ", "y"],
+  ["ε", "e"],
+  ["ζ", "z"],
+  ["η", "n"],
+  ["ι", "i"],
+  ["κ", "k"],
+  ["μ", "u"],
+  ["ν", "v"],
+  ["ο", "o"],
+  ["ρ", "p"],
+  ["τ", "t"],
+  ["υ", "u"],
+  ["χ", "x"],
+  ["ω", "w"],
+  ["ϲ", "c"],
+  ["ϱ", "p"],
+  ["ϰ", "k"],
+  ["ϳ", "j"],
+  ["ϵ", "e"],
+  ["ϙ", "q"],
+  // Armenian
+  ["հ", "h"],
+  ["յ", "j"],
+  ["ո", "n"],
+  ["ս", "u"],
+  ["ց", "g"],
+  ["օ", "o"],
+  // Latin, where the lookalike is a letter of the same script as the name it
+  // imitates: the phonetic alphabet and the small capitals, neither of which
+  // spells an ordinary word.
+  ["ɡ", "g"],
+  ["ı", "i"],
+  ["ɩ", "i"],
+  ["ǀ", "l"],
+  ["ɑ", "a"],
+  ["ɪ", "i"],
+  ["ɵ", "o"],
+  ["ʏ", "y"],
+  ["ᴀ", "a"],
+  ["ʙ", "b"],
+  ["ᴄ", "c"],
+  ["ᴅ", "d"],
+  ["ᴇ", "e"],
+  ["ɢ", "g"],
+  ["ʜ", "h"],
+  ["ᴊ", "j"],
+  ["ᴋ", "k"],
+  ["ʟ", "l"],
+  ["ᴍ", "m"],
+  ["ɴ", "n"],
+  ["ᴏ", "o"],
+  ["ᴘ", "p"],
+  ["ʀ", "r"],
+  ["ᴛ", "t"],
+  ["ᴜ", "u"],
+  ["ᴠ", "v"],
+  ["ᴡ", "w"],
+  ["ᴢ", "z"],
+]);
+
+/**
+ * The characters a Latin letter is drawn as before the case is dropped.
+ *
+ * A capital I and a lowercase l are one shape in most terminal fonts, and so
+ * are a one and an l, and a zero and an o. Lowercasing the name destroys the
+ * pairing, since a capital I becomes the letter i rather than the l it is drawn
+ * as, so these are folded first, onto the letter the shape is read as.
+ */
+const CASE_SENSITIVE_LOOKALIKES: ReadonlyMap<string, string> = new Map([
+  ["I", "l"],
+  ["1", "l"],
+  ["0", "o"],
+  ["|", "l"],
+]);
+
+/**
+ * The ASCII punctuation each other dash or quote is drawn as.
+ *
+ * The letters are only half of a name. Nearly every skill here is kebab-case,
+ * so the one character an attacker has to replace to leave a name looking like
+ * pure ASCII is the separator: `code\u2010review` with U+2010 HYPHEN is drawn
+ * exactly as `code-review` in the fonts a terminal uses. The letter checks
+ * cannot see it — punctuation belongs to no script, so the mixed-script check
+ * skips it, and the compatibility normalization leaves U+2010 alone — which is
+ * why the skeleton has to fold it.
+ *
+ * The brackets and the exclamation mark are here for the other half of the
+ * same problem. The prompt marks its own rows with `[!]` and numbers them
+ * `(1)`, and a name is checked against those marks — a check that reads the
+ * ASCII spelling alone is one U+01C3 LATIN LETTER RETROFLEX CLICK, drawn as an
+ * exclamation mark in every font, away from being told nothing.
+ *
+ * U+2014 EM DASH is deliberately absent. It is drawn plainly longer than a
+ * hyphen, and it is the character this tool puts between a note and a name, so
+ * folding it would let a name reach into how the prompt marks its own rows.
+ */
+const PUNCTUATION_LOOKALIKES: ReadonlyMap<string, string> = new Map([
+  ["\u2010", "-"],
+  ["\u2011", "-"],
+  ["\u2012", "-"],
+  ["\u2013", "-"],
+  ["\u2043", "-"],
+  ["\u02d7", "-"],
+  ["\u2212", "-"],
+  ["\u2796", "-"],
+  ["\u1806", "-"],
+  ["\u2500", "-"],
+  ["\u01c3", "!"],
+  ["\ua71d", "!"],
+  ["\u2045", "["],
+  ["\u2046", "]"],
+  ["\u2768", "("],
+  ["\u2769", ")"],
+  ["\u27ee", "("],
+  ["\u27ef", ")"],
+  ["\u2018", "'"],
+  ["\u2019", "'"],
+  ["\u02bc", "'"],
+  ["\u055a", "'"],
+  ["\u2032", "'"],
+]);
+
+/**
+ * The set below, checked against the table above.
+ *
+ * Every character read as a Latin letter has to say which letter that is, since
+ * the skeleton the other check compares by is built from the same table. The
+ * two are written out separately because one is a subset of the other rather
+ * than a view of it, and a subset kept by hand drifts; failing here is how a
+ * character added to one and forgotten in the other is found at once instead of
+ * quietly turning off the whole-script check for the names that carry it.
+ */
+function sameCaseLookalikeSet(characters: readonly string[]): ReadonlySet<string> {
+  const missing = characters.filter((character) => !LATIN_LOOKALIKES.has(character));
+  if (missing.length > 0) {
+    throw new Error(
+      `Lookalike tables out of step: ${missing.join(", ")} is read as a Latin letter but has no ` +
+        `entry saying which Latin letter it is drawn as.`,
+    );
+  }
+  return new Set(characters);
+}
+
+/**
+ * The lookalikes that hold at the case a name is written in.
+ *
+ * The table above pairs letters by shape without regard to case, because a
+ * skeleton is compared after the case is dropped: Cyrillic в is a b there, on
+ * the strength of being drawn as a B. That is the right answer for comparing
+ * two names, and the wrong one for asking whether a name is written entirely
+ * in letters read as Latin ones — by that table `нет` and `κατα` are Latin
+ * words, and an ordinary Russian or Greek name would be reported on sight.
+ *
+ * So the whole-script check is given the narrower set: the letters drawn as a
+ * lowercase Latin letter while being lowercase themselves.
+ */
+const SAME_CASE_LATIN_LOOKALIKES: ReadonlySet<string> = sameCaseLookalikeSet([
+  // Cyrillic
+  "а",
+  "е",
+  "о",
+  "р",
+  "с",
+  "у",
+  "х",
+  "ѕ",
+  "і",
+  "ј",
+  "ѵ",
+  "һ",
+  "ӏ",
+  "ԁ",
+  "ԛ",
+  "ԝ",
+  "ү",
+  "ԃ",
+  "ѡ",
+  // Greek
+  "ι",
+  "ν",
+  "ο",
+  "ρ",
+  "υ",
+  "ϲ",
+  "ϱ",
+  "ϳ",
+  // Armenian
+  "հ",
+  "յ",
+  "ո",
+  "ս",
+  "ց",
+  "օ",
+]);
+
+/**
+ * The scripts every letter of which counts as a Latin lookalike.
+ *
+ * These are the alphabets of the list above whose letters are drawn as Latin
+ * ones throughout rather than here and there: Cherokee, Lisu, Osage and Deseret
+ * were all built from Latin letter shapes, and Coptic from the Greek ones that
+ * share them. Mapping them letter by letter would be hundreds of entries for a
+ * table whose point is the pairs that carry the attack, so the whole script is
+ * taken instead — which is what makes `\u13a1\u13aa\u13d2\u13da`, four
+ * Cherokee letters read as RATS, a name the check can see.
+ *
+ * Two of the scripts the list above names are deliberately absent. Canadian
+ * Aboriginal Syllabics and Vai are written in shapes of their own, so a name
+ * in either reads as nothing Latin and saying it does would be false — the
+ * mixed-script check still covers the letters of theirs that do resemble one.
+ * Cyrillic, Greek and Armenian are absent for the opposite reason: those spell
+ * ordinary words in letters that are mostly not Latin shapes, which is why they
+ * are named letter by letter.
+ */
+const LATIN_SHAPED_SCRIPTS: ReadonlySet<string> = new Set([
+  "Cherokee",
+  "Coptic",
+  "Lisu",
+  "Osage",
+  "Deseret",
+  "Tifinagh",
+]);
+
+/** Digits, punctuation and combining marks belong to no script of their own. */
+const NO_SCRIPT_PATTERN = /[\p{Script=Common}\p{Script=Inherited}]/u;
+
+/** The one bucket every script the list above does not name is counted in. */
+const OTHER_SCRIPT = "Other";
+
+/**
+ * Script combinations that are ordinary rather than suspicious, following the
+ * augmented script sets of UTS #39: Japanese, Korean and Chinese names each mix
+ * several scripts by nature, and all three routinely carry Latin alongside.
+ *
+ * `Latin` with `Other` is ordinary too. The scripts that share letter shapes
+ * with Latin are named above, so what is left in the bucket is mostly Thai,
+ * Devanagari, Hebrew and the like, which do not — and a name that mixes Latin
+ * with one of the few lookalike scripts the list above misses is still caught
+ * by the table check, which does not go through this bucket at all.
+ */
+const ORDINARY_SCRIPT_SETS: readonly (readonly string[])[] = [
+  ["Han", "Hiragana", "Katakana", "Latin"],
+  ["Han", "Hangul", "Latin"],
+  ["Han", "Bopomofo", "Latin"],
+  ["Latin", OTHER_SCRIPT],
+];
+
+function scriptOf(character: string): string | undefined {
+  if (NO_SCRIPT_PATTERN.test(character)) {
+    return undefined;
+  }
+  for (const [script, pattern] of SCRIPT_PATTERNS) {
+    if (pattern.test(character)) {
+      return script;
+    }
+  }
+  return OTHER_SCRIPT;
+}
+
+/** `Other` names an internal bucket, so it is not what a reader is shown. */
+function describeScript(script: string): string {
+  return script === OTHER_SCRIPT ? "another script" : script;
+}
+
+function formatScriptList(scripts: string[]): string {
+  const described = scripts.map(describeScript);
+  const last = described.at(-1);
+  if (last === undefined) {
+    return "";
+  }
+  if (described.length === 1) {
+    return last;
+  }
+  return `${described.slice(0, -1).join(", ")} and ${last}`;
+}
+
+/** Runs of whitespace, which a terminal draws as one gap however many there are. */
+const WHITESPACE_RUN_PATTERN = /\s+/gu;
+
+/**
+ * The form a name is compared in: the hidden characters removed, the
+ * compatibility forms folded, the whitespace collapsed, and the case dropped.
+ *
+ * NFKC folds the forms — fullwidth, circled, ligatures — that a terminal
+ * renders as the plain characters they stand for, and lowercasing covers the
+ * pair a case-insensitive filesystem would also confuse. The hidden characters
+ * are stripped on both sides of the normalization because it neither removes
+ * them nor leaves them alone: a zero-width space survives it untouched, while
+ * U+3164 HANGUL FILLER — invisible — normalizes into U+1160, invisible too. A
+ * single strip would miss one of the two. Whitespace is collapsed last, since
+ * `pdf` and `pdf ` are one and the same row on screen.
+ */
+function normalizedFormOf(name: string): string {
+  return stripHiddenCharacters(stripHiddenCharacters(name).normalize("NFKC"))
+    .replace(WHITESPACE_RUN_PATTERN, " ")
+    .trim();
+}
+
+/** Whitespace at either end of a name, which the row it is drawn on shows none of. */
+const EDGE_WHITESPACE_PATTERN = /^\s|\s$/u;
+
+/** Two blanks running, which the row draws as the one gap it draws for any number. */
+const REPEATED_WHITESPACE_PATTERN = /\s\s/u;
+
+/**
+ * Whether the name carries more whitespace than the row it is printed on shows.
+ *
+ * Two shapes, and both are about how much rather than which: whitespace at an
+ * edge, where `pdf ` and `pdf` end at the same column and the space is only
+ * found by the cursor landing past the name, and a run of it, which a terminal
+ * draws as one gap however many blanks are in it. Between them they are what
+ * lets a name be padded to reach under the row beneath it.
+ *
+ * A single blank inside a name that is merely not the plain space is
+ * deliberately not this check's business. It is drawn, and it is a substitution
+ * rather than an extent, so it is a question about which character was chosen —
+ * `hasBlankDrawnAsPlainSpace` answers that one for the blanks that are drawn as
+ * a plain space, and the ideographic space, which is two columns wide and so
+ * tells itself apart, is left alone by both: marking it would put a warning on
+ * `設定 ガイド`, an ordinary name written the ordinary way. At an edge every
+ * blank is marked here alike, since there what is at stake is not which
+ * character was chosen but that the name reaches past where it appears to end.
+ * The tab and the other blank control characters are not here either: a name
+ * carrying one is refused outright before it is ever offered.
+ *
+ * A name with a twin already carries a note, since the two share a display
+ * form. This is for the one without: nothing else on the list says that the
+ * name reaches past what can be seen of it, and a name padded to sit under
+ * another row is padded whether or not that other row is on the same list.
+ */
+function hasWhitespaceThatDoesNotShow(name: string): boolean {
+  const shown = stripHiddenCharacters(name);
+  return EDGE_WHITESPACE_PATTERN.test(shown) || REPEATED_WHITESPACE_PATTERN.test(shown);
+}
+
+/**
+ * The blanks a terminal draws in one column, the way it draws the plain space:
+ * U+00A0 NO-BREAK SPACE, U+1680 OGHAM SPACE MARK, the U+2000–U+200A quads and
+ * spaces, U+202F NARROW NO-BREAK SPACE and U+205F MEDIUM MATHEMATICAL SPACE.
+ *
+ * U+3000 IDEOGRAPHIC SPACE is deliberately absent: it is two columns wide, so
+ * the row it is printed on already tells it apart from the plain space. U+200B
+ * ZERO WIDTH SPACE is not in the U+2000–U+200A range and is not wanted here
+ * either — it is drawn as nothing at all, which is the hidden-character check's
+ * business rather than this one's.
+ */
+const ONE_COLUMN_BLANK_PATTERN = /[\u00a0\u1680\u2000-\u200a\u202f\u205f]/u;
+
+/**
+ * Whether the name carries a blank that is drawn exactly as a plain space
+ * without being one.
+ *
+ * This is about which character was chosen, not how far the name reaches, so it
+ * is a reason of its own rather than part of `hasWhitespaceThatDoesNotShow`. A
+ * name is compared with its whitespace collapsed and NFKC-folded, so `pdf` +
+ * U+00A0 + `reader` beside a plain `pdf reader` is already reported as the pair
+ * it makes; alone on a list it has no pair and, until this check, no note —
+ * while reading on screen as exactly the plain name. The same argument the
+ * lookalike tables make for U+2010 HYPHEN, whose only tell is that it is not
+ * the ASCII one.
+ */
+function hasBlankDrawnAsPlainSpace(name: string): boolean {
+  return ONE_COLUMN_BLANK_PATTERN.test(name);
+}
+
+/**
+ * The form of `name` a terminal draws: what two pieces of text have to share to
+ * be the same thing on screen rather than the same thing to `===`.
+ */
+function displayFormOf(name: string): string {
+  return normalizedFormOf(name).toLowerCase();
+}
+
+/**
+ * The form two names read alike in, for callers that have to tell apart rows a
+ * reader cannot: the display form with every lookalike letter folded onto the
+ * Latin letter it is drawn as.
+ */
+export function readingFormOf(name: string): string {
+  return latinSkeletonOf(name);
+}
+
+/**
+ * Every character that is drawn as a Latin letter replaced by the Latin letter
+ * it is drawn as.
+ *
+ * The case is left alone. The pairs that only hold at one case are looked up
+ * as written, and the rest are looked up in lowercase, so that folding can run
+ * before the case is dropped as well as after.
+ */
+function foldLookalikes(text: string): string {
+  return [...text]
+    .map(
+      (character) =>
+        PUNCTUATION_LOOKALIKES.get(character) ??
+        CASE_SENSITIVE_LOOKALIKES.get(character) ??
+        LATIN_LOOKALIKES.get(character.toLowerCase()) ??
+        character,
+    )
+    .join("");
+}
+
+/**
+ * The name with every character that is drawn as a Latin letter replaced by the
+ * Latin letter it is drawn as.
+ *
+ * Two names with the same skeleton read the same on screen, whatever scripts
+ * they are spelled in. This is the shape of the check UTS #39 describes, with
+ * the mapping cut down to the tables above.
+ *
+ * The fold runs on both sides of the normalization, because the normalization
+ * cuts both ways. It is what turns U+2160 ROMAN NUMERAL ONE into the capital I
+ * that is read as an l, which only the fold that runs after it can see; and it
+ * is what turns U+03F2 GREEK LUNATE SIGMA SYMBOL — drawn as a c — into a σ that
+ * is drawn as nothing of the sort, which only the fold that runs before it can.
+ * The case is dropped last, once both folds have had the case they need.
+ */
+function latinSkeletonOf(name: string): string {
+  return foldLatinDigraphs(foldLookalikes(normalizedFormOf(foldLookalikes(name))).toLowerCase());
+}
+
+/**
+ * The letter pairs that are drawn as a single other letter once they are set
+ * side by side: `rn` for `m`, `vv` for `w`.
+ *
+ * The tables above map one character onto one character, which is what the
+ * confusable data of UTS #39 is mostly made of, and it is why `dep1oy` is
+ * caught while `forrnat` is not — the imitation there is not a letter drawn as
+ * another letter but two letters drawn as one, and `format` beside it is plain
+ * ASCII in a single script, so no other check has anything to say about the
+ * pair either. Only the direction that loses information is folded, so both
+ * spellings converge on the shorter one and a name that already holds the
+ * single letter is left as it is.
+ *
+ * A pair is one column wider than the letter it imitates, which is the same
+ * objection that keeps the em dash out of the tables above. It is not the same
+ * situation: the em dash is judged beside the hyphen it imitates, both drawn on
+ * screen, where a difference in width is a difference a reader can see, while
+ * the name a pair imitates is a skill on disk that no row shows. Counting the
+ * columns of a name is no help when there is nothing to count them against.
+ *
+ * `cl` for `d` is deliberately not on the list, though it is the third of the
+ * classic three. `cl` opens too many ordinary words — `clean`, `clear`,
+ * `clone`, `cli` — and folding it would report `clone` against a `done` the
+ * user happens to have, on a fetch where nothing is wrong. The two that are
+ * left cost far less: `modern` folding onto `modem` is the one pair of ordinary
+ * words either of them makes, and a note on that pair costs a reader a glance,
+ * where `clone` against `done` would be a note on a fetch anyone who keeps a
+ * skill called `done` would see.
+ */
+const LATIN_DIGRAPH_LOOKALIKES: ReadonlyArray<readonly [string, string]> = [
+  ["rn", "m"],
+  ["vv", "w"],
+];
+
+/**
+ * `form` with each of those pairs replaced by the letter it is drawn as.
+ *
+ * Run on the lowercased skeleton, after the single-character folds and the
+ * normalization, so that a pair spelled with lookalikes of its own — a Cyrillic
+ * `с` in front of an `l` — is folded here too rather than only the ASCII
+ * spelling of it.
+ */
+function foldLatinDigraphs(form: string): string {
+  return LATIN_DIGRAPH_LOOKALIKES.reduce(
+    (folded, [pair, letter]) => folded.split(pair).join(letter),
+    form,
+  );
+}
+
+/**
+ * The script a name written entirely in Latin lookalikes is really spelled in,
+ * or `undefined` when it is not such a name.
+ *
+ * This is the whole-script confusable of UTS #39, and it is the one shape that
+ * neither of the other checks can see: `copy` spelled with four Cyrillic
+ * letters is a single script, so it mixes nothing, and with no Latin twin
+ * beside it on the list there is nothing to compare it against. Every letter
+ * has to be a lookalike for the name to qualify, which is what keeps an
+ * ordinary Russian or Greek word — whose letters are mostly not drawn as Latin
+ * ones — from being reported.
+ */
+function scriptReadAsLatinIn(form: string): string | undefined {
+  let impostorScript: string | undefined;
+  let hasLetters = false;
+  for (const character of form) {
+    const script = scriptOf(character);
+    if (script === undefined) {
+      continue;
+    }
+    hasLetters = true;
+    if (script === "Latin") {
+      continue;
+    }
+    if (!LATIN_SHAPED_SCRIPTS.has(script) && !SAME_CASE_LATIN_LOOKALIKES.has(character)) {
+      return undefined;
+    }
+    impostorScript ??= script;
+  }
+  return hasLetters ? impostorScript : undefined;
+}
+
+/**
+ * The same question asked of both forms of the name, since the normalization
+ * that folds a fullwidth letter onto the plain one also folds some lookalikes
+ * onto letters that are not lookalikes at all. A name qualifies when either
+ * form is written wholly in letters read as Latin ones.
+ */
+function scriptReadAsLatin(name: string): string | undefined {
+  return (
+    scriptReadAsLatinIn(displayFormOf(name)) ??
+    scriptReadAsLatinIn(stripHiddenCharacters(name).toLowerCase())
+  );
+}
+
+/**
+ * The scripts a name mixes, or `undefined` when the mixture is an ordinary one.
+ *
+ * A name written in a single script is never reported, and neither is one of
+ * the everyday multi-script combinations. What is left is the shape a homograph
+ * takes: `good` spelled with two Cyrillic o (U+043E) reads as the Latin word
+ * but carries both scripts, so the mixture is visible even though the two names
+ * are not side by side to compare.
+ */
+export function mixedScriptsOf(name: string): string[] | undefined {
+  const scripts = new Set<string>();
+  for (const character of name) {
+    const script = scriptOf(character);
+    if (script !== undefined) {
+      scripts.add(script);
+    }
+  }
+  if (scripts.size <= 1) {
+    return undefined;
+  }
+  const found = [...scripts].toSorted();
+  if (ORDINARY_SCRIPT_SETS.some((ordinary) => found.every((script) => ordinary.includes(script)))) {
+    return undefined;
+  }
+  return found;
+}
+
+/**
+ * The two forms a name is compared against other names in: the one a terminal
+ * draws it as, and the one it reads as once the lookalike letters are folded.
+ */
+function comparableFormsOf(name: string): { displayForm: string; skeleton: string } {
+  return { displayForm: displayFormOf(name), skeleton: latinSkeletonOf(name) };
+}
+
+/** How many of the given names share each display form and each reading. */
+function countComparableForms(forms: ReadonlyArray<{ displayForm: string; skeleton: string }>): {
+  displayForms: ReadonlyMap<string, number>;
+  skeletons: ReadonlyMap<string, number>;
+} {
+  const displayForms = new Map<string, number>();
+  const skeletons = new Map<string, number>();
+  for (const form of forms) {
+    displayForms.set(form.displayForm, (displayForms.get(form.displayForm) ?? 0) + 1);
+    skeletons.set(form.skeleton, (skeletons.get(form.skeleton) ?? 0) + 1);
+  }
+  return { displayForms, skeletons };
+}
+
+/**
+ * Note, per name, why it may not be told apart on sight from what it appears to
+ * be.
+ *
+ * This is display-only: it never removes a name from a list or changes what a
+ * name stands for. Two directories whose names differ only in code points the
+ * terminal draws the same way are still two separate entries, so a selection
+ * still writes exactly what was picked — the note is there so the picker can
+ * tell that two entries which look identical are not.
+ *
+ * Seven things are reported: a name that carries more whitespace than the row
+ * shows, a name that carries an enclosing mark outside an emoji keycap, a name
+ * that carries a blank drawn as a plain space without being one, two names with
+ * the same display form, two names that read the same once the lookalike
+ * letters are matched up, a name spelled entirely in letters that read as Latin
+ * ones, and a name that mixes scripts it has no ordinary reason to. The first
+ * three are written first so that a label shortened from its tail keeps them:
+ * they say the row itself is drawn as something it is not, which nothing else
+ * on the label would imply. None of the seven is a complete answer
+ * — the lookalike tables hold the common pairs rather than all of them, a name
+ * written entirely
+ * in a script the tables do not map is compared against nothing, and a
+ * hand-picked pair of unrelated-looking names from one script escapes every
+ * check — so the note is a prompt to look closer, not a guarantee that unmarked
+ * entries are distinct.
+ *
+ * `localNames` are names that sit beside the list without being on it: the
+ * skills the user already has. They are compared against and never described,
+ * because the question a picker asks is which of the names on offer may be
+ * taken for something else, and a name already on disk is one of the things
+ * they may be taken for. Without them a list of one imitation and no original
+ * — a repository publishing `dep1oy` alone, against a `deploy` the user has had
+ * for months — is a list with nothing to compare, and every check stays quiet.
+ *
+ * A local name spelled exactly like one on the list is dropped from the
+ * comparison first: that is the skill being updated rather than one imitating
+ * it, and a second fetch of the same repository would otherwise mark every row
+ * it refreshes. Only that much is decided here, because only that much can be
+ * decided from the names alone. Whether a local `pdf` is also the directory a
+ * listed `PDF` would be written into is a question about the filesystem, not
+ * about the spellings, and the caller answers it before handing the names over
+ * — see `readSkillRootNames` and its caller in `fetch.ts`.
+ *
+ * Where both a listed name and a local one collide, the listed one is named — it
+ * is the pair a reader can compare on screen — and the row carries one reason
+ * either way.
+ *
+ * Names absent from the returned map carry no note. Duplicates in `names` are
+ * folded first, so a list that repeats a name does not report that name as
+ * colliding with itself.
+ */
+export function describeConfusableNames(params: {
+  names: string[];
+  localNames: string[];
+}): Map<string, string> {
+  const { names, localNames } = params;
+  const entries = [...new Set(names)].map((name) => ({ name, ...comparableFormsOf(name) }));
+  const listed = new Set(entries.map((entry) => entry.name));
+  const counts = countComparableForms(entries);
+  const localCounts = countComparableForms(
+    [...new Set(localNames)].filter((name) => !listed.has(name)).map(comparableFormsOf),
+  );
+
+  const notes = new Map<string, string>();
+  for (const entry of entries) {
+    const reasons: string[] = [];
+    // First, because it is the reason the label cannot afford to lose: the
+    // picker cuts a long note from its tail, and every other reason says the
+    // row may be taken for another row, which a reader can still check by eye.
+    // This one says the row itself reaches further than it shows, which nothing
+    // left on the label would imply once it is cut away.
+    if (hasWhitespaceThatDoesNotShow(entry.name)) {
+      reasons.push("carries more whitespace than the row shows");
+    }
+    // Next for the same reason: an enclosing mark is drawn over the character
+    // before it and takes no column, so the row is drawn as a name it is not,
+    // whether or not any other row is on the list.
+    if (hasEnclosingMarkOutsideKeycap(entry.name)) {
+      reasons.push("carries a mark drawn over the character before it");
+    }
+    // Last of the three that describe the row itself rather than the list it
+    // sits on, and ahead of the comparison reasons for the same reason they
+    // are: the row is drawn as a name it is not, whether or not the plain
+    // spelling is on the list to be compared against.
+    if (hasBlankDrawnAsPlainSpace(entry.name)) {
+      reasons.push("carries a character drawn as a plain space");
+    }
+    const sameDisplayForm = counts.displayForms.get(entry.displayForm) ?? 0;
+    const sameLocalDisplayForm = localCounts.displayForms.get(entry.displayForm) ?? 0;
+    if (sameDisplayForm > 1) {
+      reasons.push("another entry has the same display form");
+    } else if (sameLocalDisplayForm > 0) {
+      reasons.push("a local skill has the same display form");
+    }
+    // Counted against the entries that share the display form rather than
+    // against one: three names can read alike while only two of them are the
+    // same string, and the third is the one worth naming. The local side is
+    // counted the same way against the local names, so a `PDF` on disk beside a
+    // remote `pdf` is reported once, as the display form it shares, rather than
+    // twice for reading alike as well.
+    if ((counts.skeletons.get(entry.skeleton) ?? 0) > sameDisplayForm) {
+      reasons.push("another entry differs from it only by lookalike letters");
+    } else if ((localCounts.skeletons.get(entry.skeleton) ?? 0) > sameLocalDisplayForm) {
+      reasons.push("a local skill differs from it only by lookalike letters");
+    }
+    // The display form is what a reader sees, so it is what the script checks
+    // are asked about: a circled or fullwidth letter carries the script of the
+    // plain letter it is drawn as.
+    const mixedScripts = mixedScriptsOf(entry.displayForm);
+    if (mixedScripts === undefined) {
+      const impostorScript = scriptReadAsLatin(entry.name);
+      if (impostorScript !== undefined) {
+        reasons.push(`reads as Latin letters but is written in ${describeScript(impostorScript)}`);
+      }
+    } else {
+      reasons.push(`mixes characters from ${formatScriptList(mixedScripts)}`);
+    }
+    if (reasons.length > 0) {
+      notes.set(entry.name, reasons.join("; "));
+    }
+  }
+  return notes;
+}

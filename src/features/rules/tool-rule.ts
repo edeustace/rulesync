@@ -45,14 +45,22 @@ export type ToolRuleForDeletionParams = {
 };
 
 /**
- * A fixed-path file a tool manages beyond its root/non-root rules (e.g. Pi's
- * `APPEND_SYSTEM.md`). Returned by the optional static `getExtraFixedFiles`
- * hook, consumed by the RulesProcessor (import/deletion) and the gitignore
- * derivation.
+ * A fixed-path file (or a file-name glob within one directory) a tool manages
+ * beyond its root/non-root rules (e.g. Pi's `APPEND_SYSTEM.md`). Returned by
+ * the optional static `getExtraFixedFiles` hook, consumed by the
+ * RulesProcessor (import/deletion) and the gitignore derivation.
  */
 export type ToolRuleExtraFixedFile = {
   relativeDirPath: string;
+  /** A file name, or a file-name glob such as `*.md` for a whole directory. */
   relativeFilePath: string;
+  /**
+   * Enumerate the file(s) on import only, never for `--delete` and never as
+   * a gitignore entry. For a directory the tool shares with hand-written
+   * files, where sweeping or ignoring it would touch work rulesync never
+   * wrote. Symbolic links are skipped on import for the same reason.
+   */
+  importOnly?: boolean;
 };
 
 /**
@@ -61,6 +69,11 @@ export type ToolRuleExtraFixedFile = {
  * optional static `getNestedFilePatterns` hook and consumed by the
  * RulesProcessor on import.
  *
+ * Both sides are relative to the project root, which the processor passes as
+ * `findFilesByGlobs`'s `cwd`. Embedding the root in the pattern instead would
+ * read a project directory named `project(a)` or `project{a,b}` as a glob and
+ * silently match nothing.
+ *
  * `ignore` is separate from `include` rather than expressed as `!` patterns
  * because globby rewrites a negative pattern containing no glob metacharacter as
  * cwd-relative, which makes an absolute one silently match nothing.
@@ -68,6 +81,13 @@ export type ToolRuleExtraFixedFile = {
 export type ToolRuleNestedFilePatterns = {
   include: string[];
   ignore: string[];
+  /**
+   * The tool-owned directory each match sits in (e.g. `.trae/rules`), for a
+   * target whose nested unit is a directory rather than a file. The gitignore
+   * filter then skips testing that directory's last segment, because `rulesync
+   * gitignore` ignores that directory itself.
+   */
+  ownedDirPath?: string;
 };
 
 /**
@@ -101,6 +121,18 @@ export type ToolRuleImportOnlyRoot = {
    * rule's own output path.
    */
   onlyWhenRootAbsent?: boolean;
+  /**
+   * The tool reads this root instead of its own root file when both exist
+   * (Warp: "If both `WARP.md` and `AGENTS.md` exist in the same directory,
+   * `WARP.md` takes priority"). Generating the root file then does not stop the
+   * tool reading this one, so the generate-side "will no longer be read"
+   * warning skips it, and the import-side skip warning says that the imported
+   * root file is the one the tool ignores. Only meaningful together with
+   * `onlyWhenRootAbsent: true`, which decides whether the root is scanned at
+   * all. The tool's `fromFile` may read such a root as its root rule (Warp's
+   * `WARP.md`), not only as a non-root rule.
+   */
+  outranksRoot?: boolean;
 };
 
 export type ToolRuleSettablePaths = {
@@ -248,6 +280,7 @@ export abstract class ToolRule extends ToolFile {
     validate = true,
     rootPath = { relativeDirPath: ".", relativeFilePath: "AGENTS.md" },
     nonRootPath = { relativeDirPath: AGENTSMD_MEMORIES_DIR_PATH },
+    global = false,
   }: BuildToolRuleParamsParams): BuildToolRuleParamsResult {
     const params = this.buildToolRuleParamsDefault({
       outputRoot,
@@ -257,8 +290,10 @@ export abstract class ToolRule extends ToolFile {
       nonRootPath,
     });
 
+    // Project scope only; the global root has no workspace to nest under, so a
+    // global non-root rule keeps the adapter's own non-root path.
     const rulesyncFrontmatter = rulesyncRule.getFrontmatter();
-    if (!rulesyncFrontmatter.root && rulesyncFrontmatter.agentsmd?.subprojectPath) {
+    if (!global && !rulesyncFrontmatter.root && rulesyncFrontmatter.agentsmd?.subprojectPath) {
       params.relativeDirPath = join(rulesyncFrontmatter.agentsmd.subprojectPath);
       params.relativeFilePath = "AGENTS.md";
     }
@@ -277,21 +312,18 @@ export abstract class ToolRule extends ToolFile {
    * `--delete` would sweep away work rulesync never wrote.
    */
   protected static buildNestedFilePatterns({
-    outputRoot,
     fileName,
   }: {
-    outputRoot: string;
     fileName: string;
   }): ToolRuleNestedFilePatterns {
-    const root = toPosixPath(outputRoot);
     return {
-      include: [`${root}/**/${fileName}`],
+      include: [`**/${fileName}`],
       ignore: [
         // Enumerated separately as the root rule.
-        `${root}/${fileName}`,
-        `${root}/**/.*/**`,
-        ...NESTED_SCAN_EXCLUDED_DIRS_ANY_DEPTH.map((dir) => `${root}/**/${dir}/**`),
-        ...NESTED_SCAN_EXCLUDED_ROOT_DIRS.map((dir) => `${root}/${dir}/**`),
+        fileName,
+        "**/.*/**",
+        ...NESTED_SCAN_EXCLUDED_DIRS_ANY_DEPTH.map((dir) => `**/${dir}/**`),
+        ...NESTED_SCAN_EXCLUDED_ROOT_DIRS.map((dir) => `${dir}/**`),
       ],
     };
   }
@@ -357,7 +389,7 @@ export abstract class ToolRule extends ToolFile {
 
   abstract toRulesyncRule(): RulesyncRule;
 
-  protected toRulesyncRuleDefault(): RulesyncRule {
+  protected toRulesyncRuleDefault({ body }: { body?: string } = {}): RulesyncRule {
     return new RulesyncRule({
       outputRoot: process.cwd(),
       relativeDirPath: RULESYNC_RULES_RELATIVE_DIR_PATH,
@@ -368,7 +400,7 @@ export abstract class ToolRule extends ToolFile {
         description: this.description,
         globs: this.globs ?? (this.isRoot() ? ["**/*"] : []),
       },
-      body: this.getFileContent(),
+      body: body ?? this.getFileContent(),
     });
   }
 

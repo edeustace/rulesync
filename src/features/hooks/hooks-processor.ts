@@ -7,31 +7,52 @@ import { pickLastRootWithFile } from "../../types/feature-processor.js";
 import { FeatureProcessor } from "../../types/feature-processor.js";
 import {
   AMP_HOOK_EVENTS,
+  AMP_OVERRIDE_ONLY_HOOK_EVENTS,
   ANTIGRAVITY_HOOK_EVENTS,
   AUGMENTCODE_HOOK_EVENTS,
+  BOB_HOOK_EVENTS,
   CLAUDE_HOOK_EVENTS,
+  CODEBUDDY_HOOK_EVENTS,
+  CODEBUDDY_MATCHER_HOOK_EVENTS,
   CODEXCLI_HOOK_EVENTS,
+  CODEWHALE_HOOK_EVENTS,
+  CODEWHALE_MATCHER_HOOK_EVENTS,
+  COMMANDCODE_HOOK_EVENTS,
   COPILOT_HOOK_EVENTS,
   COPILOTCLI_HOOK_EVENTS,
+  CONTINUE_HOOK_EVENTS,
+  CORTEXCODE_HOOK_EVENTS,
   CURSOR_HOOK_EVENTS,
   DEEPAGENTS_HOOK_EVENTS,
   DEVIN_HOOK_EVENTS,
   FACTORYDROID_HOOK_EVENTS,
+  FIREBENDER_HOOK_EVENTS,
   CLINE_HOOK_EVENTS,
+  CRUSH_HOOK_EVENTS,
   GOOSE_HOOK_EVENTS,
   GROKCLI_HOOK_EVENTS,
   HERMESAGENT_HOOK_EVENTS,
+  GITLABDUO_HOOK_EVENTS,
   JUNIE_HOOK_EVENTS,
   KILO_HOOK_EVENTS,
   KIMI_CODE_HOOK_EVENTS,
   KIRO_HOOK_EVENTS,
   KIRO_IDE_HOOK_EVENTS,
+  LETTACODE_HOOK_EVENTS,
   OPENCODE_HOOK_EVENTS,
+  OPENCODE_MATCHER_HOOK_EVENTS,
+  OMP_HOOK_EVENTS,
   PI_HOOK_EVENTS,
+  POOL_HOOK_EVENTS,
+  QODER_HOOK_EVENTS,
   QWENCODE_HOOK_EVENTS,
   REASONIX_HOOK_EVENTS,
+  TABNINE_HOOK_EVENTS,
   VIBE_HOOK_EVENTS,
+  ZCODE_HOOK_EVENTS,
+  type HookDefinition,
   type HookEvent,
+  type HooksConfig,
   type HookType,
 } from "../../types/hooks.js";
 import type { RulesyncFile } from "../../types/rulesync-file.js";
@@ -46,16 +67,27 @@ import { AmpHooks } from "./amp-hooks.js";
 import { AntigravityCliHooks, AntigravityIdeHooks } from "./antigravity-hooks.js";
 import { AntigravityPluginHooks } from "./antigravity-plugin-hooks.js";
 import { AugmentcodeHooks } from "./augmentcode-hooks.js";
+import { AugmentcodePluginHooks } from "./augmentcode-plugin-hooks.js";
+import { BobHooks } from "./bob-hooks.js";
 import { ClaudecodeHooks } from "./claudecode-hooks.js";
 import { ClaudecodePluginHooks } from "./claudecode-plugin-hooks.js";
 import { ClineHooks } from "./cline-hooks.js";
+import { CodebuddyHooks } from "./codebuddy-hooks.js";
+import { CodewhaleHooks } from "./codewhale-hooks.js";
 import { CodexcliHooks } from "./codexcli-hooks.js";
+import { CommandcodeHooks } from "./commandcode-hooks.js";
+import { ContinueHooks } from "./continue-hooks.js";
 import { CopilotHooks } from "./copilot-hooks.js";
 import { CopilotcliHooks } from "./copilotcli-hooks.js";
+import { CortexcodeHooks } from "./cortexcode-hooks.js";
+import { CrushHooks } from "./crush-hooks.js";
 import { CursorHooks } from "./cursor-hooks.js";
 import { DeepagentsHooks } from "./deepagents-hooks.js";
 import { DevinHooks } from "./devin-hooks.js";
+import { DevinPluginHooks } from "./devin-plugin-hooks.js";
 import { FactorydroidHooks } from "./factorydroid-hooks.js";
+import { FirebenderHooks } from "./firebender-hooks.js";
+import { GitlabduoHooks } from "./gitlabduo-hooks.js";
 import { GooseHooks } from "./goose-hooks.js";
 import { GrokcliHooks } from "./grokcli-hooks.js";
 import { HermesagentHooks } from "./hermesagent-hooks.js";
@@ -65,11 +97,17 @@ import { KimiCodeHooks } from "./kimi-code-hooks.js";
 import { KiroCliHooks } from "./kiro-cli-hooks.js";
 import { KiroHooks } from "./kiro-hooks.js";
 import { KIRO_HOOKS_OVERRIDE_KEY, KiroIdeHooks } from "./kiro-ide-hooks.js";
+import { LettacodeHooks } from "./lettacode-hooks.js";
+import { MimocodeHooks } from "./mimocode-hooks.js";
+import { OmpHooks } from "./omp-hooks.js";
 import { OpencodeHooks } from "./opencode-hooks.js";
 import { PiHooks } from "./pi-hooks.js";
+import { PoolHooks } from "./pool-hooks.js";
+import { QoderHooks } from "./qoder-hooks.js";
 import { QwencodeHooks } from "./qwencode-hooks.js";
 import { ReasonixHooks } from "./reasonix-hooks.js";
 import { RulesyncHooks } from "./rulesync-hooks.js";
+import { TabnineHooks } from "./tabnine-hooks.js";
 import type {
   ToolHooksForDeletionParams,
   ToolHooksFromFileParams,
@@ -77,6 +115,9 @@ import type {
 } from "./tool-hooks.js";
 import { ToolHooks } from "./tool-hooks.js";
 import { VibeHooks } from "./vibe-hooks.js";
+import { VibePluginHooks } from "./vibe-plugin-hooks.js";
+import { ZcodeHooks } from "./zcode-hooks.js";
+import { ZcodePluginHooks } from "./zcode-plugin-hooks.js";
 
 export type HooksProcessorToolTarget = (typeof hooksProcessorToolTargetTuple)[number];
 
@@ -122,20 +163,30 @@ type ToolHooksFactory = {
   supportsMatcher: boolean;
   matcherEvents?: readonly HookEvent[];
   /**
-   * When true, keys in the tool-specific override block (`config[target].hooks`)
-   * are passed through verbatim by the adapter even if they are not in
-   * `supportedEvents` (e.g. Kiro IDE's `PostFileSave`/`PreTaskExec` triggers),
-   * so they must not be reported as skipped/unsupported.
+   * When true, the adapter silently drops keys in the tool-specific override
+   * block (`config[target].hooks`) that are not in `supportedEvents`, so the
+   * processor reports them as skipped. By default override-block keys are
+   * left alone: most adapters emit them verbatim (native event names an
+   * import filed there, forward-compatible triggers), and the adapters that
+   * filter the block themselves already report what they drop.
    */
-  passthroughOverrideEvents?: boolean;
+  dropsUnknownOverrideEvents?: boolean;
+  /**
+   * Native event names with no canonical equivalent that the adapter emits
+   * when they appear in the tool-specific override block, so they are not
+   * reported as skipped there. The shared `hooks` record rejects them at
+   * schema level.
+   */
+  overrideOnlyEvents?: readonly string[];
 };
 
 /**
  * Event names present in the config that the target's adapter cannot emit.
  *
- * When the factory passes override-block keys through verbatim
- * (`passthroughOverrideEvents`), those keys are excluded from the check so
- * documented passthrough triggers aren't falsely reported as skipped.
+ * Shared (`hooks`) keys are always checked. Override-block keys are only
+ * checked when the factory declares `dropsUnknownOverrideEvents`; otherwise
+ * the adapter either emits them verbatim or reports its own drops, and a
+ * generic "not supported" warning would be wrong or duplicated.
  */
 function unsupportedEventNames(params: {
   factory: ToolHooksFactory;
@@ -143,10 +194,13 @@ function unsupportedEventNames(params: {
   effectiveHooks: Record<string, unknown>;
 }): string[] {
   const { factory, sharedHooks, effectiveHooks } = params;
-  const supportedEvents: Set<string> = new Set(factory.supportedEvents);
-  const eventNames = factory.passthroughOverrideEvents
-    ? Object.keys(sharedHooks)
-    : Object.keys(effectiveHooks);
+  const supportedEvents: Set<string> = new Set([
+    ...factory.supportedEvents,
+    ...(factory.overrideOnlyEvents ?? []),
+  ]);
+  const eventNames = factory.dropsUnknownOverrideEvents
+    ? Object.keys(effectiveHooks)
+    : Object.keys(sharedHooks);
   return [...new Set(eventNames)].filter((e) => !supportedEvents.has(e));
 }
 
@@ -173,6 +227,9 @@ function withToolTargetPrefix({
     },
     get silent() {
       return logger.silent;
+    },
+    get reportsWhileSilent() {
+      return logger.reportsWhileSilent;
     },
     get jsonMode() {
       return logger.jsonMode;
@@ -219,13 +276,51 @@ function unsupportedMatcherEventNames({
  * resolution is used by the MCP (`MCP_BLOCK_KEY_ALIASES`) and permissions
  * (`PERMISSION_OVERRIDE_KEY_ALIASES`) features for the files they share.
  */
-const HOOKS_OVERRIDE_KEY_ALIASES: Partial<Record<ToolTarget, string>> = {
+export const HOOKS_OVERRIDE_KEY_ALIASES: Partial<Record<ToolTarget, string>> = {
+  // Auggie plugin components are written in the `augmentcode` format, so the
+  // packaging target reads the `augmentcode` block like its other features do.
+  "augmentcode-plugin": "augmentcode",
   "kiro-cli": KIRO_HOOKS_OVERRIDE_KEY,
   "kiro-ide": KIRO_HOOKS_OVERRIDE_KEY,
+  // A ZCode plugin's hooks are ZCode hooks, so it reads the `zcode` block.
+  "zcode-plugin": "zcode",
+  // A Vibe plugin's hooks are Vibe hooks, so it reads the `vibe` block.
+  "vibe-plugin": "vibe",
+  // A Devin plugin's hooks are Devin hooks, so it reads the `devin` block.
+  "devin-plugin": "devin",
 };
 
-/** The targets writing the standalone `.kiro/hooks/*.json` v1 format. */
-const KIRO_STANDALONE_HOOKS_TARGETS: ReadonlySet<ToolTarget> = new Set(["kiro-cli", "kiro-ide"]);
+/** The targets whose hooks format carries a per-hook on-disk enable flag. */
+const PER_HOOK_ENABLED_TARGETS: ReadonlySet<ToolTarget> = new Set([
+  "kiro-cli",
+  "kiro-ide",
+  "zcode",
+  "zcode-plugin",
+]);
+
+/** The targets whose hooks format carries the Kiro `confirm` prompt. */
+const PER_HOOK_CONFIRM_TARGETS: ReadonlySet<ToolTarget> = new Set(["kiro-cli", "kiro-ide"]);
+
+/**
+ * Names the shared events that carry a hook whose canonical definition
+ * satisfies `predicate`, excluding events the target skips altogether (those
+ * are already reported as skipped and produce no output, so warning about them
+ * again would contradict that message).
+ */
+function emittedEventsWithHook(params: {
+  factory: ToolHooksFactory;
+  sharedHooks: HooksConfig["hooks"];
+  effectiveHooks: HooksConfig["hooks"];
+  predicate: (def: HookDefinition) => boolean;
+}): string[] {
+  const { factory, sharedHooks, effectiveHooks, predicate } = params;
+  const skippedEvents: Set<string> = new Set(
+    unsupportedEventNames({ factory, sharedHooks, effectiveHooks }),
+  );
+  return Object.entries(sharedHooks)
+    .filter(([event, defs]) => !skippedEvents.has(event) && defs.some((def) => predicate(def)))
+    .map(([event]) => event);
+}
 
 export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFactory>([
   [
@@ -241,6 +336,10 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportedHookTypes: ["command"],
       supportsMatcher: true,
       matcherEvents: ["preToolUse", "postToolUse"],
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
+      overrideOnlyEvents: AMP_OVERRIDE_ONLY_HOOK_EVENTS,
     },
   ],
   [
@@ -283,6 +382,9 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportedEvents: ANTIGRAVITY_HOOK_EVENTS,
       supportedHookTypes: ["command"],
       supportsMatcher: true,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
     },
   ],
   [
@@ -296,6 +398,25 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       },
       supportedEvents: CURSOR_HOOK_EVENTS,
       supportedHookTypes: ["command", "prompt"],
+      supportsMatcher: true,
+    },
+  ],
+  [
+    "firebender",
+    {
+      class: FirebenderHooks,
+      meta: {
+        // `.firebender/hooks.json` (project) and `~/.firebender/hooks.json`
+        // (global), in Cursor's `{ version, hooks }` layout.
+        // https://docs.firebender.com/multi-agent/hooks
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: FIREBENDER_HOOK_EVENTS,
+      // The config table lists `type: "command" | "prompt"`, but what a prompt
+      // hook does is undocumented, so only command hooks are generated.
+      supportedHookTypes: ["command"],
       supportsMatcher: true,
     },
   ],
@@ -327,6 +448,57 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportedEvents: CLAUDE_HOOK_EVENTS,
       supportedHookTypes: ["command", "prompt", "http", "mcp_tool", "agent"],
       supportsMatcher: true,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
+    },
+  ],
+  [
+    "codebuddy",
+    {
+      class: CodebuddyHooks,
+      meta: {
+        // CodeBuddy Code hooks live under the top-level `hooks` key of
+        // `.codebuddy/settings.json` (project) and `~/.codebuddy/settings.json`
+        // (user), in the Claude-Code shape with command, http, prompt and
+        // agent hooks.
+        // `matcher` is a regex over the tool name (or the event's source);
+        // UserPromptSubmit, Stop, SubagentStop and PostCompact fire
+        // unconditionally.
+        // https://www.codebuddy.ai/docs/cli/hooks
+        // https://www.codebuddy.ai/docs/cli/plugins-reference
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: CODEBUDDY_HOOK_EVENTS,
+      supportedHookTypes: ["command", "http", "prompt", "agent"],
+      supportsMatcher: true,
+      matcherEvents: CODEBUDDY_MATCHER_HOOK_EVENTS,
+    },
+  ],
+  [
+    "codewhale",
+    {
+      class: CodewhaleHooks,
+      meta: {
+        // Codewhale hooks live in `.codewhale/hooks.toml` (project, top-level
+        // `[[hooks]]`; honored once the workspace is trusted and the file bytes
+        // approved with `/hooks approve`) and in the `[hooks]` table of
+        // `~/.codewhale/config.toml` (global, shared with every other setting).
+        // https://github.com/Hmbown/Codewhale/blob/main/docs/HOOKS.md
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: CODEWHALE_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      // A matcher becomes a `tool_name` condition, which Codewhale accepts only
+      // on events that carry a tool.
+      supportsMatcher: true,
+      matcherEvents: CODEWHALE_MATCHER_HOOK_EVENTS,
+      // Override-block keys are emitted verbatim when they are Codewhale's own
+      // event names (as an import files them); the adapter reports the rest.
     },
   ],
   [
@@ -339,8 +511,29 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
         supportsImport: true,
       },
       supportedEvents: CODEXCLI_HOOK_EVENTS,
+      supportedHookTypes: ["command", "mcp_tool"],
+      supportsMatcher: true,
+    },
+  ],
+  [
+    "commandcode",
+    {
+      class: CommandcodeHooks,
+      meta: {
+        // Command Code hooks live under the top-level `hooks` key of
+        // `.commandcode/settings.json` (project) and
+        // `~/.commandcode/settings.json` (user), in the Claude-Code shape with
+        // command hooks only. `matcher` is a regex over the tool name for
+        // PreToolUse/PostToolUse; Stop and SessionStart fire unconditionally.
+        // https://commandcode.ai/docs/hooks
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: COMMANDCODE_HOOK_EVENTS,
       supportedHookTypes: ["command"],
       supportsMatcher: true,
+      matcherEvents: ["preToolUse", "postToolUse"],
     },
   ],
   [
@@ -390,7 +583,28 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportedEvents: KILO_HOOK_EVENTS,
       supportedHookTypes: ["command"],
       supportsMatcher: true,
-      matcherEvents: ["preToolUse", "postToolUse"],
+      matcherEvents: OPENCODE_MATCHER_HOOK_EVENTS,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
+    },
+  ],
+  [
+    "mimocode",
+    {
+      class: MimocodeHooks,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: false,
+      },
+      supportedEvents: OPENCODE_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+      matcherEvents: OPENCODE_MATCHER_HOOK_EVENTS,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
     },
   ],
   [
@@ -405,7 +619,10 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportedEvents: OPENCODE_HOOK_EVENTS,
       supportedHookTypes: ["command"],
       supportsMatcher: true,
-      matcherEvents: ["preToolUse", "postToolUse"],
+      matcherEvents: OPENCODE_MATCHER_HOOK_EVENTS,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
     },
   ],
   [
@@ -427,6 +644,31 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       // Matchers are evaluated as regexes against `event.toolName` on Pi's
       // tool_call / tool_result events.
       supportsMatcher: true,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
+    },
+  ],
+  [
+    "omp",
+    {
+      class: OmpHooks,
+      meta: {
+        // oh-my-pi discovers extensions from `.omp/extensions/` (project) and
+        // `~/.omp/agent/extensions/` (global); rulesync generates the same
+        // kind of TypeScript extension as for Pi, so import is unsupported.
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: false,
+      },
+      supportedEvents: OMP_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      // Matchers are evaluated as regexes against `event.toolName` on
+      // oh-my-pi's tool_call / tool_result events.
+      supportsMatcher: true,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
     },
   ],
   [
@@ -463,6 +705,9 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       // The payload shape differs per event and the wrapper is a plain shell
       // script with no JSON parser to rely on, so a matcher cannot be enforced.
       supportsMatcher: false,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
     },
   ],
   [
@@ -498,7 +743,6 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportsMatcher: true,
       // Hermes-native event names are valid in the target override block and
       // are emitted verbatim after adapter validation.
-      passthroughOverrideEvents: true,
     },
   ],
   [
@@ -509,7 +753,6 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportedEvents: KIMI_CODE_HOOK_EVENTS,
       supportedHookTypes: ["command"],
       supportsMatcher: true,
-      passthroughOverrideEvents: true,
     },
   ],
   [
@@ -523,6 +766,9 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportedHookTypes: ["command"],
       // v2 matcher groups carry the matcher; the pre-v2 flat list could not.
       supportsMatcher: true,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
     },
   ],
   [
@@ -542,9 +788,7 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       // The shared `kiro` override block carries this format's own native keys
       // (`fileEdited`, `fileCreated`, …) plus the standalone-format triggers the
       // other Kiro targets read. The adapter filters that block against its own
-      // vocabulary and reports what it drops, so a generic "not supported"
-      // warning here would be both duplicate and wrong.
-      passthroughOverrideEvents: true,
+      // vocabulary and reports what it drops.
     },
   ],
   [
@@ -568,7 +812,6 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportsMatcher: true,
       // Triggers with no canonical event (PostFileSave, PreTaskExec, …)
       // supplied via the shared `kiro` override block are emitted verbatim.
-      passthroughOverrideEvents: true,
     },
   ],
   [
@@ -590,8 +833,27 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportedHookTypes: ["command", "prompt"],
       supportsMatcher: true,
       // IDE-only triggers (PostFileSave, PreTaskExec, …) supplied via the
-      // shared `kiro` override block are emitted verbatim, so don't warn on them.
-      passthroughOverrideEvents: true,
+      // shared `kiro` override block are emitted verbatim.
+    },
+  ],
+  [
+    "lettacode",
+    {
+      class: LettacodeHooks,
+      meta: {
+        // Letta Code hooks live under the top-level `hooks` key of
+        // `.letta/settings.json` (project) and `~/.letta/settings.json`
+        // (user), in the Claude-Code shape. Only command hooks are emitted,
+        // with timeouts in milliseconds. `matcher` applies to the tool events.
+        // https://github.com/letta-ai/letta-code/blob/main/src/hooks/types.ts
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: LETTACODE_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+      matcherEvents: ["preToolUse", "postToolUse", "postToolUseFailure", "permissionRequest"],
     },
   ],
   [
@@ -607,6 +869,18 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
         supportsGlobal: true,
         supportsImport: true,
       },
+      supportedEvents: DEVIN_HOOK_EVENTS,
+      supportedHookTypes: ["command", "prompt"],
+      supportsMatcher: true,
+    },
+  ],
+  [
+    "devin-plugin",
+    {
+      // `<plugin>/hooks.json`, the same bare event map as `.devin/hooks.v1.json`.
+      // https://docs.devin.ai/cli/extensibility/plugins/overview
+      class: DevinPluginHooks,
+      meta: { supportsProject: true, supportsGlobal: false, supportsImport: true },
       supportedEvents: DEVIN_HOOK_EVENTS,
       supportedHookTypes: ["command", "prompt"],
       supportsMatcher: true,
@@ -630,6 +904,108 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
     },
   ],
   [
+    "augmentcode-plugin",
+    {
+      class: AugmentcodePluginHooks,
+      meta: {
+        // Auggie plugin bundles ship hooks in `<plugin>/hooks/hooks.json`.
+        // https://docs.augmentcode.com/cli/plugins
+        supportsProject: true,
+        supportsGlobal: false,
+        supportsImport: true,
+      },
+      supportedEvents: AUGMENTCODE_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+    },
+  ],
+  [
+    "bob",
+    {
+      class: BobHooks,
+      meta: {
+        // IBM Bob hooks live under the top-level `hooks` key of the shared
+        // settings file `.bob/settings.json` (project) /
+        // `~/.bob/settings/settings.json` (global). Command hooks and http
+        // hooks (written as Bob's `https` handler) are supported, and a
+        // matcher applies only to the tool events.
+        // https://bob.ibm.com/docs/ide/configuration/lifecycle-hooks
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: BOB_HOOK_EVENTS,
+      supportedHookTypes: ["command", "http"],
+      supportsMatcher: true,
+      matcherEvents: ["preToolUse", "postToolUse"],
+    },
+  ],
+  [
+    "continue",
+    {
+      class: ContinueHooks,
+      meta: {
+        // Continue CLI hooks live under the top-level `hooks` key of
+        // `.continue/settings.json` (project) and `~/.continue/settings.json`
+        // (global), in the Claude-Code shape with command, http, prompt and
+        // agent handlers. `matcher` is a regex over the event's subject;
+        // UserPromptSubmit, Stop, TeammateIdle, TaskCompleted, WorktreeCreate
+        // and WorktreeRemove fire unconditionally.
+        // https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/extensions/cli/src/hooks/types.ts
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: CONTINUE_HOOK_EVENTS,
+      supportedHookTypes: ["command", "http", "prompt", "agent"],
+      supportsMatcher: true,
+      matcherEvents: [
+        "preToolUse",
+        "postToolUse",
+        "postToolUseFailure",
+        "permissionRequest",
+        "sessionStart",
+        "sessionEnd",
+        "notification",
+        "subagentStart",
+        "subagentStop",
+        "preCompact",
+        "configChange",
+      ],
+    },
+  ],
+  [
+    "cortexcode",
+    {
+      class: CortexcodeHooks,
+      meta: {
+        // Snowflake Cortex Code hooks live under the top-level `hooks` key of
+        // `.cortex/settings.json` (project) and of the dedicated
+        // `~/.snowflake/cortex/hooks.json` (global), in the Claude-Code shape
+        // with command and prompt hooks. `matcher` is a regex over the tool
+        // name; UserPromptSubmit and Stop fire unconditionally.
+        // https://docs.snowflake.com/en/user-guide/cortex-code/extensibility
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: CORTEXCODE_HOOK_EVENTS,
+      supportedHookTypes: ["command", "prompt"],
+      supportsMatcher: true,
+      matcherEvents: [
+        "preToolUse",
+        "postToolUse",
+        "permissionRequest",
+        "sessionStart",
+        "sessionEnd",
+        "preCompact",
+        "subagentStop",
+        "notification",
+        "setup",
+      ],
+    },
+  ],
+  [
     "junie",
     {
       class: JunieHooks,
@@ -642,6 +1018,44 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
         supportsImport: true,
       },
       supportedEvents: JUNIE_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+    },
+  ],
+  [
+    "gitlabduo",
+    {
+      class: GitlabduoHooks,
+      meta: {
+        // GitLab Duo CLI reads `~/.gitlab/duo/hooks.json` (user) and
+        // `<project>/.gitlab/duo/hooks.json` (project; opt-in via
+        // `--enable-project-hooks` / `GITLAB_ENABLE_PROJECT_HOOKS=true`).
+        // https://docs.gitlab.com/user/gitlab_duo_cli/customize/
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: GITLABDUO_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+    },
+  ],
+  [
+    "tabnine",
+    {
+      class: TabnineHooks,
+      meta: {
+        // Tabnine CLI hooks live under the top-level `hooks` key of the shared
+        // settings file `.tabnine/agent/settings.json` (project) /
+        // `~/.tabnine/agent/settings.json` (user). Only command hooks exist;
+        // `matcher` is a regex on the two tool events and an exact string on
+        // the lifecycle events, so every event accepts one.
+        // https://docs.tabnine.com/main/getting-started/tabnine-cli/features/hooks
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: TABNINE_HOOK_EVENTS,
       supportedHookTypes: ["command"],
       supportsMatcher: true,
     },
@@ -663,6 +1077,82 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       // All three Vibe events (before_tool/after_tool/post_agent_turn) accept a
       // `match` tool-name matcher (fnmatch glob or `re:` regex).
       supportsMatcher: true,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
+    },
+  ],
+  [
+    "vibe-plugin",
+    {
+      // `<plugin>/ai.mistral.vibe/hooks.toml`, the same `[[hooks]]` array as
+      // `.vibe/hooks.toml`.
+      // https://github.com/mistralai/mistral-vibe/blob/v2.25.8/vibe/core/plugins/_native.py
+      class: VibePluginHooks,
+      meta: { supportsProject: true, supportsGlobal: false, supportsImport: true },
+      supportedEvents: VIBE_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+      dropsUnknownOverrideEvents: true,
+    },
+  ],
+  [
+    "pool",
+    {
+      // Pool hooks live under the `hooks` key of its settings file,
+      // `.poolside/settings.yaml` (project) / `~/.config/poolside/settings.yaml`
+      // (global), as a flat `<Event>: [{name, matcher, command, timeout}]`
+      // list per event. `matcher` is tested against the tool name on
+      // PreToolUse/PostToolUse only (`*` any, bare name exact, `a|b` list,
+      // else regex) and is written as `*` on the other events, which Pool
+      // ignores it on. https://docs.poolside.ai/hooks
+      class: PoolHooks,
+      meta: { supportsProject: true, supportsGlobal: true, supportsImport: true },
+      supportedEvents: POOL_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+      // Event names under the `pool.hooks` override (e.g. ones an import
+      // filed there) are emitted verbatim by the adapter.
+    },
+  ],
+  [
+    "qoder",
+    {
+      // Qoder hooks live under the `hooks` key of `.qoder/settings.json`
+      // (project) / `~/.qoder/settings.json` (global) in the Claude-Code shape.
+      // UserPromptSubmit, Stop, CwdChanged, WorktreeCreate/Remove and the
+      // task/teammate events carry no matcher.
+      // https://docs.qoder.com/en/cli/hooks
+      class: QoderHooks,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+      supportedEvents: QODER_HOOK_EVENTS,
+      supportedHookTypes: ["command", "http", "prompt", "agent"],
+      supportsMatcher: true,
+      matcherEvents: [
+        "sessionStart",
+        "sessionEnd",
+        "preToolUse",
+        "postToolUse",
+        "postToolUseFailure",
+        "stopFailure",
+        "subagentStart",
+        "subagentStop",
+        "preCompact",
+        "postCompact",
+        "notification",
+        "configChange",
+        "instructionsLoaded",
+        "fileChanged",
+        "elicitation",
+        "elicitationResult",
+        "permissionRequest",
+        "permissionDenied",
+        "setup",
+      ],
     },
   ],
   [
@@ -704,6 +1194,9 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       // Only PreToolUse/PostToolUse honor `match`; the adapter itself drops it
       // (with a warning) on UserPromptSubmit/Stop.
       supportsMatcher: true,
+      // The adapter only emits its own native events; unknown override-block
+      // keys are dropped, so report them.
+      dropsUnknownOverrideEvents: true,
     },
   ],
   [
@@ -730,6 +1223,49 @@ export const toolHooksFactories = new Map<HooksProcessorToolTarget, ToolHooksFac
       supportsMatcher: true,
     },
   ],
+  [
+    "crush",
+    {
+      // Crush hooks live under the `hooks` key of `<project>/crush.json` (or
+      // `.crush.json`) and `~/.config/crush/crush.json`, as a flat
+      // `PreToolUse: [{name, matcher, command, timeout}]` list. `matcher` is
+      // a regex on the tool name; only `PreToolUse` fires today.
+      // https://github.com/charmbracelet/crush/blob/main/docs/hooks/README.md
+      class: CrushHooks,
+      meta: { supportsProject: true, supportsGlobal: true, supportsImport: true },
+      supportedEvents: CRUSH_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+      // Event names under the `crush.hooks` override (e.g. ones an import
+      // filed there) are emitted verbatim by the adapter.
+    },
+  ],
+  [
+    "zcode",
+    {
+      // ZCode hooks live under the `hooks` key of its config file —
+      // `<project>/.zcode/config.json` (workspace) or `~/.zcode/cli/config.json`
+      // (user) — with the event map nested under `hooks.events`. Workspace
+      // hooks run once the user trusts them in ZCode.
+      class: ZcodeHooks,
+      meta: { supportsProject: true, supportsGlobal: true, supportsImport: true },
+      supportedEvents: ZCODE_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+    },
+  ],
+  [
+    "zcode-plugin",
+    {
+      // `<plugin>/hooks/hooks.json`, the event map directly under `hooks`.
+      // https://zcode.z.ai/en/docs/plugin
+      class: ZcodePluginHooks,
+      meta: { supportsProject: true, supportsGlobal: false, supportsImport: true },
+      supportedEvents: ZCODE_HOOK_EVENTS,
+      supportedHookTypes: ["command"],
+      supportsMatcher: true,
+    },
+  ],
 ]);
 
 // Project-mode generation/import should only expose tools that actually write
@@ -751,6 +1287,7 @@ const hooksProcessorToolTargetsGlobalImportable: ToolTarget[] = [...toolHooksFac
 export class HooksProcessor extends FeatureProcessor {
   private readonly toolTarget: HooksProcessorToolTarget;
   private readonly global: boolean;
+  private readonly preserveUnownedHooks: boolean;
 
   constructor({
     outputRoot = process.cwd(),
@@ -758,6 +1295,7 @@ export class HooksProcessor extends FeatureProcessor {
     toolTarget,
     global = false,
     dryRun = false,
+    preserveUnownedHooks = false,
     logger,
   }: {
     outputRoot?: string;
@@ -765,6 +1303,7 @@ export class HooksProcessor extends FeatureProcessor {
     toolTarget: ToolTarget;
     global?: boolean;
     dryRun?: boolean;
+    preserveUnownedHooks?: boolean;
     logger: Logger;
   }) {
     super({ outputRoot, inputRoots, dryRun, logger });
@@ -776,6 +1315,7 @@ export class HooksProcessor extends FeatureProcessor {
     }
     this.toolTarget = result.data;
     this.global = global;
+    this.preserveUnownedHooks = preserveUnownedHooks;
   }
 
   async loadRulesyncFiles(): Promise<RulesyncFile[]> {
@@ -850,6 +1390,7 @@ export class HooksProcessor extends FeatureProcessor {
         outputRoot: this.outputRoot,
         validate: true,
         global: this.global,
+        logger: this.logger,
       });
       this.logger.debug(`Successfully loaded 1 ${this.toolTarget} hooks file`);
       return [toolHooks];
@@ -915,33 +1456,7 @@ export class HooksProcessor extends FeatureProcessor {
       }
     }
 
-    // Warn that `enabled: false` cannot be expressed outside the Kiro
-    // standalone hooks format, whose entries carry an on-disk per-definition
-    // enable flag (both `kiro-ide` and `kiro-cli` write it); everywhere
-    // else the hook is emitted as an ordinary, active hook, so a user who paused
-    // one hook would otherwise see it keep firing with no explanation.
-    // Only canonical definitions are considered: a tool-native `enabled` inside
-    // an override block is passed through verbatim and honored by that tool.
-    if (!KIRO_STANDALONE_HOOKS_TARGETS.has(this.toolTarget)) {
-      // Events the target does not support are already reported as skipped and
-      // produce no output at all, so warning about them here would contradict
-      // that message.
-      const skippedEvents: Set<string> = new Set(
-        unsupportedEventNames({ factory, sharedHooks, effectiveHooks }),
-      );
-      const eventsWithDisabledHooks = Object.entries(sharedHooks)
-        .filter(
-          ([event, defs]) =>
-            !skippedEvents.has(event) &&
-            (defs as { enabled?: unknown }[]).some((def) => def.enabled === false),
-        )
-        .map(([event]) => event);
-      if (eventsWithDisabledHooks.length > 0) {
-        this.logger.warn(
-          `Emitting "enabled: false" hook(s) as active for ${this.toolTarget} (only the kiro-cli / kiro-ide standalone hooks format supports the flag): ${eventsWithDisabledHooks.join(", ")}`,
-        );
-      }
-    }
+    this.warnAboutDroppedPerHookFields({ factory, sharedHooks, effectiveHooks });
 
     // Warn about unsupported matcher
     const eventsWithUnsupportedMatcher = unsupportedMatcherEventNames({ factory, effectiveHooks });
@@ -956,6 +1471,7 @@ export class HooksProcessor extends FeatureProcessor {
       rulesyncHooks,
       validate: true,
       global: this.global,
+      preserveUnowned: this.preserveUnownedHooks,
       // The converter is shared by every target, so its warnings say what is
       // wrong but not which file is being written. Every other warning here
       // names the tool, and one generate run walks all of them.
@@ -974,6 +1490,55 @@ export class HooksProcessor extends FeatureProcessor {
     }
 
     return result;
+  }
+
+  /**
+   * Warns about canonical per-hook fields that this target's hooks format
+   * cannot express, so a hook does not silently change behavior on generation.
+   * Only canonical definitions are considered: a tool-native field inside an
+   * override block is passed through verbatim and honored by that tool.
+   */
+  private warnAboutDroppedPerHookFields(params: {
+    factory: ToolHooksFactory;
+    sharedHooks: HooksConfig["hooks"];
+    effectiveHooks: HooksConfig["hooks"];
+  }): void {
+    const { factory, sharedHooks, effectiveHooks } = params;
+    // Warn that `enabled: false` cannot be expressed by targets whose hooks
+    // format carries no per-definition on-disk enable flag (`kiro-ide`,
+    // `kiro-cli` and `zcode` do); everywhere else the hook is emitted as an
+    // ordinary, active hook, so a user who paused one hook would otherwise see
+    // it keep firing with no explanation.
+    if (!PER_HOOK_ENABLED_TARGETS.has(this.toolTarget)) {
+      const eventsWithDisabledHooks = emittedEventsWithHook({
+        factory,
+        sharedHooks,
+        effectiveHooks,
+        predicate: (def) => def.enabled === false,
+      });
+      if (eventsWithDisabledHooks.length > 0) {
+        this.logger.warn(
+          `Emitting "enabled: false" hook(s) as active for ${this.toolTarget} (only the kiro-cli / kiro-ide / zcode hooks formats support the flag): ${eventsWithDisabledHooks.join(", ")}`,
+        );
+      }
+    }
+
+    // Same idea for the Kiro `confirm` prompt: it asks the user
+    // before the command runs, so a target without it would run the hook
+    // unconditionally with no explanation.
+    if (!PER_HOOK_CONFIRM_TARGETS.has(this.toolTarget)) {
+      const eventsWithConfirmHooks = emittedEventsWithHook({
+        factory,
+        sharedHooks,
+        effectiveHooks,
+        predicate: (def) => def.confirm !== undefined,
+      });
+      if (eventsWithConfirmHooks.length > 0) {
+        this.logger.warn(
+          `Emitting hook(s) without their "confirm" prompt for ${this.toolTarget} (only the kiro-cli / kiro-ide hooks formats support it): ${eventsWithConfirmHooks.join(", ")}`,
+        );
+      }
+    }
   }
 
   async convertToolFilesToRulesyncFiles(toolFiles: ToolFile[]): Promise<RulesyncFile[]> {

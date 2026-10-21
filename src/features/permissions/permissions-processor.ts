@@ -17,12 +17,20 @@ import { AmpPermissions } from "./amp-permissions.js";
 import { AntigravityCliPermissions } from "./antigravity-cli-permissions.js";
 import { AntigravityIdePermissions } from "./antigravity-ide-permissions.js";
 import { AugmentcodePermissions } from "./augmentcode-permissions.js";
+import { BobPermissions } from "./bob-permissions.js";
 import { ClaudecodePermissions } from "./claudecode-permissions.js";
 import { ClinePermissions } from "./cline-permissions.js";
+import { CodebuddyPermissions } from "./codebuddy-permissions.js";
+import { CodewhalePermissions } from "./codewhale-permissions.js";
+import { createCodewhaleProjectConfigFile } from "./codewhale-project-config.js";
 import { CodexcliPermissions, createCodexcliBashRulesFile } from "./codexcli-permissions.js";
+import { CommandcodePermissions } from "./commandcode-permissions.js";
+import { ContinuePermissions } from "./continue-permissions.js";
 import { CopilotPermissions } from "./copilot-permissions.js";
 import { CopilotcliPermissions } from "./copilotcli-permissions.js";
+import { CrushPermissions } from "./crush-permissions.js";
 import { CursorPermissions } from "./cursor-permissions.js";
+import { DeepagentsPermissions } from "./deepagents-permissions.js";
 import { DevinPermissions } from "./devin-permissions.js";
 import { FactorydroidPermissions } from "./factorydroid-permissions.js";
 import { GoosePermissions } from "./goose-permissions.js";
@@ -31,14 +39,21 @@ import { HermesagentPermissions } from "./hermesagent-permissions.js";
 import { JuniePermissions } from "./junie-permissions.js";
 import { KiloPermissions } from "./kilo-permissions.js";
 import { KimiCodePermissions } from "./kimi-code-permissions.js";
+import { KiroScopedPermissions } from "./kiro-capability-permissions.js";
 import { KiroPermissions } from "./kiro-permissions.js";
+import { LettacodePermissions } from "./lettacode-permissions.js";
+import { MimocodePermissions } from "./mimocode-permissions.js";
+import { OmpPermissions } from "./omp-permissions.js";
 import { OpencodePermissions } from "./opencode-permissions.js";
 import { PiPermissions } from "./pi-permissions.js";
+import { PoolPermissions } from "./pool-permissions.js";
+import { QoderPermissions } from "./qoder-permissions.js";
 import { QwencodePermissions } from "./qwencode-permissions.js";
 import { ReasonixPermissions } from "./reasonix-permissions.js";
 import { RooPermissions } from "./roo-permissions.js";
 import { RovodevPermissions } from "./rovodev-permissions.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+import { TabninePermissions } from "./tabnine-permissions.js";
 import { TaktPermissions } from "./takt-permissions.js";
 import type {
   ToolPermissionsForDeletionParams,
@@ -47,8 +62,10 @@ import type {
   ToolPermissionsSettablePaths,
 } from "./tool-permissions.js";
 import { ToolPermissions } from "./tool-permissions.js";
+import { TraePermissions } from "./trae-permissions.js";
 import { VibePermissions } from "./vibe-permissions.js";
 import { WarpPermissions } from "./warp-permissions.js";
+import { WarpcliPermissions } from "./warpcli-permissions.js";
 import { ZedPermissions } from "./zed-permissions.js";
 import { ZoocodePermissions } from "./zoocode-permissions.js";
 
@@ -131,6 +148,21 @@ export const toolPermissionsFactories = new Map<
     },
   ],
   [
+    "bob",
+    {
+      class: BobPermissions,
+      meta: {
+        // IBM Bob documents its `approval` block only in the user settings file
+        // `~/.bob/settings/settings.json` (shared by Bob IDE and Bob Shell);
+        // whether a workspace `.bob/settings.json` honors it is undocumented.
+        // https://bob.ibm.com/docs/shell/configuration/approval-settings
+        supportsProject: false,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
     "claudecode",
     {
       class: ClaudecodePermissions,
@@ -153,6 +185,35 @@ export const toolPermissionsFactories = new Map<
     },
   ],
   [
+    "codebuddy",
+    {
+      class: CodebuddyPermissions,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "codewhale",
+    {
+      class: CodewhalePermissions,
+      meta: {
+        // Codewhale reads typed permission rules only from the global
+        // `~/.codewhale/permissions.toml`. In the project, the enforced
+        // `protected_invariants` of `.codewhale/constitution.json` hold writes
+        // to protected paths (deny/ask only), and a deny on every shell
+        // command sets `allow_shell = false` in `.codewhale/config.toml`.
+        // https://github.com/Hmbown/Codewhale/blob/main/docs/AUTHORIZATION_ORDER.md
+        // https://github.com/Hmbown/Codewhale/blob/main/docs/CONFIGURATION.md#enforced-repo-law-invariants
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
     "codexcli",
     {
       class: CodexcliPermissions,
@@ -164,15 +225,42 @@ export const toolPermissionsFactories = new Map<
     },
   ],
   [
+    "commandcode",
+    {
+      class: CommandcodePermissions,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "continue",
+    {
+      class: ContinuePermissions,
+      meta: {
+        // The Continue CLI reads tool policies only from the user-scoped
+        // `~/.continue/permissions.yaml`; there is no project-scoped
+        // permissions file (mirrors the Goose adapter).
+        // https://docs.continue.dev/cli/tool-permissions
+        supportsProject: false,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
     "copilot",
     {
       class: CopilotPermissions,
       meta: {
         // GitHub Copilot Chat in VS Code has no standalone policy file; the
-        // adapter manages only the `chat.tools.terminal.autoApprove` map in the
-        // workspace `.vscode/settings.json`. VS Code's user-scope settings.json
-        // is at a platform-dependent path outside rulesync's home-relative
-        // global model, so only project scope is supported.
+        // adapter manages the `chat.tools.*.autoApprove` maps and
+        // `chat.permissions.default` in the workspace `.vscode/settings.json`.
+        // VS Code's user-scope settings.json is at a platform-dependent path
+        // outside rulesync's home-relative global model, so only project scope
+        // is supported.
         supportsProject: true,
         supportsGlobal: false,
         supportsImport: true,
@@ -195,11 +283,42 @@ export const toolPermissionsFactories = new Map<
     },
   ],
   [
+    "crush",
+    {
+      class: CrushPermissions,
+      meta: {
+        // Crush's `permissions.allowed_tools` (no prompt) and
+        // `options.disabled_tools` (hidden built-ins) live in
+        // `<project>/crush.json` (or `.crush.json`) and
+        // `~/.config/crush/crush.json`; both lists are tool-wide, so only
+        // catch-all rules are written.
+        // https://github.com/charmbracelet/crush/blob/main/docs/config/README.md
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
     "cursor",
     {
       class: CursorPermissions,
       meta: {
         supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "deepagents",
+    {
+      class: DeepagentsPermissions,
+      meta: {
+        // dcode reads shell auto-approval from `[shell].allow_list` in the user
+        // config `~/.deepagents/config.toml`; it has no project-level config
+        // file, so there is no project scope to write.
+        supportsProject: false,
         supportsGlobal: true,
         supportsImport: true,
       },
@@ -325,13 +444,15 @@ export const toolPermissionsFactories = new Map<
     },
   ],
   [
-    // Kiro IDE and CLI share the same permissions file.
+    // Kiro IDE and CLI share the same permissions files: the agent config
+    // `.kiro/agents/default.json` in project scope, and the capability-based
+    // `~/.kiro/settings/permissions.yaml` (IDE 1.0 / CLI V3) in global scope.
     "kiro-cli",
     {
-      class: KiroPermissions,
+      class: KiroScopedPermissions,
       meta: {
         supportsProject: true,
-        supportsGlobal: false,
+        supportsGlobal: true,
         supportsImport: true,
       },
     },
@@ -339,10 +460,45 @@ export const toolPermissionsFactories = new Map<
   [
     "kiro-ide",
     {
-      class: KiroPermissions,
+      class: KiroScopedPermissions,
       meta: {
         supportsProject: true,
-        supportsGlobal: false,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "lettacode",
+    {
+      class: LettacodePermissions,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "mimocode",
+    {
+      class: MimocodePermissions,
+      meta: {
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "omp",
+    {
+      class: OmpPermissions,
+      meta: {
+        // `tools.approval` and `bash.patterns` in `.omp/config.yml` (project)
+        // and `~/.omp/agent/config.yml` (global, default profile).
+        supportsProject: true,
+        supportsGlobal: true,
         supportsImport: true,
       },
     },
@@ -364,7 +520,35 @@ export const toolPermissionsFactories = new Map<
       class: PiPermissions,
       meta: {
         // `.pi/settings.json` (project) and `~/.pi/agent/settings.json`
-        // (global); a project `defaultTools` array replaces the global one.
+        // (global); Pi layers a project `defaultTools` array on the global one
+        // itself (plain names replace it, `+name` / `-name` entries adjust it).
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "pool",
+    {
+      class: PoolPermissions,
+      meta: {
+        // Pool's `tools.<name>.allow`/`deny` pattern lists and `paths`
+        // entries live in `.poolside/settings.yaml` (project) and
+        // `~/.config/poolside/settings.yaml` (global), the same file the MCP
+        // servers are written to; the merge is in place.
+        // https://docs.poolside.ai/settings-file-reference
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "qoder",
+    {
+      class: QoderPermissions,
+      meta: {
         supportsProject: true,
         supportsGlobal: true,
         supportsImport: true,
@@ -432,6 +616,21 @@ export const toolPermissionsFactories = new Map<
     },
   ],
   [
+    "tabnine",
+    {
+      class: TabninePermissions,
+      meta: {
+        // Tabnine CLI reads `tools.allowed` / `tools.exclude` from the shared
+        // settings file `.tabnine/agent/settings.json` (project) /
+        // `~/.tabnine/agent/settings.json` (user).
+        // https://docs.tabnine.com/main/getting-started/tabnine-cli/features/settings/settings-reference
+        supportsProject: true,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
     "takt",
     {
       class: TaktPermissions,
@@ -473,14 +672,46 @@ export const toolPermissionsFactories = new Map<
     },
   ],
   [
+    "warpcli",
+    {
+      class: WarpcliPermissions,
+      meta: {
+        // The standalone Warp Agent CLI reads permissions only from the
+        // `default` execution profile in its own global `settings.toml`,
+        // separate from the Warp app's. The path differs per platform,
+        // resolved in WarpcliPermissions.getSettablePaths.
+        // https://docs.warp.dev/agents/cli/permissions-and-profiles/
+        supportsProject: false,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
     "zed",
     {
       class: ZedPermissions,
       meta: {
         // Zed maps permissions onto `agent.tool_permissions` in the shared
-        // settings file: `.zed/settings.json` (project) and
-        // `~/.config/zed/settings.json` (global).
-        supportsProject: true,
+        // user settings file `~/.config/zed/settings.json`. Project scope is
+        // unsupported: Zed parses `.zed/settings.json` as
+        // `ProjectSettingsContent`, which has no `agent` field, so every
+        // `agent.*` key written there is ignored.
+        // https://github.com/zed-industries/zed/blob/main/crates/settings_content/src/project.rs
+        supportsProject: false,
+        supportsGlobal: true,
+        supportsImport: true,
+      },
+    },
+  ],
+  [
+    "trae",
+    {
+      class: TraePermissions,
+      meta: {
+        // TRAE keeps its permission policy in the user file
+        // `~/.trae/permission/global.json`; there is no project-scoped one.
+        supportsProject: false,
         supportsGlobal: true,
         supportsImport: true,
       },
@@ -596,6 +827,7 @@ export class PermissionsProcessor extends FeatureProcessor {
         outputRoot: this.outputRoot,
         validate: true,
         global: this.global,
+        logger: this.logger,
       });
       return [toolPermissions];
     } catch (error) {
@@ -636,6 +868,14 @@ export class PermissionsProcessor extends FeatureProcessor {
       logger: this.logger,
       global: this.global,
     });
+    if (this.toolTarget === "codewhale" && !this.global) {
+      const projectConfigFile = await createCodewhaleProjectConfigFile({
+        outputRoot: this.outputRoot,
+        config: effectivePermissions.getJson(),
+        logger: this.logger,
+      });
+      return projectConfigFile ? [toolPermissions, projectConfigFile] : [toolPermissions];
+    }
     if (this.toolTarget !== "codexcli") {
       return [toolPermissions];
     }
@@ -643,13 +883,14 @@ export class PermissionsProcessor extends FeatureProcessor {
     const bashRulesFile = createCodexcliBashRulesFile({
       outputRoot: this.outputRoot,
       config: effectivePermissions.getJson(),
+      logger: this.logger,
     });
     return [toolPermissions, bashRulesFile];
   }
 
   async convertToolFilesToRulesyncFiles(toolFiles: ToolFile[]): Promise<RulesyncFile[]> {
     const permissions = toolFiles.filter((f): f is ToolPermissions => f instanceof ToolPermissions);
-    return permissions.map((p) => p.toRulesyncPermissions());
+    return permissions.map((p) => p.toRulesyncPermissions({ logger: this.logger }));
   }
 
   static getToolTargets({

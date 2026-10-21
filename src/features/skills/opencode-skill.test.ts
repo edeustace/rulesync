@@ -1,4 +1,5 @@
-import { join } from "node:path";
+import { realpath, symlink } from "node:fs/promises";
+import { dirname, join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -6,12 +7,13 @@ import { SKILL_FILE_NAME } from "../../constants/general.js";
 import { RULESYNC_SKILLS_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
+import { fallbackLogger } from "../../utils/logger.js";
 import {
   OpenCodeSkill,
   OpenCodeSkillFrontmatter,
   OpenCodeSkillFrontmatterSchema,
 } from "./opencode-skill.js";
-import { RulesyncSkill, RulesyncSkillFrontmatterInput } from "./rulesync-skill.js";
+import { RulesyncSkill } from "./rulesync-skill.js";
 
 describe("OpenCodeSkill", () => {
   let testDir: string;
@@ -267,15 +269,13 @@ describe("OpenCodeSkill", () => {
         outputRoot: testDir,
         relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
         dirName: "test-skill",
-        // Top-level license/compatibility/metadata are accepted by the loose
-        // schema even though they are not part of the typed input.
         frontmatter: {
           name: "Test Skill",
           description: "Test skill description",
           license: "MIT",
           compatibility: { opencode: ">=2.0.0" },
           metadata: { author: "top-level" },
-        } as unknown as RulesyncSkillFrontmatterInput,
+        },
         body: "Test body",
         validate: true,
       });
@@ -314,22 +314,97 @@ describe("OpenCodeSkill", () => {
         outputRoot: testDir,
         relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
         dirName: "test-skill",
-        // `license` at the top level is accepted by the loose schema.
         frontmatter: {
           name: "Test Skill",
           description: "Test skill description",
           license: "MIT",
+          compatibility: "Requires git",
+          metadata: { author: "top-level" },
           opencode: {
             license: "Apache-2.0",
+            compatibility: { opencode: ">=2.0.0" },
+            metadata: { author: "section" },
           },
-        } as unknown as RulesyncSkillFrontmatterInput,
+        },
         body: "Test body",
         validate: true,
       });
 
-      const skill = OpenCodeSkill.fromRulesyncSkill({ rulesyncSkill, global: false });
+      const frontmatter = OpenCodeSkill.fromRulesyncSkill({
+        rulesyncSkill,
+        global: false,
+      }).getFrontmatter();
 
-      expect(skill.getFrontmatter().license).toBe("Apache-2.0");
+      expect(frontmatter.license).toBe("Apache-2.0");
+      expect(frontmatter.compatibility).toEqual({ opencode: ">=2.0.0" });
+      expect(frontmatter.metadata).toEqual({ author: "section" });
+    });
+    it("should emit the root-level disable-model-invocation", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "test-skill",
+        frontmatter: {
+          name: "Test Skill",
+          description: "Test skill description",
+          "disable-model-invocation": true,
+        },
+        body: "Test body",
+        validate: true,
+      });
+
+      const frontmatter = OpenCodeSkill.fromRulesyncSkill({
+        rulesyncSkill,
+        global: false,
+      }).getFrontmatter();
+
+      expect(frontmatter["disable-model-invocation"]).toBe(true);
+    });
+
+    it("should prefer the opencode section disable-model-invocation over the root value", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "test-skill",
+        frontmatter: {
+          name: "Test Skill",
+          description: "Test skill description",
+          "disable-model-invocation": true,
+          opencode: {
+            "disable-model-invocation": false,
+          },
+        },
+        body: "Test body",
+        validate: true,
+      });
+
+      const frontmatter = OpenCodeSkill.fromRulesyncSkill({
+        rulesyncSkill,
+        global: false,
+      }).getFrontmatter();
+
+      expect(frontmatter["disable-model-invocation"]).toBe(false);
+    });
+
+    it("should omit disable-model-invocation when neither value is set", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "test-skill",
+        frontmatter: {
+          name: "Test Skill",
+          description: "Test skill description",
+        },
+        body: "Test body",
+        validate: true,
+      });
+
+      const frontmatter = OpenCodeSkill.fromRulesyncSkill({
+        rulesyncSkill,
+        global: false,
+      }).getFrontmatter();
+
+      expect(frontmatter).not.toHaveProperty("disable-model-invocation");
     });
   });
 
@@ -394,6 +469,85 @@ Body content.`;
         compatibility: { opencode: ">=1.0.0" },
         metadata: { author: "rulesync" },
       });
+    });
+
+    it("should import disable-model-invocation into the opencode section", async () => {
+      const skillDir = join(testDir, ".opencode", "skills", "test-skill");
+      await ensureDir(skillDir);
+      const skillContent = `---
+name: Test Skill
+description: Test skill description
+disable-model-invocation: true
+---
+
+Body content.`;
+      await writeFileContent(join(skillDir, SKILL_FILE_NAME), skillContent);
+
+      const skill = await OpenCodeSkill.fromDir({
+        outputRoot: testDir,
+        dirName: "test-skill",
+      });
+
+      expect(skill.getFrontmatter()["disable-model-invocation"]).toBe(true);
+      const rulesyncFrontmatter = skill.toRulesyncSkill().getFrontmatter();
+      expect(rulesyncFrontmatter.opencode).toEqual({ "disable-model-invocation": true });
+      expect(rulesyncFrontmatter).not.toHaveProperty("disable-model-invocation");
+    });
+
+    it.each([
+      ["yes", true],
+      ["On", true],
+      ['"1"', true],
+      ["1", true],
+      ["no", false],
+      ["OFF", false],
+      ['"false"', false],
+      ["0", false],
+    ])(
+      "should coerce the OpenCode V2 spelling disable-model-invocation: %s to %s",
+      async (spelling, expected) => {
+        const skillDir = join(testDir, ".opencode", "skills", "test-skill");
+        await ensureDir(skillDir);
+        await writeFileContent(
+          join(skillDir, SKILL_FILE_NAME),
+          `---\nname: Test Skill\ndescription: Test skill description\ndisable-model-invocation: ${spelling}\n---\n\nBody content.`,
+        );
+
+        const skill = await OpenCodeSkill.fromDir({
+          outputRoot: testDir,
+          dirName: "test-skill",
+        });
+
+        expect(skill.getFrontmatter()["disable-model-invocation"]).toBe(expected);
+        expect(skill.toRulesyncSkill().getFrontmatter().opencode).toEqual({
+          "disable-model-invocation": expected,
+        });
+      },
+    );
+
+    it("should drop an unreadable disable-model-invocation with a warning instead of failing", async () => {
+      const skillDir = join(testDir, ".opencode", "skills", "test-skill");
+      await ensureDir(skillDir);
+      await writeFileContent(
+        join(skillDir, SKILL_FILE_NAME),
+        `---\nname: Test Skill\ndescription: Test skill description\ndisable-model-invocation: maybe\n---\n\nBody content.`,
+      );
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      try {
+        const skill = await OpenCodeSkill.fromDir({
+          outputRoot: testDir,
+          dirName: "test-skill",
+        });
+
+        expect(skill.getFrontmatter()).not.toHaveProperty("disable-model-invocation");
+        expect(skill.toRulesyncSkill().getFrontmatter()).not.toHaveProperty("opencode");
+        expect(warnSpy).toHaveBeenCalledWith(
+          expect.stringContaining('ignoring unreadable "disable-model-invocation" value "maybe"'),
+        );
+      } finally {
+        warnSpy.mockRestore();
+      }
     });
 
     it("should import the documented `compatibility: opencode` string form (issue #2066)", async () => {
@@ -491,6 +645,18 @@ Body content.`;
       const result = OpenCodeSkillFrontmatterSchema.safeParse(validFrontmatter);
       expect(result.success).toBe(true);
     });
+
+    it("should accept packaging metadata shapes a typed schema would reject", () => {
+      const result = OpenCodeSkillFrontmatterSchema.safeParse({
+        name: "Test Skill",
+        description: "Test description",
+        license: 2024,
+        compatibility: ["opencode", "claude-code"],
+        metadata: "platform-team",
+      });
+
+      expect(result.success).toBe(true);
+    });
   });
   describe("getConfiguredImportRoots", () => {
     it("returns the skills.paths entries opencode.json configures", async () => {
@@ -507,6 +673,17 @@ Body content.`;
       ]);
     });
 
+    it("returns the path entries of a flat V2 skills array", async () => {
+      await writeFileContent(
+        join(testDir, "opencode.json"),
+        JSON.stringify({ skills: ["docs/skills", "https://example.com/.well-known/skills/"] }),
+      );
+
+      await expect(
+        OpenCodeSkill.getConfiguredImportRoots({ outputRoot: testDir }),
+      ).resolves.toEqual([{ outputRoot: testDir, relativeDirPath: "docs/skills" }]);
+    });
+
     it("drops absolute paths and paths escaping the output root", async () => {
       await writeFileContent(
         join(testDir, "opencode.json"),
@@ -518,6 +695,59 @@ Body content.`;
       await expect(
         OpenCodeSkill.getConfiguredImportRoots({ outputRoot: testDir }),
       ).resolves.toEqual([{ outputRoot: testDir, relativeDirPath: "ok/skills" }]);
+    });
+
+    it.skipIf(process.platform === "win32")(
+      "drops a relative path that is a symbolic link pointing outside the config directory",
+      async () => {
+        // Spelled inside the project, so the lexical test passes; resolved, it
+        // is the tree above the project and must not be read. The link's target
+        // is the parent directory so that nothing is written outside `testDir`.
+        await symlink(dirname(testDir), join(testDir, "linked-skills"), "dir");
+        await writeFileContent(
+          join(testDir, "opencode.json"),
+          JSON.stringify({ skills: { paths: ["linked-skills", "ok/skills"] } }),
+        );
+
+        await expect(
+          OpenCodeSkill.getConfiguredImportRoots({ outputRoot: testDir }),
+        ).resolves.toEqual([{ outputRoot: testDir, relativeDirPath: "ok/skills" }]);
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "keeps a relative path that is a symbolic link staying inside the config directory",
+      async () => {
+        await ensureDir(join(testDir, "real-skills"));
+        await symlink(join(testDir, "real-skills"), join(testDir, "linked-skills"), "dir");
+        await writeFileContent(
+          join(testDir, "opencode.json"),
+          JSON.stringify({ skills: { paths: ["linked-skills"] } }),
+        );
+
+        await expect(
+          OpenCodeSkill.getConfiguredImportRoots({ outputRoot: testDir }),
+        ).resolves.toEqual([{ outputRoot: testDir, relativeDirPath: "linked-skills" }]);
+      },
+    );
+
+    it("keeps a relative path that does not exist under a config directory that resolves to its own spelling", async () => {
+      // Nothing to resolve, so the entry is compared as spelled against the
+      // resolved config directory. It is kept only when that directory is its
+      // own resolution, so the config directory is pinned to its real path here
+      // rather than to a checkout path that may run through a symbolic link
+      // (in which case the entry is dropped instead). Either outcome yields no
+      // skills: the scan finds no directory under it and moves on.
+      const realTestDir = await realpath(testDir);
+      vi.spyOn(process, "cwd").mockReturnValue(realTestDir);
+      await writeFileContent(
+        join(realTestDir, "opencode.json"),
+        JSON.stringify({ skills: { paths: ["missing/skills"] } }),
+      );
+
+      await expect(
+        OpenCodeSkill.getConfiguredImportRoots({ outputRoot: realTestDir }),
+      ).resolves.toEqual([{ outputRoot: realTestDir, relativeDirPath: "missing/skills" }]);
     });
 
     it("resolves a global root against the config dir, not the home directory", async () => {

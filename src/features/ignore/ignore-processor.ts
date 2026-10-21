@@ -14,20 +14,30 @@ import { isFileNotFoundError } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
 import { getRulesyncSourceCandidates } from "../../utils/rulesync-source-path.js";
 import { AiassistantIgnore } from "./aiassistant-ignore.js";
+import { AndroidstudioIgnore } from "./androidstudio-ignore.js";
 import { AntigravityCliIgnore } from "./antigravity-cli-ignore.js";
 import { AugmentcodeIgnore } from "./augmentcode-ignore.js";
+import { BobIgnore } from "./bob-ignore.js";
 import { ClaudecodeIgnore } from "./claudecode-ignore.js";
 import { ClineIgnore } from "./cline-ignore.js";
+import { CodebuffIgnore } from "./codebuff-ignore.js";
+import { ContinueIgnore } from "./continue-ignore.js";
+import { CrushIgnore } from "./crush-ignore.js";
 import { CursorIgnore } from "./cursor-ignore.js";
 import { DevinIgnore } from "./devin-ignore.js";
+import { FirebenderIgnore } from "./firebender-ignore.js";
+import { GrokcliIgnore } from "./grokcli-ignore.js";
 import { HermesagentIgnore } from "./hermesagent-ignore.js";
 import { JunieIgnore } from "./junie-ignore.js";
 import { KiloIgnore } from "./kilo-ignore.js";
 import { KiroIgnore } from "./kiro-ignore.js";
+import { LettacodeIgnore } from "./lettacode-ignore.js";
+import { QoderIgnore } from "./qoder-ignore.js";
 import { QwencodeIgnore } from "./qwencode-ignore.js";
 import { ReasonixIgnore } from "./reasonix-ignore.js";
 import { RooIgnore } from "./roo-ignore.js";
 import { RulesyncIgnore } from "./rulesync-ignore.js";
+import { TabnineIgnore } from "./tabnine-ignore.js";
 import {
   ToolIgnore,
   ToolIgnoreForDeletionParams,
@@ -36,6 +46,7 @@ import {
   ToolIgnoreSettablePaths,
   ToolIgnoreSettablePathsParams,
 } from "./tool-ignore.js";
+import { TraeIgnore } from "./trae-ignore.js";
 import { VibeIgnore } from "./vibe-ignore.js";
 import { WarpIgnore } from "./warp-ignore.js";
 import { ZedIgnore } from "./zed-ignore.js";
@@ -62,24 +73,42 @@ type ToolIgnoreFactory = {
 
 export const toolIgnoreFactories = new Map<IgnoreProcessorToolTarget, ToolIgnoreFactory>([
   ["aiassistant", { class: AiassistantIgnore }],
+  // Gemini in Android Studio reads `.aiexclude` (gitignore syntax); project only.
+  // https://developer.android.com/studio/gemini/aiexclude
+  ["androidstudio", { class: AndroidstudioIgnore }],
   ["antigravity-cli", { class: AntigravityCliIgnore }],
   ["augmentcode", { class: AugmentcodeIgnore }],
+  ["bob", { class: BobIgnore }],
   ["claudecode", { class: ClaudecodeIgnore }],
   ["claudecode-legacy", { class: ClaudecodeIgnore }],
   ["cline", { class: ClineIgnore }],
+  // Codebuff (Freebuff) reads `.codebuffignore` from the project only.
+  ["codebuff", { class: CodebuffIgnore }],
+  ["continue", { class: ContinueIgnore }],
+  ["crush", { class: CrushIgnore }],
   ["cursor", { class: CursorIgnore }],
+  // Firebender keeps its ignore list in the `ignore` key of `firebender.json`.
+  ["firebender", { class: FirebenderIgnore }],
+  // Grok CLI has no ignore file; the deny list goes into a sandbox profile.
+  ["grokcli", { class: GrokcliIgnore }],
   ["hermesagent", { class: HermesagentIgnore }],
   ["junie", { class: JunieIgnore }],
   ["kilo", { class: KiloIgnore }],
   ["kiro", { class: KiroIgnore }],
   ["kiro-cli", { class: KiroIgnore }],
   ["kiro-ide", { class: KiroIgnore }],
+  // Letta Code reads `.letta/.lettaignore` from the project only.
+  ["lettacode", { class: LettacodeIgnore }],
+  ["qoder", { class: QoderIgnore }],
   ["qwencode", { class: QwencodeIgnore }],
   ["reasonix", { class: ReasonixIgnore }],
   ["roo", { class: RooIgnore }],
   // Zoo Code keeps Roo's `.rooignore`; the class is shared (mirrors kiro-ide).
   ["zoocode", { class: RooIgnore }],
   ["devin", { class: DevinIgnore }],
+  ["tabnine", { class: TabnineIgnore }],
+  // Trae reads `.trae/.ignore` from the project only.
+  ["trae", { class: TraeIgnore }],
   ["vibe", { class: VibeIgnore }],
   ["warp", { class: WarpIgnore }],
   ["zed", { class: ZedIgnore }],
@@ -87,9 +116,18 @@ export const toolIgnoreFactories = new Map<IgnoreProcessorToolTarget, ToolIgnore
 
 const ignoreProcessorToolTargets: ToolTarget[] = [...toolIgnoreFactories.keys()];
 const ignoreProcessorGlobalToolTargets: ToolTarget[] = [
+  "continue",
   "devin",
+  // Firebender appends the personal `~/.firebender/firebender.json` `ignore`
+  // list to the project one. https://docs.firebender.com/api-reference/syntax
+  "firebender",
+  "grokcli",
+  // Kilo's global ignore file is the legacy `~/.kilocode/.kilocodeignore`.
+  "kilo",
   "kiro",
-  "kiro-cli",
+  // Not `kiro-cli`: Kiro's docs mark the global `~/.kiro/settings/kiroignore`
+  // as IDE-only, so the CLI never reads it.
+  // https://kiro.dev/docs/kiroignore/
   "kiro-ide",
   "reasonix",
   "zed",

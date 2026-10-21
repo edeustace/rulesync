@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import { uniq } from "es-toolkit";
 
@@ -8,13 +9,30 @@ import {
   DEVIN_GLOBAL_CONFIG_DIR_PATH,
 } from "../../constants/devin-paths.js";
 import type { AiFileParams, ValidationResult } from "../../types/ai-file.js";
-import type { PermissionAction, PermissionsConfig } from "../../types/permissions.js";
+import {
+  DEVIN_PLUGIN_GOVERNANCE_SCHEMAS,
+  type PermissionAction,
+  type PermissionsConfig,
+} from "../../types/permissions.js";
 import { formatError } from "../../utils/error.js";
-import { readFileContentOrNull } from "../../utils/file.js";
+import { readFileContentOrNull, toPosixPath } from "../../utils/file.js";
+import type { Logger } from "../../utils/logger.js";
 import { isPrototypePollutionKey } from "../../utils/prototype-pollution.js";
+import { quoteValueForWarning } from "../../utils/quote-value.js";
 import { isRecord } from "../../utils/type-guards.js";
 import { applySharedConfigPatch, sharedConfigFileKey } from "../shared/shared-config-gateway.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+import {
+  collectRestrictionLosingSandboxEntries,
+  collectTrustAffectingSandboxPaths,
+  isNonEmptyList,
+  replacedUnreadableReason,
+  type RestrictionLosingSandboxPath,
+  type TrustAffectingSandboxPath,
+  warnOnTrustAffectingEntries,
+} from "./sandbox-trust.js";
+import { honorAllToolsOnBash } from "./shell-command-categories.js";
+import { collapseRulesToSingleAction, hasPatternSpecificRules } from "./single-action-collapse.js";
 import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
@@ -31,10 +49,13 @@ import {
  * `Write(glob)`, `Exec(prefix)`, and `Fetch(pattern)` — plus MCP tool patterns
  * (`mcp__server__tool`). The canonical `edit` and `write` categories both map
  * onto Devin's single `Write` scope; on import `Write` maps back to `write`, so
- * `edit` rules round-trip as `write` (a lossy but documented collapse). Unknown
+ * `edit` rules round-trip as `write` (a lossy but documented collapse). The
+ * canonical `websearch` category maps onto the bare `web_search` tool name,
+ * accepted in the permission lists since CLI v3000.10.21 (2026-09-10). Unknown
  * names (e.g. `mcp__github__list_issues`) pass through verbatim.
  *
  * @see https://docs.devin.ai/cli/reference/permissions
+ * @see https://docs.devin.ai/cli/changelog/stable — v3000.10.21, `web_search`
  */
 const CANONICAL_TO_DEVIN_SCOPE: Record<string, string> = {
   read: "Read",
@@ -42,6 +63,7 @@ const CANONICAL_TO_DEVIN_SCOPE: Record<string, string> = {
   edit: "Write",
   bash: "Exec",
   webfetch: "Fetch",
+  websearch: "web_search",
 };
 
 /**
@@ -52,7 +74,15 @@ const DEVIN_SCOPE_TO_CANONICAL: Record<string, string> = {
   Write: "write",
   Exec: "bash",
   Fetch: "webfetch",
+  web_search: "websearch",
 };
+
+/**
+ * Devin scopes that exist only as a bare tool name: there is no
+ * `web_search(pattern)` matcher, so a pattern-specific rule under the canonical
+ * category cannot be expressed and is collapsed to one action instead.
+ */
+const DEVIN_BARE_ONLY_SCOPES: ReadonlySet<string> = new Set(["web_search"]);
 
 function toDevinScope(canonical: string): string {
   return CANONICAL_TO_DEVIN_SCOPE[canonical] ?? canonical;
@@ -97,6 +127,87 @@ function buildDevinPermissionEntry(scope: string, pattern: string): string {
   return `${scope}(${pattern})`;
 }
 
+function asDevinRecord(value: unknown): Record<string, unknown> {
+  return isRecord(value) ? { ...value } : {};
+}
+
+/**
+ * `sandbox` paths whose authored value loosens the sandbox on its own: they let
+ * a command out of it, or widen what a command left inside it may reach. They
+ * are written — the ordinary uses are far too common to refuse — but never
+ * silently, because a permissions file is shareable (`rulesync fetch` copies one
+ * into a project) and should not be able to open the sandbox without saying so.
+ * This is the same stance `CLAUDECODE_TRUST_AFFECTING_SANDBOX_PATHS` takes for
+ * the equivalent Claude Code keys, and `widens` follows the same convention of
+ * naming the restrictive value rather than the permissive ones, so a spelling
+ * Devin does not recognize is reported rather than waved through.
+ *
+ * The three keys that restrict — `allowed_domains` (an allowlist only while it
+ * has entries), `denied_domains` and `excluded.deny` — are not here: they loosen
+ * by losing entries, which `DEVIN_RESTRICTION_LOSING_SANDBOX_PATHS` covers.
+ *
+ * @see https://docs.devin.ai/cli/sandbox
+ */
+const DEVIN_TRUST_AFFECTING_SANDBOX_PATHS: readonly TrustAffectingSandboxPath[] = [
+  {
+    path: ["network_mode"],
+    reason:
+      "anything but 'limited' lets sandboxed requests use every HTTP method, not just GET/HEAD/OPTIONS",
+    widens: (value) => value !== "limited",
+  },
+  {
+    path: ["excluded", "allow"],
+    reason: "names commands that run outside the sandbox with no prompt and no sandbox policy",
+    widens: isNonEmptyList,
+  },
+  {
+    path: ["excluded", "ask"],
+    reason: "names commands that run outside the sandbox once confirmed, with no sandbox policy",
+    widens: isNonEmptyList,
+  },
+];
+
+/** How Devin is named in the warnings this file emits. */
+const DEVIN_TOOL_LABEL = "Devin";
+
+/**
+ * `sandbox` paths that restrict, and that therefore loosen the policy by losing
+ * entries rather than by holding a value. Devin's config is one file rather than
+ * a stack of settings scopes, and the override is shallow-merged over the
+ * existing `sandbox` at its top level: each of these lists is replaced whole,
+ * and `excluded.deny` vanishes as soon as the override states any other
+ * `excluded` key. Losing an entry has the same effect as adding one to the
+ * permissive keys above, so it is announced the same way. Claude Code needs no
+ * equivalent — it merges its lists across settings scopes, so a file can only
+ * ever add to them.
+ *
+ * `loosens` is asked only about a `before` that actually restricted something,
+ * and the two directions are not symmetric: `allowed_domains` restricts by
+ * listing what is reachable, so it loosens by gaining entries or by emptying
+ * out altogether, while the deny lists loosen by losing entries.
+ *
+ * @see https://docs.devin.ai/cli/sandbox
+ */
+const DEVIN_RESTRICTION_LOSING_SANDBOX_PATHS: readonly RestrictionLosingSandboxPath[] = [
+  {
+    path: ["allowed_domains"],
+    reason:
+      "adds to the proxy allowlist already in the file, or empties it so every domain becomes reachable again",
+    loosens: ({ before, after }) =>
+      after.length === 0 || after.some((entry) => !before.includes(entry)),
+  },
+  {
+    path: ["denied_domains"],
+    reason: "drops domains the deny list already in the file kept out of reach",
+    loosens: ({ before, after }) => before.some((entry) => !after.includes(entry)),
+  },
+  {
+    path: ["excluded", "deny"],
+    reason: "drops commands the list already in the file pinned inside the sandbox",
+    loosens: ({ before, after }) => before.some((entry) => !after.includes(entry)),
+  },
+];
+
 /**
  * Permissions generator for Devin Local (native `.devin/` configuration).
  *
@@ -112,10 +223,19 @@ function buildDevinPermissionEntry(scope: string, pattern: string): string {
  *
  * In global mode the config file is shared with the hooks (`hooks`) feature
  * (MCP moved to the dedicated mcp_config.json in v3000.3), so reads and writes
- * merge into the existing JSON and the file is never deleted; only the managed
- * `permissions` key is rewritten.
+ * merge into the existing JSON and the file is never deleted; only the keys
+ * this feature manages are rewritten — `permissions`, plus `sandbox` in global
+ * mode and the plugin governance lists (`requiredPlugins` / `optionalPlugins` /
+ * `forbiddenPlugins`) in project mode when the `devin` override authors them.
+ *
+ * The sibling `sandbox` block — which decides what a permitted command may
+ * reach rather than which commands are permitted — has no canonical category
+ * and is authored through the `devin` override in `.rulesync/permissions.jsonc`.
+ * Devin documents it as a user-config-only key, so it is written at global
+ * scope only.
  *
  * @see https://docs.devin.ai/cli/reference/permissions
+ * @see https://docs.devin.ai/cli/sandbox
  */
 export class DevinPermissions extends ToolPermissions {
   constructor(params: AiFileParams) {
@@ -127,7 +247,9 @@ export class DevinPermissions extends ToolPermissions {
 
   /**
    * config.json may carry the MCP/hooks features' keys, so it is never deleted;
-   * only the managed `permissions` key is rewritten.
+   * only the keys this feature manages are rewritten — `permissions`, plus
+   * `sandbox` (global) and the plugin governance lists (project) when the
+   * `devin` override authors them.
    */
   override isDeletable(): boolean {
     return false;
@@ -170,6 +292,7 @@ export class DevinPermissions extends ToolPermissions {
     rulesyncPermissions,
     global = false,
     validate = true,
+    logger,
   }: ToolPermissionsFromRulesyncPermissionsParams): Promise<DevinPermissions> {
     const paths = DevinPermissions.getSettablePaths({ global });
     const filePath = join(outputRoot, paths.relativeDirPath, paths.relativeFilePath);
@@ -187,7 +310,7 @@ export class DevinPermissions extends ToolPermissions {
     }
 
     const config = rulesyncPermissions.getJson();
-    const { allow, ask, deny } = convertRulesyncToDevinPermissions(config);
+    const { allow, ask, deny } = convertRulesyncToDevinPermissions({ config, logger });
 
     // rulesync owns the scopes present in the permissions config; preserve any
     // existing entries for scopes it does not manage.
@@ -212,6 +335,85 @@ export class DevinPermissions extends ToolPermissions {
     if (mergedDeny.length > 0) mergedPermissions.deny = mergedDeny;
     else delete mergedPermissions.deny;
 
+    const patch: Record<string, unknown> = { permissions: mergedPermissions };
+
+    // The `devin` override's `sandbox` block. Shallow-merged at its top level so
+    // the override's keys win while sibling keys the user set directly are kept.
+    // Devin lists `sandbox` as a User Config Only key, so a project config that
+    // stated it would simply be ignored — drop it with a warning instead.
+    const authoredSandbox = config.devin?.sandbox;
+    if (authoredSandbox !== undefined) {
+      const authoredSandboxRecord = asDevinRecord(authoredSandbox);
+      if (global) {
+        const existingSandbox = asDevinRecord(settings.sandbox);
+        const mergedSandbox = {
+          ...existingSandbox,
+          ...authoredSandboxRecord,
+        };
+        // Materializing `"sandbox": {}` would put a meaningless key — and a
+        // diff — into a file that never had one.
+        const writesSandbox = Object.keys(mergedSandbox).length > 0;
+        if (writesSandbox) {
+          patch.sandbox = mergedSandbox;
+        }
+
+        // `asDevinRecord` flattens a `sandbox` the file holds in some other
+        // shape to `{}`, so the per-path comparison below sees nothing to lose.
+        // Whatever it meant to Devin, the write replaces it wholesale.
+        const replacesUnreadableSandbox =
+          writesSandbox && settings.sandbox !== undefined && !isRecord(settings.sandbox);
+
+        warnOnTrustAffectingEntries({
+          toolLabel: DEVIN_TOOL_LABEL,
+          // Not every entry is an addition — a lost restriction is a change to
+          // the file, not a setting written into it — so "change" covers both.
+          noun: "sandbox change",
+          entries: [
+            ...(replacesUnreadableSandbox
+              ? [
+                  {
+                    label: "sandbox",
+                    reason: replacedUnreadableReason({
+                      shape: "object",
+                      toolLabel: DEVIN_TOOL_LABEL,
+                    }),
+                  },
+                ]
+              : []),
+            // The authored block rather than the merged one: a loosening value
+            // the file already held is the user's own, and re-announcing it on
+            // every generate would bury the values rulesync actually wrote.
+            ...collectTrustAffectingSandboxPaths({
+              sandbox: authoredSandboxRecord,
+              paths: DEVIN_TRUST_AFFECTING_SANDBOX_PATHS,
+            }),
+            ...collectRestrictionLosingSandboxEntries({
+              existing: existingSandbox,
+              merged: mergedSandbox,
+              paths: DEVIN_RESTRICTION_LOSING_SANDBOX_PATHS,
+              toolLabel: DEVIN_TOOL_LABEL,
+            }),
+          ],
+          relativeFilePath: toPosixPath(join(paths.relativeDirPath, paths.relativeFilePath)),
+          logger,
+        });
+      } else if (Object.keys(authoredSandboxRecord).length > 0) {
+        // An empty override drops nothing, so announcing a loss would be a lie.
+        logger?.warn(
+          "Devin reads 'sandbox' from the user config only, so the 'devin.sandbox' override was " +
+            "dropped from the project config. Generate with --global to author it.",
+        );
+      }
+    }
+
+    applyPluginGovernanceOverride({
+      override: config.devin,
+      settings,
+      patch,
+      global,
+      logger,
+    });
+
     return new DevinPermissions({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
@@ -220,14 +422,14 @@ export class DevinPermissions extends ToolPermissions {
         fileKey: sharedConfigFileKey(paths),
         feature: "permissions",
         existingContent,
-        patch: { permissions: mergedPermissions },
+        patch,
         filePath,
       }),
       validate,
     });
   }
 
-  toRulesyncPermissions(): RulesyncPermissions {
+  toRulesyncPermissions({ logger }: { logger?: Logger } = {}): RulesyncPermissions {
     let settings: Record<string, unknown>;
     try {
       const parsed: unknown = JSON.parse(this.getFileContent());
@@ -248,8 +450,43 @@ export class DevinPermissions extends ToolPermissions {
       deny: Array.isArray(permissions.deny) ? permissions.deny : [],
     });
 
+    // Route the `sandbox` block into the `devin` override — it has no canonical
+    // category. The whole block round-trips, so a key the override did not
+    // author is pulled in on the next import rather than being lost.
+    //
+    // Deliberately not scope-filtered, unlike the generate side. Importing a
+    // project `.devin/config.json` that carries a `sandbox` Devin itself would
+    // ignore still surfaces it in `.rulesync/permissions.jsonc` where it is
+    // reviewable, and the next project generate drops it again with the warning
+    // above; silently discarding it here would instead hide a stray block from
+    // the person doing the import. claudecode and kilo import their global-only
+    // keys the same way.
+    const sandbox = asDevinRecord(settings.sandbox);
+    const devinOverride: Record<string, unknown> = {};
+    if (Object.keys(sandbox).length > 0) {
+      devinOverride.sandbox = sandbox;
+    }
+    // The repo-level plugin governance lists round-trip verbatim, like `sandbox`.
+    // A list the override schema would reject is dropped with a warning, so it
+    // cannot make the next generate fail on the imported source.
+    for (const key of DEVIN_PLUGIN_GOVERNANCE_KEYS) {
+      const value = settings[key];
+      if (value === undefined) continue;
+      if (DEVIN_PLUGIN_GOVERNANCE_SCHEMAS[key].safeParse(value).success) {
+        devinOverride[key] = value;
+      } else {
+        logger?.warn(
+          `Skipped Devin \`${key}\` on import: ${key === "forbiddenPlugins" ? "expected an array of strings" : "expected an array of plugin sources (strings or objects)"}.`,
+        );
+      }
+    }
+    const result: Record<string, unknown> = { ...config };
+    if (Object.keys(devinOverride).length > 0) {
+      result.devin = devinOverride;
+    }
+
     return this.toRulesyncPermissionsDefault({
-      fileContent: JSON.stringify(config, null, 2),
+      fileContent: JSON.stringify(result, null, 2),
     });
   }
 
@@ -275,9 +512,118 @@ export class DevinPermissions extends ToolPermissions {
 }
 
 /**
+ * The repo-level plugin governance lists of a checkout's `.devin/config.json`.
+ *
+ * @see https://docs.devin.ai/cli/extensibility/plugins/overview
+ */
+const DEVIN_PLUGIN_GOVERNANCE_KEYS = [
+  "requiredPlugins",
+  "optionalPlugins",
+  "forbiddenPlugins",
+] as const;
+
+/**
+ * Patch the plugin governance lists the `devin` override authors into the
+ * project `.devin/config.json`. Each authored list replaces the file's list
+ * whole; a list it does not author is left as the file holds it. Devin reads these
+ * lists only from a checkout's `.devin/config.json`, so in global mode they are
+ * dropped with a warning. Losing a `forbiddenPlugins` entry the file held is
+ * announced, since that lifts a restriction. A non-empty `requiredPlugins` that changes the file
+ * is announced, since Devin installs required plugins automatically and a
+ * plugin can ship its own hooks and MCP servers.
+ */
+function applyPluginGovernanceOverride({
+  override,
+  settings,
+  patch,
+  global,
+  logger,
+}: {
+  override: Record<string, unknown> | undefined;
+  settings: Record<string, unknown>;
+  patch: Record<string, unknown>;
+  global: boolean;
+  logger?: Logger;
+}): void {
+  const authoredKeys = DEVIN_PLUGIN_GOVERNANCE_KEYS.filter((key) => override?.[key] !== undefined);
+  if (authoredKeys.length === 0) return;
+  if (global) {
+    logger?.warn(
+      `Devin reads the plugin governance lists (${authoredKeys.join(", ")}) from a checkout's ` +
+        "'.devin/config.json' only, so they were dropped from the user config. Generate without " +
+        "--global to author them.",
+    );
+    return;
+  }
+  for (const key of authoredKeys) {
+    patch[key] = override?.[key];
+  }
+  // `forbiddenPlugins` is a restriction: an authored list replaces the file's
+  // list whole, so an entry only the file held stops being forbidden.
+  const forbidden = override?.forbiddenPlugins;
+  if (Array.isArray(forbidden) && Array.isArray(settings.forbiddenPlugins)) {
+    const lost = settings.forbiddenPlugins.filter((entry) => !forbidden.includes(entry));
+    if (lost.length > 0) {
+      logger?.warn(
+        `Replacing Devin \`forbiddenPlugins\` drops ${lost.map(quoteValueForWarning).join(", ")} ` +
+          "from '.devin/config.json': those plugins are no longer forbidden at the repo level.",
+      );
+    }
+  }
+  const required = override?.requiredPlugins;
+  if (
+    Array.isArray(required) &&
+    required.length > 0 &&
+    !isDeepStrictEqual(required, settings.requiredPlugins)
+  ) {
+    logger?.warn(
+      `Writing Devin \`requiredPlugins\` (${required.map(quoteValueForWarning).join(", ")}): Devin installs required plugins ` +
+        "automatically, and a plugin can ship its own hooks and MCP servers.",
+    );
+  }
+}
+
+/**
+ * Collapse the pattern rules of a bare-only scope to the single action Devin
+ * can hold for it, using deny > ask > allow precedence. A map without a
+ * catch-all grants nothing to unmatched inputs, so an implicit `ask` joins the
+ * candidates and a narrow allowlist can never widen into a blanket allow.
+ * Returns `undefined` for an empty map: like any other empty category it
+ * emits nothing, which leaves Devin's own auto-approve default in place.
+ */
+function collapseBareOnlyScopeRules({
+  category,
+  scope,
+  rules,
+  logger,
+}: {
+  category: string;
+  scope: string;
+  rules: Record<string, PermissionAction>;
+  logger?: Logger;
+}): PermissionAction | undefined {
+  const action = collapseRulesToSingleAction({ rules });
+  if (action === undefined) {
+    return undefined;
+  }
+  if (hasPatternSpecificRules(rules)) {
+    logger?.warn(
+      `Devin accepts "${scope}" only as a bare tool name, with no pattern matcher. Collapsed the "${category}" pattern rules to "${action}" using deny > ask > allow precedence.`,
+    );
+  }
+  return action;
+}
+
+/**
  * Convert rulesync permissions config to Devin allow/ask/deny arrays.
  */
-function convertRulesyncToDevinPermissions(config: PermissionsConfig): {
+function convertRulesyncToDevinPermissions({
+  config,
+  logger,
+}: {
+  config: PermissionsConfig;
+  logger?: Logger;
+}): {
   allow: string[];
   ask: string[];
   deny: string[];
@@ -286,21 +632,31 @@ function convertRulesyncToDevinPermissions(config: PermissionsConfig): {
   const ask: string[] = [];
   const deny: string[] = [];
 
-  for (const [category, rules] of Object.entries(config.permission)) {
+  const push = (entry: string, action: PermissionAction): void => {
+    switch (action) {
+      case "allow":
+        allow.push(entry);
+        break;
+      case "ask":
+        ask.push(entry);
+        break;
+      case "deny":
+        deny.push(entry);
+        break;
+    }
+  };
+
+  for (const [category, rules] of Object.entries(honorAllToolsOnBash(config.permission))) {
     const scope = toDevinScope(category);
-    for (const [pattern, action] of Object.entries(rules)) {
-      const entry = buildDevinPermissionEntry(scope, pattern);
-      switch (action) {
-        case "allow":
-          allow.push(entry);
-          break;
-        case "ask":
-          ask.push(entry);
-          break;
-        case "deny":
-          deny.push(entry);
-          break;
+    if (DEVIN_BARE_ONLY_SCOPES.has(scope)) {
+      const action = collapseBareOnlyScopeRules({ category, scope, rules, logger });
+      if (action !== undefined) {
+        push(scope, action);
       }
+      continue;
+    }
+    for (const [pattern, action] of Object.entries(rules)) {
+      push(buildDevinPermissionEntry(scope, pattern), action);
     }
   }
 

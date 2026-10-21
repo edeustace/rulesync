@@ -1,4 +1,4 @@
-import { realpath, symlink } from "node:fs/promises";
+import { chmod, realpath, stat, symlink } from "node:fs/promises";
 import { join, relative, resolve } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -10,6 +10,7 @@ import {
 import { setupTestDirectory } from "../test-utils/test-directories.js";
 import {
   addTrailingNewline,
+  applyFileMode,
   assertDirectoryIfExists,
   assertTreeContainsNoSymlinks,
   assertWritablePathInsideRoot,
@@ -18,27 +19,36 @@ import {
   directoryExists,
   directoryExistsStrict,
   ensureDir,
-  filterOutPathsInGitIgnoredDirectories,
   fileExists,
   fileExistsStrict,
+  filterOutPathsInGitIgnoredDirectories,
   findFiles,
   findFilesByGlobs,
   findRuleFiles,
+  getFileSizeAndExecutableBit,
   getHomeDirectory,
   isFileNotFoundError,
   isFileSystemError,
   isPresentButUnresolvable,
-  listDirectoryFiles,
+  listDirectoryEntryNames,
   listFileNames,
+  listFilePathsRecursively,
   listSubdirectoryNames,
+  posixRelativePathEscapesRoot,
   readFileBufferOrNull,
   readFileContent,
   readJsonFile,
+  relativeWriteLanding,
   removeDirectory,
   removeFile,
   removeTempDirectory,
-  runWithDirectoryRollback,
+  resolvedPathEscapesRoot,
+  writablePathEscapesRoot,
+  resolvedRelativePath,
   resolvePath,
+  restoreMissingExecutableBit,
+  runWithDirectoryRollback,
+  sharedTrailingSegments,
   toKebabCaseFilename,
   toPosixPath,
   validateOutputRoot,
@@ -57,6 +67,76 @@ describe("file utilities", () => {
 
   afterEach(async () => {
     await cleanup();
+  });
+
+  describe("applyFileMode and restoreMissingExecutableBit", () => {
+    const skipOnWindows = it.skipIf(process.platform === "win32");
+
+    skipOnWindows(
+      "should apply a mode to a file and repair a stripped executable bit",
+      async () => {
+        const scriptPath = join(testDir, "run.sh");
+        await writeFileContent(scriptPath, "#!/bin/sh\n");
+        await chmod(scriptPath, 0o644);
+
+        await applyFileMode(scriptPath, 0o755);
+        expect((await stat(scriptPath)).mode & 0o777).toBe(0o755);
+
+        await chmod(scriptPath, 0o644);
+        await restoreMissingExecutableBit(scriptPath, 0o755);
+        expect((await stat(scriptPath)).mode & 0o777).toBe(0o755);
+      },
+    );
+
+    skipOnWindows("should report whether a file carries an execute bit", async () => {
+      const scriptPath = join(testDir, "run.sh");
+      await writeFileContent(scriptPath, "#!/bin/sh\n");
+      await chmod(scriptPath, 0o644);
+      expect(await getFileSizeAndExecutableBit(scriptPath)).toEqual({
+        size: 10,
+        executable: false,
+      });
+
+      await chmod(scriptPath, 0o755);
+      expect(await getFileSizeAndExecutableBit(scriptPath)).toEqual({
+        size: 10,
+        executable: true,
+      });
+    });
+
+    skipOnWindows("should leave a stricter executable mode alone", async () => {
+      const scriptPath = join(testDir, "run.sh");
+      await writeFileContent(scriptPath, "#!/bin/sh\n");
+      await chmod(scriptPath, 0o700);
+
+      await restoreMissingExecutableBit(scriptPath, 0o755);
+      expect((await stat(scriptPath)).mode & 0o777).toBe(0o700);
+    });
+
+    skipOnWindows("should never change the target of a symbolic link", async () => {
+      // A chmod that followed the link would land on a file Rulesync did not
+      // write, possibly outside the output tree.
+      const targetPath = join(testDir, "target.sh");
+      const linkPath = join(testDir, "link.sh");
+      await writeFileContent(targetPath, "#!/bin/sh\n");
+      await chmod(targetPath, 0o644);
+      await symlink(targetPath, linkPath);
+
+      await applyFileMode(linkPath, 0o755);
+      await restoreMissingExecutableBit(linkPath, 0o755);
+
+      expect((await stat(targetPath)).mode & 0o777).toBe(0o644);
+    });
+
+    skipOnWindows(
+      "should throw on a missing file only when applying, not when restoring",
+      async () => {
+        const missingPath = join(testDir, "missing.sh");
+
+        await expect(applyFileMode(missingPath, 0o755)).rejects.toThrow();
+        await expect(restoreMissingExecutableBit(missingPath, 0o755)).resolves.toBeUndefined();
+      },
+    );
   });
 
   describe("ensureDir", () => {
@@ -189,6 +269,26 @@ describe("file utilities", () => {
       ["root-like path", "\\packages\\shared", "/packages/shared"],
     ])("should convert %s", (_label, input, expected) => {
       expect(toPosixPath(input)).toBe(expected);
+    });
+  });
+
+  describe("sharedTrailingSegments", () => {
+    it("should count the segments a Windows-style path shares with its posix identity", () => {
+      // The identity `realpath` returns is rewritten to posix separators; the
+      // candidate is spelled the way the platform reported it. Splitting both
+      // on either separator is what lets the two compare on Windows without a
+      // rewrite of the candidate first. This pins that both sides are split on
+      // both separators: it fails if `splitPathSegments` narrows to one.
+      expect(sharedTrailingSegments("C:\\proj\\zzz\\x.md", "C:/proj/zzz/x.md")).toBe(4);
+      expect(sharedTrailingSegments("C:\\proj\\aaa\\x.md", "C:/proj/zzz/x.md")).toBe(1);
+    });
+
+    it("should split a backslash inside a name the same way on both sides", () => {
+      // On a posix platform a backslash is an ordinary character, and neither
+      // side is rewritten: the count stays symmetric because both are split on
+      // it alike, so a path that walked through no link still shares everything.
+      expect(sharedTrailingSegments("/proj/a\\b/x.md", "/proj/a\\b/x.md")).toBe(5);
+      expect(sharedTrailingSegments("/proj/aaa/x.md", "/proj/a\\b/x.md")).toBe(1);
     });
   });
 
@@ -434,6 +534,33 @@ describe("file utilities", () => {
         ).toEqual([filePath]);
       });
 
+      it("should skip testing only the owned directory's last segment", async () => {
+        // `rulesync gitignore` writes `**/.trae/rules/` for Trae's output, whose
+        // per-subdirectory copies are what the Trae nested scan discovers.
+        await writeFileContent(
+          join(testDir, ".gitignore"),
+          "**/.trae/rules/\nvendored/\nignored/.trae/\n",
+        );
+        const kept = join(testDir, "packages", "api", ".trae", "rules", "sub", "api.md");
+        const dropped = join(testDir, "vendored", "dep", ".trae", "rules", "dep.md");
+        // The user's own rule on `<dir>/.trae/` still applies.
+        const droppedTrae = join(testDir, "ignored", ".trae", "rules", "x.md");
+        await writeFileContent(kept, "keep");
+        await writeFileContent(dropped, "drop");
+        await writeFileContent(droppedTrae, "drop");
+
+        expect(
+          filterOutPathsInGitIgnoredDirectories({
+            rootDir: testDir,
+            filePaths: [kept, dropped, droppedTrae],
+            ownedDirPath: join(".trae", "rules"),
+          }),
+        ).toEqual([kept]);
+        expect(
+          filterOutPathsInGitIgnoredDirectories({ rootDir: testDir, filePaths: [kept, dropped] }),
+        ).toEqual([]);
+      });
+
       it("should not recurse forever for a path outside the root", () => {
         // `dirname("/")` is `"/"`, so walking ancestors would not terminate.
         expect(
@@ -498,7 +625,7 @@ describe("file utilities", () => {
   });
 
   describe("directory listing", () => {
-    describe("listDirectoryFiles", () => {
+    describe("listDirectoryEntryNames", () => {
       beforeEach(async () => {
         await writeFileContent(join(testDir, "file1.txt"), "content1");
         await writeFileContent(join(testDir, "file2.md"), "content2");
@@ -506,7 +633,7 @@ describe("file utilities", () => {
       });
 
       it("should list files and directories", async () => {
-        const files = await listDirectoryFiles(testDir);
+        const files = await listDirectoryEntryNames(testDir);
 
         expect(files).toContain("file1.txt");
         expect(files).toContain("file2.md");
@@ -515,7 +642,7 @@ describe("file utilities", () => {
       });
 
       it("should return empty array for non-existent directory", async () => {
-        const files = await listDirectoryFiles(join(testDir, "nonexistent"));
+        const files = await listDirectoryEntryNames(join(testDir, "nonexistent"));
         expect(files).toEqual([]);
       });
     });
@@ -600,6 +727,70 @@ describe("file utilities", () => {
         expect(await listFileNames(root, { followSymbolicLinks: false })).toEqual(["real.md"]);
       });
 
+      it.skipIf(process.platform === "win32")(
+        "should report every name a file is reachable under by default",
+        async () => {
+          const root = join(testDir, "root");
+          await writeFileContent(join(root, "shared", "base.md"), "content");
+          await symlink(join(root, "shared", "base.md"), join(root, "alias.md"));
+
+          expect(await listFilePathsRecursively(root)).toEqual([
+            "alias.md",
+            join("shared", "base.md"),
+          ]);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should keep one name per file when asked to deduplicate by identity",
+        async () => {
+          // The same choice the glob makes: the name that walked through no link
+          // represents the file, so both agree on the name it has.
+          const root = join(testDir, "root");
+          await writeFileContent(join(root, "shared", "base.md"), "content");
+          await symlink(join(root, "shared", "base.md"), join(root, "alias.md"));
+
+          expect(await listFilePathsRecursively(root, { deduplicateByFileIdentity: true })).toEqual(
+            [join("shared", "base.md")],
+          );
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should keep the same name the glob keeps when the alias is the nested one",
+        async () => {
+          // The mirror of the case above: the real file is at the top of the walk
+          // and the alias is nested. The name has to be the real one either way,
+          // or the set of names disagrees with the set the loader's glob builds.
+          const root = join(testDir, "root");
+          await writeFileContent(join(root, "coding.md"), "content");
+          await ensureDir(join(root, "aaa"));
+          await symlink(join(root, "coding.md"), join(root, "aaa", "coding.md"));
+
+          expect(await listFilePathsRecursively(root, { deduplicateByFileIdentity: true })).toEqual(
+            ["coding.md"],
+          );
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should keep a directory whose name holds a backslash apart from the path it reads like",
+        async () => {
+          // A backslash is an ordinary character in a posix name, so `a\\b` and
+          // `a/b` are two different directories. Rewriting the separator while
+          // taking a file's identity folds them together, and whichever of the
+          // two the walk reaches second is then dropped as a repeat of the first.
+          const root = join(testDir, "root");
+          await writeFileContent(join(root, "a", "b", "real.md"), "real");
+          await writeFileContent(join(root, "a\\b", "literal.md"), "literal");
+
+          expect(await listFilePathsRecursively(root)).toEqual(["a/b/real.md", "a\\b/literal.md"]);
+          expect(await listFilePathsRecursively(root, { deduplicateByFileIdentity: true })).toEqual(
+            ["a/b/real.md", "a\\b/literal.md"],
+          );
+        },
+      );
+
       it("should leave hidden entries out unless asked for them", async () => {
         // The glob these replaced ran with `dot: false`. Callers sweep what they
         // are given, so a `.git` beside the entries must not appear by default.
@@ -680,6 +871,537 @@ describe("file utilities", () => {
 
       it("should reject a directory it cannot read", async () => {
         await expect(listSubdirectoryNames(join(testDir, "missing"))).rejects.toThrow();
+      });
+    });
+
+    describe("listFilePathsRecursively", () => {
+      it("should return every file below the root, relative to it and sorted", async () => {
+        const root = join(testDir, "root");
+        await writeFileContent(join(root, "top.md"), "content");
+        await writeFileContent(join(root, "nested", "deep.md"), "content");
+        await writeFileContent(join(root, "nested", "deeper", "deepest.md"), "content");
+
+        expect(await listFilePathsRecursively(root)).toEqual([
+          join("nested", "deep.md"),
+          join("nested", "deeper", "deepest.md"),
+          "top.md",
+        ]);
+      });
+
+      it.skipIf(process.platform === "win32")(
+        "should spell a name the way the filesystem does",
+        async () => {
+          // The reason this exists rather than a `**` glob: globby reads the
+          // backslash as a separator and reports the file at `back/slash.md`,
+          // a path that belongs to no file.
+          const root = join(testDir, "root");
+          await writeFileContent(join(root, "back\\slash.md"), "content");
+
+          expect(await listFilePathsRecursively(root)).toEqual(["back\\slash.md"]);
+        },
+      );
+
+      it("should leave hidden entries out unless asked for them", async () => {
+        const root = join(testDir, "root");
+        await writeFileContent(join(root, "plain.md"), "content");
+        await writeFileContent(join(root, ".hidden.md"), "content");
+        await writeFileContent(join(root, ".curated", "fetched.md"), "content");
+
+        expect(await listFilePathsRecursively(root)).toEqual(["plain.md"]);
+        expect(await listFilePathsRecursively(root, { includeHidden: true })).toEqual([
+          join(".curated", "fetched.md"),
+          ".hidden.md",
+          "plain.md",
+        ]);
+      });
+
+      it("should narrow the files without narrowing the walk", async () => {
+        const root = join(testDir, "root");
+        await writeFileContent(join(root, "notes.txt"), "content");
+        await writeFileContent(join(root, "sub", "rule.md"), "content");
+
+        expect(
+          await listFilePathsRecursively(root, {
+            nameFilter: (name) => name.endsWith(".md"),
+          }),
+        ).toEqual([join("sub", "rule.md")]);
+      });
+
+      it("should read a root that is not there as an empty one", async () => {
+        expect(await listFilePathsRecursively(join(testDir, "missing"))).toEqual([]);
+      });
+
+      it.skipIf(process.platform === "win32")(
+        "should stop at a link that points back at an ancestor",
+        async () => {
+          const root = join(testDir, "root");
+          await writeFileContent(join(root, "sub", "note.md"), "content");
+          await symlink(root, join(root, "sub", "loop"));
+
+          expect(await listFilePathsRecursively(root)).toEqual([join("sub", "note.md")]);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should report a directory two names reach under the one nearest the root",
+        async () => {
+          // The walk goes level by level, so the directory's own name is
+          // reached before the link aliasing it from further down, and the file
+          // keeps the path it really has rather than one through the link.
+          const root = join(testDir, "root");
+          await writeFileContent(join(root, "target", "y.md"), "content");
+          await ensureDir(join(root, "a"));
+          await symlink(join(root, "target"), join(root, "a", "link"));
+
+          expect(await listFilePathsRecursively(root)).toEqual([join("target", "y.md")]);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should report a directory under a link that reaches it before its own name does",
+        async () => {
+          // The other side of walking level by level, and the difference from
+          // `findFilesByGlobs`, which resolves its results and keeps the real
+          // path: a link one level up is reached first and stands in for the
+          // directory it points at, which is two levels down.
+          const root = join(testDir, "root");
+          await writeFileContent(join(root, "a", "target", "y.md"), "content");
+          await symlink(join(root, "a", "target"), join(root, "link"));
+
+          expect(await listFilePathsRecursively(root)).toEqual([join("link", "y.md")]);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should walk a mesh of aliasing links once per directory",
+        async () => {
+          // Two names for every level, each linking on to the next: a walk that
+          // took each route separately would visit 2^N paths to reach N real
+          // directories, so an ordinary shared rules directory linked in from a
+          // few places would be enough to hang `fetch`.
+          const root = join(testDir, "root");
+          const levelCount = 12;
+          for (let level = 0; level < levelCount; level++) {
+            for (const name of ["p", "q"]) {
+              const levelDir = join(root, `l${level}`, name);
+              await ensureDir(levelDir);
+              await symlink(join(root, `l${level + 1}`), join(levelDir, "next"));
+            }
+          }
+          await writeFileContent(join(root, `l${levelCount}`, "leaf.md"), "content");
+
+          expect(await listFilePathsRecursively(root)).toEqual([join(`l${levelCount}`, "leaf.md")]);
+        },
+      );
+    });
+
+    describe("resolvedPathEscapesRoot", () => {
+      it("should not report a directory that really sits under the root", async () => {
+        const root = join(testDir, "root");
+        const target = join(root, "nested", "deep");
+        await ensureDir(target);
+
+        expect(await resolvedPathEscapesRoot({ rootPath: root, targetPath: target })).toBe(false);
+      });
+
+      it("should report a path spelled outside the root", async () => {
+        const root = join(testDir, "root");
+        const target = join(testDir, "outside");
+        await ensureDir(root);
+        await ensureDir(target);
+
+        expect(await resolvedPathEscapesRoot({ rootPath: root, targetPath: target })).toBe(true);
+      });
+
+      it.skipIf(process.platform === "win32")(
+        "should report a name under the root that links out of it",
+        async () => {
+          // The name is spelled inside the root, so reading the path alone says
+          // it is contained; only resolving the link shows where it leads.
+          const root = join(testDir, "root");
+          const outside = join(testDir, "outside");
+          await ensureDir(root);
+          await ensureDir(outside);
+          const target = join(root, "link");
+          await symlink(outside, target);
+
+          expect(await resolvedPathEscapesRoot({ rootPath: root, targetPath: target })).toBe(true);
+        },
+      );
+
+      it("should report a target that cannot be resolved rather than pass it", async () => {
+        const root = join(testDir, "root");
+        await ensureDir(root);
+
+        expect(
+          await resolvedPathEscapesRoot({ rootPath: root, targetPath: join(testDir, "missing") }),
+        ).toBe(true);
+      });
+    });
+
+    describe("writablePathEscapesRoot", () => {
+      it("should pass a target below directories that do not exist yet", async () => {
+        const root = join(testDir, "root");
+        await ensureDir(root);
+
+        expect(
+          await writablePathEscapesRoot({
+            rootPath: root,
+            targetPath: join(root, "new", "deeper", "file.md"),
+          }),
+        ).toBe(false);
+      });
+
+      it("should pass a target whose root does not exist yet", async () => {
+        const root = join(testDir, "root");
+
+        expect(
+          await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "file.md") }),
+        ).toBe(false);
+      });
+
+      it.skipIf(process.platform === "win32")(
+        "should report a target below a directory that links out of the root",
+        async () => {
+          const root = join(testDir, "root");
+          const outside = join(testDir, "outside");
+          await ensureDir(root);
+          await ensureDir(outside);
+          await symlink(outside, join(root, "link"));
+
+          expect(
+            await writablePathEscapesRoot({
+              rootPath: root,
+              targetPath: join(root, "link", "rules", "file.md"),
+            }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should report a target that is itself a link out of the root",
+        async () => {
+          const root = join(testDir, "root");
+          await ensureDir(root);
+          const outsideFile = join(testDir, "outside.md");
+          await writeFileContent(outsideFile, "theirs");
+          await symlink(outsideFile, join(root, "file.md"));
+
+          expect(
+            await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "file.md") }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should pass a target below a directory that links elsewhere inside the root",
+        async () => {
+          // A dotfiles checkout linked from inside the home directory: the link
+          // stays inside the root, so writing through it stays inside too.
+          const root = join(testDir, "root");
+          const real = join(root, "dotfiles", "tool");
+          await ensureDir(real);
+          await symlink(real, join(root, "tool"));
+
+          expect(
+            await writablePathEscapesRoot({
+              rootPath: root,
+              targetPath: join(root, "tool", "file.md"),
+            }),
+          ).toBe(false);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should report a dangling link whose target would be created outside the root",
+        async () => {
+          // `realpath` cannot resolve the link, so the target it would create
+          // has to be judged from the link's spelled target instead.
+          const root = join(testDir, "root");
+          await ensureDir(root);
+          await symlink(join(testDir, "not-yet.md"), join(root, "file.md"));
+
+          expect(
+            await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "file.md") }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should report a target below a dangling directory link out of the root",
+        async () => {
+          const root = join(testDir, "root");
+          await ensureDir(root);
+          await symlink(join(testDir, "not-yet"), join(root, "link"));
+
+          expect(
+            await writablePathEscapesRoot({
+              rootPath: root,
+              targetPath: join(root, "link", "file.md"),
+            }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should follow a dangling link's relative target from the link's own directory",
+        async () => {
+          const root = join(testDir, "root");
+          await ensureDir(join(root, "nested"));
+          await symlink(join("..", "..", "not-yet.md"), join(root, "nested", "file.md"));
+
+          expect(
+            await writablePathEscapesRoot({
+              rootPath: root,
+              targetPath: join(root, "nested", "file.md"),
+            }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should pass a dangling link whose target would be created inside the root",
+        async () => {
+          // The dotfiles shape again, before the first write creates the file.
+          const root = join(testDir, "root");
+          await ensureDir(join(root, "dotfiles"));
+          await symlink(join(root, "dotfiles", "file.md"), join(root, "file.md"));
+
+          expect(
+            await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "file.md") }),
+          ).toBe(false);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should report a link cycle rather than loop forever",
+        async () => {
+          const root = join(testDir, "root");
+          await ensureDir(root);
+          await symlink(join(root, "b.md"), join(root, "a.md"));
+          await symlink(join(root, "a.md"), join(root, "b.md"));
+
+          expect(
+            await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "a.md") }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should resolve a dangling link's target segment by segment rather than lexically",
+        async () => {
+          // `sub` leads out of the root, so the `..` in the link's target climbs
+          // out of the outside directory, not out of the root where `sub` is
+          // spelled. Folding `sub/..` away lexically would pass the write.
+          const root = join(testDir, "root");
+          const outside = join(testDir, "outside");
+          await ensureDir(root);
+          await ensureDir(join(outside, "victim"));
+          await symlink(outside, join(root, "sub"));
+          // Spelled by hand: `join` would fold the `..` away before the link is made.
+          await symlink("sub/../victim/file.md", join(root, "file.md"));
+
+          expect(
+            await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "file.md") }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should resolve a dangling link's absolute target segment by segment rather than lexically",
+        async () => {
+          const root = join(testDir, "root");
+          const outside = join(testDir, "outside");
+          await ensureDir(root);
+          await ensureDir(join(outside, "victim"));
+          await symlink(outside, join(root, "sub"));
+          // Spelled by hand: `join` would fold the `..` away before the link is made.
+          await symlink(`${root}/sub/../victim/file.md`, join(root, "file.md"));
+
+          expect(
+            await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "file.md") }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should pass a dangling link whose target climbs back into the root through a link",
+        async () => {
+          const root = join(testDir, "root");
+          await ensureDir(join(root, "dotfiles", "tool"));
+          await symlink(join(root, "dotfiles", "tool"), join(root, "tool"));
+          await symlink("tool/../file.md", join(root, "file.md"));
+
+          expect(
+            await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "file.md") }),
+          ).toBe(false);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should follow a dangling link whose target goes through another dangling link",
+        async () => {
+          const root = join(testDir, "root");
+          await ensureDir(root);
+          await symlink(join(testDir, "not-yet"), join(root, "hop"));
+          await symlink(join("hop", "file.md"), join(root, "file.md"));
+
+          expect(
+            await writablePathEscapesRoot({ rootPath: root, targetPath: join(root, "file.md") }),
+          ).toBe(true);
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should report a target below a link cycle rather than throw",
+        async () => {
+          const root = join(testDir, "root");
+          await ensureDir(root);
+          await symlink(join(root, "b"), join(root, "a"));
+          await symlink(join(root, "a"), join(root, "b"));
+
+          expect(
+            await writablePathEscapesRoot({
+              rootPath: root,
+              targetPath: join(root, "a", "file.md"),
+            }),
+          ).toBe(true);
+        },
+      );
+
+      it("should pass a target spelled below a file rather than throw", async () => {
+        // The write itself fails with ENOTDIR; the guard only has to answer
+        // where it would land.
+        const root = join(testDir, "root");
+        await ensureDir(root);
+        await writeFileContent(join(root, "file.md"), "content");
+
+        expect(
+          await writablePathEscapesRoot({
+            rootPath: root,
+            targetPath: join(root, "file.md", "below.md"),
+          }),
+        ).toBe(false);
+      });
+
+      it.skipIf(process.platform === "win32")(
+        "should pass a target whose root is itself reached through a link",
+        async () => {
+          const real = join(testDir, "real-home");
+          await ensureDir(real);
+          const root = join(testDir, "home");
+          await symlink(real, root);
+
+          expect(
+            await writablePathEscapesRoot({
+              rootPath: root,
+              targetPath: join(root, "new", "file.md"),
+            }),
+          ).toBe(false);
+        },
+      );
+    });
+
+    describe("relativeWriteLanding", () => {
+      it("should give the path from the root's landing to the target's landing", async () => {
+        const root = join(testDir, "root");
+
+        expect(
+          await relativeWriteLanding({ rootPath: root, targetPath: join(root, "new", "file.md") }),
+        ).toBe(join("new", "file.md"));
+      });
+
+      it.skipIf(process.platform === "win32")(
+        "should give an empty path for a target linked onto the root itself",
+        async () => {
+          const root = join(testDir, "root");
+          await ensureDir(join(root, "skills"));
+          await symlink("..", join(root, "skills", "foo"));
+
+          expect(
+            await relativeWriteLanding({ rootPath: root, targetPath: join(root, "skills", "foo") }),
+          ).toBe("");
+        },
+      );
+
+      it.skipIf(process.platform === "win32")("should give null for a link cycle", async () => {
+        const root = join(testDir, "root");
+        await ensureDir(root);
+        await symlink(join(root, "b"), join(root, "a"));
+        await symlink(join(root, "a"), join(root, "b"));
+
+        expect(
+          await relativeWriteLanding({ rootPath: root, targetPath: join(root, "a", "file.md") }),
+        ).toBeNull();
+      });
+    });
+
+    describe("resolvedRelativePath", () => {
+      it("should give the path from the root to a directory really under it", async () => {
+        const root = join(testDir, "root");
+        const target = join(root, "nested", "deep");
+        await ensureDir(target);
+
+        expect(await resolvedRelativePath({ rootPath: root, targetPath: target })).toBe(
+          "nested/deep",
+        );
+      });
+
+      it("should give an empty path for the root itself", async () => {
+        const root = join(testDir, "root");
+        await ensureDir(root);
+
+        expect(await resolvedRelativePath({ rootPath: root, targetPath: root })).toBe("");
+      });
+
+      it.skipIf(process.platform === "win32")(
+        "should give the path the link leads to rather than the one it is spelled at",
+        async () => {
+          // The name is spelled two levels down inside the root; what it denotes
+          // sits one level down, under an entirely different name.
+          const root = join(testDir, "root");
+          const real = join(root, "real");
+          await ensureDir(real);
+          await ensureDir(join(root, "parent"));
+          await symlink(real, join(root, "parent", "link"));
+
+          expect(
+            await resolvedRelativePath({
+              rootPath: root,
+              targetPath: join(root, "parent", "link"),
+            }),
+          ).toBe("real");
+        },
+      );
+
+      it.skipIf(process.platform === "win32")(
+        "should climb out of the root when the link leads out of it",
+        async () => {
+          const root = join(testDir, "root");
+          const outside = join(testDir, "outside");
+          await ensureDir(root);
+          await ensureDir(outside);
+          await symlink(outside, join(root, "link"));
+
+          expect(
+            await resolvedRelativePath({ rootPath: root, targetPath: join(root, "link") }),
+          ).toBe("../outside");
+        },
+      );
+
+      it("should fall back to the literal path when the target cannot be resolved", async () => {
+        // Unresolvable has to read as an escape rather than as containment, so the
+        // literal path is kept instead of the question going unanswered.
+        const root = await realpath(testDir);
+
+        expect(
+          posixRelativePathEscapesRoot(
+            await resolvedRelativePath({
+              rootPath: join(root, "root"),
+              targetPath: join(root, "missing"),
+            }),
+          ),
+        ).toBe(true);
       });
     });
 
@@ -768,6 +1490,31 @@ describe("file utilities", () => {
           expect(results).toContain(join(testDir, "file1.md"));
           expect(results).toContain(join(testDir, "nested", "file3.md"));
         });
+
+        it("should evaluate relative patterns from a literal directory path", async () => {
+          const literalRoot = join(testDir, "project(glob)");
+          const filePath = join(literalRoot, "file.md");
+          await writeFileContent(filePath, "content");
+
+          await expect(
+            findFilesByGlobs("*.md", { cwd: literalRoot, type: "file" }),
+          ).resolves.toEqual([toPosixPath(filePath)]);
+        });
+
+        it.skipIf(process.platform === "win32")(
+          "should not include files from a sibling matching a literal directory path",
+          async () => {
+            const literalRoot = join(testDir, "project*x");
+            const siblingRoot = join(testDir, "projectOTHERx");
+            const literalFilePath = join(literalRoot, "literal.md");
+            await writeFileContent(literalFilePath, "literal content");
+            await writeFileContent(join(siblingRoot, "sibling.md"), "sibling content");
+
+            await expect(
+              findFilesByGlobs("**/*.md", { cwd: literalRoot, type: "file" }),
+            ).resolves.toEqual([toPosixPath(literalFilePath)]);
+          },
+        );
       });
 
       describe("Windows path normalization", () => {
@@ -923,8 +1670,8 @@ describe("file utilities", () => {
         });
 
         it("should not produce duplicated entries when a directory symlink cycle exists", async () => {
-          // skills/a contains a real file and a link back to skills/, forming a cycle that
-          // globby follows up to the kernel ELOOP limit. Deduplication by real path collapses it.
+          // skills/a contains a real file and a link back to skills/, forming a cycle. The
+          // loop check stops the walk at the link, so each real file is found once.
           const skillsDir = join(testDir, "skills");
           const skillA = join(skillsDir, "a");
           await ensureDir(skillA);
@@ -935,10 +1682,80 @@ describe("file utilities", () => {
             type: "file",
           });
 
-          // Exactly one entry survives per real file despite the cycle (no ~40x blowup).
+          // Exactly one entry survives per real file despite the cycle.
           const uniqueRealPaths = new Set(await Promise.all(fileResults.map((p) => realpath(p))));
           expect(uniqueRealPaths.size).toBe(fileResults.length);
           expect(fileResults.length).toBeLessThan(5);
+        });
+
+        it("should terminate on two links back to the walked directory", async () => {
+          // Two self-links double the walk at every level, so without a loop check the
+          // walk grows exponentially until ELOOP and never finishes in practice.
+          const loopDir = join(testDir, "two-self-links");
+          await writeFileContent(join(loopDir, "a.md"), "a");
+          await writeFileContent(join(loopDir, "sub", "b.md"), "b");
+          await symlink(".", join(loopDir, "l1"));
+          await symlink(".", join(loopDir, "l2"));
+
+          const results = await findFilesByGlobs("**/*.md", { cwd: loopDir, type: "file" });
+
+          expect(results).toEqual([join(loopDir, "a.md"), join(loopDir, "sub", "b.md")]);
+        });
+
+        it("should terminate on two directories linking to each other", async () => {
+          const mutualDir = join(testDir, "mutual-loop");
+          await writeFileContent(join(mutualDir, "a", "a.md"), "a");
+          await writeFileContent(join(mutualDir, "c", "c.md"), "c");
+          await symlink(join("..", "c"), join(mutualDir, "a", "b"));
+          await symlink(join("..", "a"), join(mutualDir, "c", "d"));
+
+          const results = await findFilesByGlobs("**/*.md", { cwd: mutualDir, type: "file" });
+
+          expect(results).toEqual([join(mutualDir, "a", "a.md"), join(mutualDir, "c", "c.md")]);
+        });
+
+        it("should not let one pattern's walk cut another pattern's walk short", async () => {
+          // `*.txt` reads the root; `sub/*.md` starts its own walk at `sub -> .`, which
+          // must not count the root read by the other pattern as its ancestor.
+          const loopDir = join(testDir, "loop-across-patterns");
+          await writeFileContent(join(loopDir, "a.md"), "a");
+          await writeFileContent(join(loopDir, "x.txt"), "x");
+          await symlink(".", join(loopDir, "sub"));
+
+          const results = await findFilesByGlobs(["*.txt", "sub/*.md"], {
+            cwd: loopDir,
+            type: "file",
+          });
+
+          expect(results).toEqual([join(loopDir, "sub", "a.md"), join(loopDir, "x.txt")]);
+        });
+
+        it("should apply a negative pattern only to the patterns before it", async () => {
+          const negDir = join(testDir, "negative-per-walk");
+          await writeFileContent(join(negDir, "a.md"), "a");
+          await writeFileContent(join(negDir, "b.md"), "b");
+          await writeFileContent(join(negDir, "a.txt"), "a");
+
+          const results = await findFilesByGlobs(["*.md", "!a.*", "*.txt"], {
+            cwd: negDir,
+            type: "file",
+          });
+
+          expect(results).toEqual([join(negDir, "a.txt"), join(negDir, "b.md")]);
+        });
+
+        it("should still walk a link to a directory above the walk root", async () => {
+          // `up -> ..` leaves the walk, so its files are reachable through it; only the
+          // descent back into the walk root through `up/<root>` repeats a directory.
+          const parentDir = join(testDir, "link-to-parent");
+          const rootDir = join(parentDir, "root");
+          await writeFileContent(join(parentDir, "outside.md"), "outside");
+          await writeFileContent(join(rootDir, "inside.md"), "inside");
+          await symlink("..", join(rootDir, "up"));
+
+          const results = await findFilesByGlobs("**/*.md", { cwd: rootDir, type: "file" });
+
+          expect(results).toEqual([join(rootDir, "inside.md"), join(rootDir, "up", "outside.md")]);
         });
 
         it("should represent a file by its real path rather than by a directory alias", async () => {
@@ -956,6 +1773,27 @@ describe("file utilities", () => {
           });
 
           expect(results).toEqual([join(realSubDir, "x.md")]);
+        });
+
+        it("should represent a file by its real path when the glob leads through a link", async () => {
+          // Testing a candidate against the identity `realpath` returns only
+          // settles it for an already resolved path. Reached through a link of
+          // its own — the shape a linked checkout or a `/tmp` that is itself a
+          // link produces — no candidate equals the identity, and the alias
+          // would win the tie-break and hide `zzz` again.
+          const aliasDir = join(testDir, "real-over-alias-via-link");
+          const realSubDir = join(aliasDir, "zzz");
+          await writeFileContent(join(realSubDir, "x.md"), "content");
+          await symlink(realSubDir, join(aliasDir, "aaa"));
+          const viaLink = join(testDir, "via-link");
+          await symlink(aliasDir, viaLink);
+
+          const results = await findFilesByGlobs(join(viaLink, "**", "*"), {
+            type: "file",
+            dot: true,
+          });
+
+          expect(results).toEqual([join(viaLink, "zzz", "x.md")]);
         });
 
         it("should represent a file by its flat real path rather than through a cycle", async () => {

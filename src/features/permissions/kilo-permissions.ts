@@ -16,7 +16,13 @@ import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
 import { isPlainObject } from "../../utils/type-guards.js";
+import {
+  findKiloMcpToolKeyOwner,
+  isKiloPermissionPattern,
+  kiloPermissionToToolFilter,
+} from "../shared/kilo-mcp-tool-keys.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+import { honorAllToolsOnBash } from "./shell-command-categories.js";
 import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
@@ -158,6 +164,71 @@ function narrowSandboxToProjectScope({
   return emitted;
 }
 
+const KILO_MARKDOWN_SOURCE_KEY = "markdown_source";
+
+/**
+ * Narrow an authored `markdown_source` rule to what a *project* `kilo.jsonc`
+ * can mean. Kilo only grants it when the winning pattern came from the global
+ * config with the action `allow` ("Project configuration cannot grant this
+ * permission"). A project pattern that wins last-match-wins therefore never
+ * grants: `deny` and `ask` both block (Kilo never prompts for it), so they
+ * are kept — a project config may only tighten. A project `allow` would block
+ * too, the opposite of what it says, so it is dropped with a warning pointing
+ * at `--global`.
+ * Returns `undefined` when nothing is left to write.
+ * @see https://kilo.ai/docs/customize/workflows
+ * @see https://github.com/Kilo-Org/kilocode/blob/main/packages/opencode/src/kilocode/config/external-markdown.ts
+ */
+function narrowMarkdownSourceToProjectScope({
+  authored,
+  logger,
+}: {
+  authored: unknown;
+  logger?: Logger | undefined;
+}): unknown {
+  let emitted: unknown;
+  let dropped: string[];
+  if (typeof authored === "string") {
+    emitted = authored === "allow" ? undefined : authored;
+    dropped = authored === "allow" ? ["*"] : [];
+  } else {
+    const entries = Object.entries(asKiloRecord(authored));
+    const kept = entries.filter(([, action]) => action !== "allow");
+    emitted = kept.length > 0 ? Object.fromEntries(kept) : undefined;
+    dropped = entries.filter(([, action]) => action === "allow").map(([pattern]) => pattern);
+  }
+  if (dropped.length > 0) {
+    logger?.warn(
+      `Kilo grants '${KILO_MARKDOWN_SOURCE_KEY}' from the global config only, so these 'allow' ` +
+        `patterns were dropped from the project config: ${dropped.join(", ")}. A project config ` +
+        `can only block it ('deny' or 'ask'); generate with --global to grant access.`,
+    );
+  }
+  return emitted;
+}
+
+/**
+ * Move every exact (non-wildcard) key whose action is a plain `"deny"` to the
+ * end of a Kilo `permission` block, keeping every other key where it is. Kilo
+ * evaluates the block last-match-wins in key order and matches each key as a
+ * wildcard against the permission name, so the permissions writer appending a
+ * new catch-all `"*": "allow"` after the `{server}_{tool}` deny the MCP feature
+ * wrote moments before would silently lift it. An exact key matches only its
+ * own permission name, so placing its deny last can only make that one name
+ * stricter; the authored order of everything else (a `*` deny written after a
+ * category allow, ...) is left alone.
+ * @see https://github.com/Kilo-Org/kilocode/blob/main/packages/opencode/src/permission/index.ts
+ */
+function moveKiloExactDeniesLast(permission: Record<string, unknown>): Record<string, unknown> {
+  const isExactDeny = ([key, value]: [string, unknown]): boolean =>
+    value === "deny" && !isKiloPermissionPattern(key);
+  const entries = Object.entries(permission);
+  return Object.fromEntries([
+    ...entries.filter((entry) => !isExactDeny(entry)),
+    ...entries.filter(isExactDeny),
+  ]);
+}
+
 export class KiloPermissions extends ToolPermissions {
   private readonly json: KiloPermissionsConfig;
 
@@ -290,9 +361,18 @@ export class KiloPermissions extends ToolPermissions {
     // notebook_edit, ...) authorable from rulesync rather than only pass-through.
     const kiloOverride = rulesyncJson.kilo;
     const incomingPermission: Record<string, unknown> = {
-      ...rulesyncJson.permission,
+      ...honorAllToolsOnBash(rulesyncJson.permission),
       ...kiloOverride?.permission,
     };
+    if (!global && Object.hasOwn(incomingPermission, KILO_MARKDOWN_SOURCE_KEY)) {
+      const narrowed = narrowMarkdownSourceToProjectScope({
+        authored: incomingPermission[KILO_MARKDOWN_SOURCE_KEY],
+        logger,
+      });
+      // Still owned when nothing survives, so a stale project entry (an earlier
+      // rulesync wrote the rule verbatim) is removed rather than kept.
+      incomingPermission[KILO_MARKDOWN_SOURCE_KEY] = narrowed;
+    }
 
     // Detect `deny` patterns that disappear from any key rulesync now owns —
     // including override keys — so a regenerate that silently weakens a
@@ -322,10 +402,13 @@ export class KiloPermissions extends ToolPermissions {
       ...existingPermission,
       ...incomingPermission,
     };
+    if (mergedPermission[KILO_MARKDOWN_SOURCE_KEY] === undefined) {
+      delete mergedPermission[KILO_MARKDOWN_SOURCE_KEY];
+    }
 
     const nextJson: Record<string, unknown> = {
       ...parsed,
-      permission: mergedPermission,
+      permission: moveKiloExactDeniesLast(mergedPermission),
     };
 
     // Overlay the Kilo-scoped override's `sandbox` block. Shallow merged at the
@@ -362,7 +445,21 @@ export class KiloPermissions extends ToolPermissions {
     // into other tools' configs.
     const shared: PermissionsConfig["permission"] = {};
     const overrideOnly: NonNullable<KiloPermissionsOverride["permission"]> = {};
+    // An `allow`/`deny` (plain, or the `{"*": ...}` map Kilo saves) naming a
+    // tool of a server the file's `mcp` block lists is that server's
+    // `enabledTools`/`disabledTools` entry, which the MCP feature imports and
+    // rewrites. Copying it into the override too
+    // would let a stale copy here overwrite the MCP feature's next write.
+    const parsedFile: unknown = parseJsonc(this.fileContent || "{}");
+    const mcpServerNames =
+      isPlainObject(parsedFile) && isPlainObject(parsedFile.mcp) ? Object.keys(parsedFile.mcp) : [];
     for (const [key, value] of Object.entries(rawPermission)) {
+      if (
+        kiloPermissionToToolFilter(value) !== undefined &&
+        findKiloMcpToolKeyOwner(key, mcpServerNames) !== undefined
+      ) {
+        continue;
+      }
       if (isSharedKiloCategory(key)) {
         shared[key] = typeof value === "string" ? { "*": value } : value;
       } else {

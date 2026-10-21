@@ -3,20 +3,30 @@ import { join } from "node:path";
 import { parse as parseJsonc } from "jsonc-parser";
 import { refine, z } from "zod/mini";
 
-import {
-  OPENCODE_DIR,
-  OPENCODE_GLOBAL_DIR,
-  OPENCODE_JSON_FILE_NAME,
-  OPENCODE_JSONC_FILE_NAME,
-} from "../../constants/opencode-paths.js";
+import { OPENCODE_LAYOUT, type OpencodeLayout } from "../../constants/opencode-paths.js";
 import { ValidationResult } from "../../types/ai-file.js";
 import { McpServers } from "../../types/mcp.js";
 import { readFileContentOrNull, toPosixPath } from "../../utils/file.js";
+import { parseJsonc as parseJsoncStrict } from "../../utils/jsonc.js";
 import type { Logger } from "../../utils/logger.js";
-import { applySharedConfigPatch, sharedConfigFileKey } from "../shared/shared-config-gateway.js";
+import { quoteValueForWarning } from "../../utils/quote-value.js";
+import { isRecord } from "../../utils/type-guards.js";
+import {
+  findOpencodeV2McpContainers,
+  lowerOpencodeV2Mcp,
+  mergeOpencodeConfigValues,
+  readOpencodeDotDirConfigLayers,
+  warnOpencodeDotDirOverrides,
+} from "../opencode-config.js";
+import {
+  applySharedConfigPatch,
+  sharedConfigFileKey,
+  undefinedWhenEmpty,
+} from "../shared/shared-config-gateway.js";
 import {
   convertEnvVarRefsFromToolFormat,
   convertEnvVarRefsToToolFormat,
+  BRACE_ENV_VAR_PATTERN,
 } from "./mcp-env-var-format.js";
 import {
   declaresNoTransport,
@@ -38,12 +48,14 @@ import {
   ToolMcpSettablePaths,
 } from "./tool-mcp.js";
 
-// Negative lookbehind avoids matching Cursor's ${env:VAR} format
-const OPENCODE_ENV_VAR_PATTERN = /(?<!\$)\{env:([^}:]+)\}/g;
-
 // OpenCode MCP server schemas
 // OpenCode uses "local"/"remote" instead of "stdio"/"sse"/"http",
 // "environment" instead of "env", and "enabled" instead of "disabled"
+
+// V2's `disabled` is lowered to `enabled` before parsing (see
+// `lowerOpencodeV2Mcp`), which leaves a non-boolean one as it is so that it is
+// rejected here rather than passed through as an unknown field.
+const OpencodeMcpV2DisabledSchema = z.optional(z.boolean());
 
 // OpenCode native format for local servers.
 // looseObject preserves documented-but-unmodeled per-server fields (e.g. `timeout`)
@@ -54,17 +66,19 @@ const OpencodeMcpLocalServerSchema = z.looseObject({
   command: z.array(z.string()),
   environment: z.optional(z.record(z.string(), z.string())),
   enabled: z._default(z.boolean(), true),
+  disabled: OpencodeMcpV2DisabledSchema,
   cwd: z.optional(z.string()),
 });
 
 // OpenCode native format for remote servers.
 // looseObject preserves documented-but-unmodeled per-server fields (e.g. `timeout`,
-// `oauth`) and future additions on round-trip. https://opencode.ai/docs/mcp-servers
+// `oauth`, `protocol`, `codemode`) and future additions on round-trip. https://opencode.ai/docs/mcp-servers
 const OpencodeMcpRemoteServerSchema = z.looseObject({
   type: z.literal("remote"),
   url: z.string(),
   headers: z.optional(z.record(z.string(), z.string())),
   enabled: z._default(z.boolean(), true),
+  disabled: OpencodeMcpV2DisabledSchema,
 });
 
 // OpenCode-supported per-server fields that rulesync does not map explicitly.
@@ -74,20 +88,28 @@ const OpencodeMcpRemoteServerSchema = z.looseObject({
 // rulesync `mcp.json` is a multi-tool superset, so export uses an explicit
 // allow-list to avoid leaking other tools' keys (e.g. `kiroAutoApprove`,
 // `alwaysAllow`, `trust`) into `opencode.json`.
+// `protocol` (`legacy` | `auto` | `2026-07-28`) and `codemode` are OpenCode V2
+// per-server keys (https://opencode.ai/v2/docs/mcp-servers/). This adapter
+// reads and writes the V1 file shape (a flat `mcp` map), so the two keys reach
+// it only when a canonical server carries them — hand-authored in
+// `.rulesync/mcp.jsonc`, or imported from a flat-`mcp` `opencode.json` entry
+// that has them — and they are never emitted otherwise. V1's published schema
+// does not list them.
 // https://opencode.ai/docs/mcp-servers
-const OPENCODE_PASSTHROUGH_SERVER_FIELDS = ["timeout", "oauth"] as const;
+const OPENCODE_PASSTHROUGH_SERVER_FIELDS = ["timeout", "oauth", "protocol", "codemode"] as const;
 
 // Every field of the two transport schemas except `enabled`, which is what a
-// toggle entry carries — plus the per-server keys the two transport arms accept
-// only through their `looseObject` passthrough, so they are not in `.def.shape`
-// but still mark an entry as a transport rather than a toggle. Without them
+// toggle entry carries, and `disabled`, which a toggle may carry too — plus
+// the per-server keys the two transport arms accept only through their
+// `looseObject` passthrough, so they are not in `.def.shape` but still mark
+// an entry as a transport rather than a toggle. Without them
 // `{"enabled": true, "oauth": {...}}` would be read as a toggle and its OAuth
 // credentials dropped without a word.
 const OPENCODE_MCP_TRANSPORT_KEYS = [
   ...Object.keys(OpencodeMcpLocalServerSchema.def.shape),
   ...Object.keys(OpencodeMcpRemoteServerSchema.def.shape),
   ...OPENCODE_PASSTHROUGH_SERVER_FIELDS,
-].filter((key) => key !== "enabled");
+].filter((key) => key !== "enabled" && key !== "disabled");
 
 /**
  * A bare toggle entry: `{"enabled": <bool>}` with no transport of its own,
@@ -310,8 +332,9 @@ function warnAboutToggleDroppedKeys(
     return;
   }
   logger?.warn(
-    `OpenCode MCP: "${serverName}" declares no transport, so it is written as a toggle entry and ` +
-      `${dropped.toSorted().join(", ")} ${dropped.length === 1 ? "is" : "are"} dropped.`,
+    `OpenCode MCP: ${quoteValueForWarning(serverName)} declares no transport, so it is written ` +
+      `as a toggle entry and ${dropped.toSorted().map(quoteValueForWarning).join(", ")} ` +
+      `${dropped.length === 1 ? "is" : "are"} dropped.`,
   );
 }
 
@@ -322,7 +345,7 @@ function warnAboutToggleDroppedKeys(
  * - env -> environment
  * - disabled -> enabled (inverted)
  * - enabledTools/disabledTools -> top-level tools map (with server name prefix)
- * - OpenCode-supported extras (timeout, oauth) -> passed through verbatim
+ * - OpenCode-supported extras (timeout, oauth, protocol, codemode) -> passed through verbatim
  */
 function convertServerToOpencodeFormat(
   serverName: string,
@@ -330,7 +353,7 @@ function convertServerToOpencodeFormat(
   existingEntry: OpencodeMcpServer | undefined,
   logger?: Logger,
 ): OpencodeMcpServer | null {
-  // Preserve OpenCode-supported extras (e.g. timeout, oauth) on export so a
+  // Preserve OpenCode-supported extras (e.g. timeout, oauth, protocol, codemode) on export so a
   // round-trip keeps them. Spread first so derived fields below always win.
   const serverRecord = serverConfig as Record<string, unknown>;
   const passthrough: Record<string, unknown> = {};
@@ -450,11 +473,55 @@ function convertToOpencodeFormat(
 }
 
 export class OpencodeMcp extends ToolMcp {
+  /** Directory layout; OpenCode forks (MiMo Code) override it. */
+  protected static readonly layout: OpencodeLayout = OPENCODE_LAYOUT;
+
   private readonly json: OpencodeConfig;
 
-  constructor(params: ToolMcpParams) {
+  /**
+   * With a `logger`, the V2 values that lowering the content drops are warned
+   * about (see {@link OpencodeMcp.lowerConfig}); `fromFile` passes one so the
+   * warnings come from the lowering that builds the parsed view rather than
+   * from an extra pass of their own. (`validate()`, which the parent
+   * constructor calls before this view exists, lowers separately and silently.)
+   */
+  constructor({ logger, ...params }: ToolMcpParams & { logger?: Logger }) {
     super(params);
-    this.json = OpencodeConfigSchema.parse(parseJsonc(this.fileContent || "{}"));
+    this.json = OpencodeConfigSchema.parse(
+      (this.constructor as typeof OpencodeMcp).lowerConfig(
+        parseJsonc(this.fileContent || "{}"),
+        logger,
+      ),
+    );
+  }
+
+  /**
+   * Lowers the OpenCode V2 `mcp` spellings of a parsed config for a layout
+   * that reads them (see {@link lowerOpencodeV2Mcp}), so every reader — import,
+   * the toggle lookup on generate, and the rules feature's `instructions`
+   * write to the same file — accepts a V2-shaped `mcp`. Only the parsed view
+   * is lowered; content written back keeps whatever `mcp` a feature that does
+   * not own the key found there. With a `logger`, each V2 value the lowering
+   * drops is warned about.
+   */
+  protected static lowerConfig(json: unknown, logger?: Logger): unknown {
+    if (!this.layout.readsV2ConfigSpellings || !isRecord(json) || json.mcp === undefined) {
+      return json;
+    }
+    return {
+      ...json,
+      mcp: lowerOpencodeV2Mcp(json.mcp, (path, reason) => {
+        // Quoted, not interpolated: a server name in a repository's config
+        // could carry control characters or bidirectional overrides.
+        const quoted = quoteValueForWarning(path);
+        logger?.warn(
+          reason === "conflict"
+            ? `OpenCode MCP: ${quoted} conflicts with a V1 value that takes precedence ` +
+                '(the flat "mcp" entry of the same name, or "enabled"), so it is dropped on import.'
+            : `OpenCode MCP: ${quoted} has no Rulesync equivalent, so it is dropped on import.`,
+        );
+      }),
+    };
   }
 
   getJson(): OpencodeConfig {
@@ -469,15 +536,9 @@ export class OpencodeMcp extends ToolMcp {
   }
 
   static getSettablePaths({ global }: { global?: boolean } = {}): ToolMcpSettablePaths {
-    if (global) {
-      return {
-        relativeDirPath: OPENCODE_GLOBAL_DIR,
-        relativeFilePath: OPENCODE_JSON_FILE_NAME,
-      };
-    }
     return {
-      relativeDirPath: ".",
-      relativeFilePath: OPENCODE_JSON_FILE_NAME,
+      relativeDirPath: global ? this.layout.globalDir : this.layout.configDir,
+      relativeFilePath: this.layout.jsonFileName,
     };
   }
 
@@ -485,35 +546,49 @@ export class OpencodeMcp extends ToolMcp {
     outputRoot = process.cwd(),
     validate = true,
     global = false,
+    logger,
   }: ToolMcpFromFileParams): Promise<OpencodeMcp> {
     const basePaths = this.getSettablePaths({ global });
     const jsonDir = join(outputRoot, basePaths.relativeDirPath);
 
     let fileContent: string | null = null;
-    let relativeFilePath = OPENCODE_JSONC_FILE_NAME;
+    let relativeFilePath = this.layout.jsoncFileName;
 
-    const jsoncPath = join(jsonDir, OPENCODE_JSONC_FILE_NAME);
-    const jsonPath = join(jsonDir, OPENCODE_JSON_FILE_NAME);
+    const jsoncPath = join(jsonDir, this.layout.jsoncFileName);
+    const jsonPath = join(jsonDir, this.layout.jsonFileName);
 
     // Always try JSONC first (preferred format), then fall back to JSON
     fileContent = await readFileContentOrNull(jsoncPath);
     if (!fileContent) {
       fileContent = await readFileContentOrNull(jsonPath);
       if (fileContent) {
-        relativeFilePath = OPENCODE_JSON_FILE_NAME;
+        relativeFilePath = this.layout.jsonFileName;
       }
     }
 
     const fileContentToUse = fileContent ?? '{"mcp":{}}';
-    const json = parseJsonc(fileContentToUse);
+    // OpenCode merges `.opencode/opencode.json(c)` over the root config, so
+    // their servers are imported too, each file lowered on its own first.
+    const overlays = await readOpencodeDotDirConfigLayers({
+      outputRoot,
+      global,
+      layout: this.layout,
+    });
+    const json =
+      overlays.length === 0
+        ? parseJsonc(fileContentToUse)
+        : [parseJsonc(fileContentToUse), ...overlays.map(({ config }) => config)]
+            .map((layer: unknown) => this.lowerConfig(layer, logger))
+            .reduce(mergeOpencodeConfigValues);
     const newJson = { ...json, mcp: json.mcp ?? {} };
 
-    return new OpencodeMcp({
+    return new this({
       outputRoot,
       relativeDirPath: basePaths.relativeDirPath,
       relativeFilePath,
       fileContent: JSON.stringify(newJson, null, 2),
       validate,
+      logger,
     });
   }
 
@@ -528,17 +603,17 @@ export class OpencodeMcp extends ToolMcp {
     const jsonDir = join(outputRoot, basePaths.relativeDirPath);
 
     let fileContent: string | null = null;
-    let relativeFilePath = OPENCODE_JSONC_FILE_NAME;
+    let relativeFilePath = this.layout.jsoncFileName;
 
-    const jsoncPath = join(jsonDir, OPENCODE_JSONC_FILE_NAME);
-    const jsonPath = join(jsonDir, OPENCODE_JSON_FILE_NAME);
+    const jsoncPath = join(jsonDir, this.layout.jsoncFileName);
+    const jsonPath = join(jsonDir, this.layout.jsonFileName);
 
     // Try JSONC first (preferred format), then fall back to JSON
     fileContent = await readFileContentOrNull(jsoncPath);
     if (!fileContent) {
       fileContent = await readFileContentOrNull(jsonPath);
       if (fileContent) {
-        relativeFilePath = OPENCODE_JSON_FILE_NAME;
+        relativeFilePath = this.layout.jsonFileName;
       }
     }
 
@@ -550,29 +625,52 @@ export class OpencodeMcp extends ToolMcp {
     // The toggle a transport-less server needs may already be in the file; read
     // it so a server the user disabled in another config layer is not switched
     // back on by rewriting the whole `mcp` key without it.
-    const existingMcp = OpencodeConfigSchema.safeParse(parseJsonc(fileContent || "{}"));
+    // A toggle under the V2 `mcp.servers` envelope counts too.
+    const existingJson: unknown = parseJsonc(fileContent || "{}");
+    const existingMcp = OpencodeConfigSchema.safeParse(this.lowerConfig(existingJson));
+    if (this.layout.readsV2ConfigSpellings && isRecord(existingJson)) {
+      const containers = findOpencodeV2McpContainers(existingJson.mcp);
+      if (containers.length > 0) {
+        logger?.warn(
+          `OpenCode MCP: the whole "mcp" key is rewritten in the flat V1 shape, so ` +
+            `${containers.map(quoteValueForWarning).join(" and ")} ` +
+            `${containers.length === 1 ? "is" : "are"} not kept.`,
+        );
+      }
+    }
     const { mcp: convertedMcp, tools: mcpTools } = convertToOpencodeFormat(
       transformedServers,
       (existingMcp.success ? existingMcp.data.mcp : undefined) ?? {},
       logger,
     );
+    const generatedMcp = undefinedWhenEmpty(convertedMcp);
+    const generatedTools = Object.keys(mcpTools).length > 0 ? mcpTools : undefined;
+    warnOpencodeDotDirOverrides({
+      generated: { mcp: generatedMcp, tools: generatedTools },
+      overlays: (
+        await readOpencodeDotDirConfigLayers({ outputRoot, global, layout: this.layout })
+      ).map((overlay) => {
+        const lowered = this.lowerConfig(overlay.config);
+        return { ...overlay, config: isRecord(lowered) ? lowered : {} };
+      }),
+      rootFileName: relativeFilePath,
+      logger,
+    });
 
-    return new OpencodeMcp({
+    return new this({
       outputRoot,
       relativeDirPath: basePaths.relativeDirPath,
       relativeFilePath,
       // Keyed by the base settable paths: a resolved `.jsonc` twin shares the
-      // `.json` ownership declaration. `tools` is retracted when the generated
-      // servers carry no tool filters.
+      // `.json` ownership declaration. `mcp` is retracted when no server is
+      // left, and `tools` when the generated servers carry no tool filters.
       fileContent: applySharedConfigPatch({
         fileKey: sharedConfigFileKey(basePaths),
         feature: "mcp",
         existingContent: fileContent ?? "",
-        patch: {
-          mcp: convertedMcp,
-          tools: Object.keys(mcpTools).length > 0 ? mcpTools : undefined,
-        },
+        patch: { mcp: generatedMcp, tools: generatedTools },
         filePath: join(jsonDir, relativeFilePath),
+        logger,
       }),
       validate,
     });
@@ -599,11 +697,13 @@ export class OpencodeMcp extends ToolMcp {
     instructions,
     validate = true,
     global = false,
+    logger,
   }: {
     outputRoot?: string;
     instructions: string[];
     validate?: boolean;
     global?: boolean;
+    logger?: Logger;
   }): Promise<OpencodeMcp | null> {
     const basePaths = this.getSettablePaths({ global });
     const jsonDir = join(outputRoot, basePaths.relativeDirPath);
@@ -614,21 +714,23 @@ export class OpencodeMcp extends ToolMcp {
     // config lives in, so that prefix is stripped.
     const configDirPrefix = `${toPosixPath(basePaths.relativeDirPath).replace(/\/+$/, "")}/`;
     const normalizedInstructions = instructions.map((path) =>
-      global && path.startsWith(configDirPrefix) ? path.slice(configDirPrefix.length) : path,
+      global && path.startsWith(configDirPrefix)
+        ? this.toGlobalInstructionEntry({ path, configDirPrefix })
+        : path,
     );
 
     let fileContent: string | null = null;
-    let relativeFilePath = OPENCODE_JSONC_FILE_NAME;
+    let relativeFilePath = this.layout.jsoncFileName;
 
-    const jsoncPath = join(jsonDir, OPENCODE_JSONC_FILE_NAME);
-    const jsonPath = join(jsonDir, OPENCODE_JSON_FILE_NAME);
+    const jsoncPath = join(jsonDir, this.layout.jsoncFileName);
+    const jsonPath = join(jsonDir, this.layout.jsonFileName);
 
     // Prefer opencode.jsonc, fall back to opencode.json, mirroring fromRulesyncMcp.
     fileContent = await readFileContentOrNull(jsoncPath);
     if (!fileContent) {
       fileContent = await readFileContentOrNull(jsonPath);
       if (fileContent) {
-        relativeFilePath = OPENCODE_JSON_FILE_NAME;
+        relativeFilePath = this.layout.jsonFileName;
       }
     }
 
@@ -649,8 +751,14 @@ export class OpencodeMcp extends ToolMcp {
     // full-prefix global spelling cannot coexist as a duplicate). Entries
     // outside the managed directory are the user's and pass through verbatim.
     const managedPrefixes = global
-      ? ["memories/", `${configDirPrefix}memories/`]
-      : [`${toPosixPath(OPENCODE_DIR)}/memories/`];
+      ? [
+          this.toGlobalInstructionEntry({
+            path: `${configDirPrefix}memories/`,
+            configDirPrefix,
+          }),
+          `${configDirPrefix}memories/`,
+        ]
+      : [`${toPosixPath(this.layout.dir)}/memories/`];
     const preservedInstructions = existingInstructions.filter((entry) => {
       const normalized = toPosixPath(entry).replace(/^\.\//, "");
       return !managedPrefixes.some((prefix) => normalized.startsWith(prefix));
@@ -660,7 +768,7 @@ export class OpencodeMcp extends ToolMcp {
       new Set([...preservedInstructions, ...normalizedInstructions]),
     ).toSorted();
 
-    return new OpencodeMcp({
+    return new this({
       outputRoot,
       relativeDirPath: basePaths.relativeDirPath,
       relativeFilePath,
@@ -671,16 +779,32 @@ export class OpencodeMcp extends ToolMcp {
         // An emptied list retracts the key rather than writing `[]`.
         patch: { instructions: mergedInstructions.length > 0 ? mergedInstructions : undefined },
         filePath: join(jsonDir, relativeFilePath),
+        logger,
       }),
       validate,
     });
+  }
+
+  /**
+   * Spells a global rule path (relative to the home directory, under the
+   * global config directory) as an `instructions` entry. OpenCode resolves the
+   * entry relative to the global config directory, so the prefix is stripped.
+   */
+  protected static toGlobalInstructionEntry({
+    path,
+    configDirPrefix,
+  }: {
+    path: string;
+    configDirPrefix: string;
+  }): string {
+    return path.slice(configDirPrefix.length);
   }
 
   toRulesyncMcp(): RulesyncMcp {
     const convertedMcpServers = convertFromOpencodeFormat(this.json.mcp ?? {}, this.json.tools);
     const transformedServers = convertEnvVarRefsFromToolFormat({
       mcpServers: convertedMcpServers,
-      pattern: OPENCODE_ENV_VAR_PATTERN,
+      pattern: BRACE_ENV_VAR_PATTERN,
     });
     // A transport-less server is an OpenCode idea — a filter for a server
     // another config layer defines — so it goes in the block only OpenCode
@@ -690,7 +814,9 @@ export class OpencodeMcp extends ToolMcp {
       fileContent: JSON.stringify(
         {
           mcpServers: shared,
-          ...(Object.keys(toolOnly).length > 0 && { opencode: { mcpServers: toolOnly } }),
+          ...(Object.keys(toolOnly).length > 0 && {
+            [(this.constructor as typeof OpencodeMcp).layout.toolTarget]: { mcpServers: toolOnly },
+          }),
         },
         null,
         2,
@@ -701,8 +827,12 @@ export class OpencodeMcp extends ToolMcp {
   validate(): ValidationResult {
     // Parse fileContent directly since this.json may not be initialized yet
     // when validate() is called from parent constructor
-    const json = JSON.parse(this.fileContent || "{}");
-    const result = OpencodeConfigSchema.safeParse(json);
+    // Strict JSONC rather than JSON: `opencode.json`/`opencode.jsonc` may
+    // carry the user's comments, which the gateway preserves on write-back.
+    const json = parseJsoncStrict(this.fileContent || "{}");
+    const result = OpencodeConfigSchema.safeParse(
+      (this.constructor as typeof OpencodeMcp).lowerConfig(json),
+    );
     if (!result.success) {
       return { success: false, error: result.error };
     }
@@ -715,7 +845,7 @@ export class OpencodeMcp extends ToolMcp {
     relativeFilePath,
     global = false,
   }: ToolMcpForDeletionParams): OpencodeMcp {
-    return new OpencodeMcp({
+    return new this({
       outputRoot,
       relativeDirPath,
       relativeFilePath,

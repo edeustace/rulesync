@@ -3,11 +3,15 @@ import { join } from "node:path";
 import { z } from "zod/mini";
 
 import {
+  COPILOT_DIR,
   COPILOT_HOOKS_DIR_PATH,
   COPILOT_HOOKS_FILE_NAME,
   COPILOTCLI_HOOKS_DIR_PATH,
   COPILOTCLI_HOOKS_FILE_NAME,
+  COPILOTCLI_PROJECT_SETTINGS_DIR_PATH,
+  COPILOTCLI_SETTINGS_FILE_NAME,
 } from "../../constants/copilot-paths.js";
+import type { SharedWritePath } from "../../lib/shared-file-derive.js";
 import type { AiFileParams, ValidationResult } from "../../types/ai-file.js";
 import type { HooksConfig } from "../../types/hooks.js";
 import {
@@ -16,10 +20,17 @@ import {
   COPILOTCLI_TO_CANONICAL_EVENT_NAMES,
   HookDefinitionSchema,
 } from "../../types/hooks.js";
+import { ToolFile } from "../../types/tool-file.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
 import { compact } from "../../utils/object.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
+import {
+  applySharedConfigPatch,
+  parseSharedConfig,
+  sharedConfigFileKey,
+} from "../shared/shared-config-gateway.js";
 import type { RulesyncHooks } from "./rulesync-hooks.js";
 import { buildImportedHooksConfig } from "./tool-hooks-converter.js";
 import {
@@ -121,9 +132,16 @@ const CopilotCliHookEntrySchema = z.looseObject({
   powershell: z.optional(z.string()),
   // Cross-platform fallback: upstream copies it to both `bash` and
   // `powershell` when those fields are absent. Generate writes it whenever the
-  // canonical `shell` selector is unset (see `buildCopilotCliEntriesForEvent`),
-  // and writes the shell-specific field otherwise.
+  // canonical `shell` selector is unset (see `resolveExportCommandPart`), and
+  // writes the shell-specific field otherwise.
   command: z.optional(z.string()),
+  // CLI-only shell-free form: `exec` names an executable that is spawned
+  // directly, `args` its argv. The docs say not to combine `exec` with
+  // `bash`/`powershell`/`command`, and the same canonical definition uses
+  // `command` + `args` (the exec form AugmentCode and Claude Code share).
+  // https://docs.github.com/en/copilot/reference/hooks-reference
+  exec: z.optional(z.string()),
+  args: z.optional(z.array(z.string())),
   prompt: z.optional(z.string()),
   url: z.optional(z.string()),
   headers: z.optional(z.record(z.string(), z.string())),
@@ -176,6 +194,39 @@ function resolveExportMatcherPart({
     `Copilot CLI hook matchers are only honored on ${COPILOTCLI_MATCHER_EVENTS_LABEL}; dropping matcher "${matcher}" on '${eventName}'.`,
   );
   return {};
+}
+
+/**
+ * Pick the command fields of an exported `command` entry.
+ *
+ * A canonical `args` list (an empty one counts) selects the CLI's shell-free
+ * form: `command` becomes `exec` and the list is written as `args`, so the
+ * executable is spawned directly. The `shell` selector is meaningless there
+ * and is dropped with a warning. Otherwise the canonical `shell` selector
+ * picks the shell-specific field; without it the portable `command` field is
+ * written, which upstream copies to both `bash` and `powershell`. Keying off
+ * `shell` rather than `process.platform` keeps the generated file identical
+ * on every machine.
+ */
+function resolveExportCommandPart({
+  def,
+  eventName,
+  logger,
+}: {
+  def: HooksConfig["hooks"][string][number];
+  eventName: string;
+  logger?: Logger;
+}): Record<string, unknown> {
+  if (Array.isArray(def.args)) {
+    if (def.shell !== undefined) {
+      logger?.warn(
+        `Copilot CLI runs an \`exec\` hook without a shell; dropping shell "${def.shell}" on '${eventName}'.`,
+      );
+    }
+    return compact({ exec: def.command, args: def.args, env: def.env });
+  }
+  const commandField = def.shell ?? "command";
+  return compact({ [commandField]: def.command, env: def.env });
 }
 
 /**
@@ -242,11 +293,10 @@ function buildCopilotCliEntriesForEvent({
       // it the portable `command` field is written, which upstream copies to
       // both `bash` and `powershell`. Keying off `shell` rather than
       // `process.platform` keeps the generated file identical on every machine.
-      const commandField = def.shell ?? "command";
       entries.push({
         type: "command",
         ...matcherPart,
-        ...compact({ [commandField]: def.command, env: def.env }),
+        ...resolveExportCommandPart({ def, eventName, logger }),
         ...timeoutPart,
         ...rest,
       });
@@ -272,7 +322,8 @@ function canonicalToCopilotCliHooks(
   };
   const out: Record<string, CopilotCliHookEntry[]> = {};
   for (const [eventName, definitions] of Object.entries(effectiveHooks)) {
-    const copilotEventName = CANONICAL_TO_COPILOTCLI_EVENT_NAMES[eventName] ?? eventName;
+    const copilotEventName =
+      lookupOwn({ record: CANONICAL_TO_COPILOTCLI_EVENT_NAMES, key: eventName }) ?? eventName;
     const entries = buildCopilotCliEntriesForEvent({
       eventName,
       definitions,
@@ -300,6 +351,10 @@ function importPassthrough(entry: CopilotCliHookEntry): Record<string, unknown> 
 /**
  * Resolve the canonical command and its `shell` selector from an imported entry.
  *
+ * The CLI-only `exec` form maps to canonical `command` + `args`, the exec form
+ * shared with AugmentCode and Claude Code, so it no longer imports as a hook
+ * with no command at all.
+ *
  * A shell-specific field carries its `shell` through so re-export writes the
  * same field back. An entry using only the portable `command` field leaves
  * `shell` unset, which re-export renders as the portable field again.
@@ -313,9 +368,21 @@ function importPassthrough(entry: CopilotCliHookEntry): Record<string, unknown> 
 function resolveImportCommand(
   entry: CopilotCliHookEntry,
   logger?: Logger,
-): { command?: string; shell?: "bash" | "powershell" } {
+): { command?: string; shell?: "bash" | "powershell"; args?: string[] } {
   const hasBash = typeof entry.bash === "string";
   const hasPowershell = typeof entry.powershell === "string";
+  if (typeof entry.exec === "string") {
+    // The shell-free form. Upstream documents `exec` as replacing the shell
+    // fields, so any of them alongside it is ignored, with a warning. An
+    // always-present `args` list is what marks the canonical exec form, so a
+    // bare `exec` imports with an empty list.
+    if (hasBash || hasPowershell || typeof entry.command === "string") {
+      logger?.warn(
+        "Copilot CLI hook has both exec and a shell command; using exec and ignoring the shell fields, as the hooks reference says not to combine them.",
+      );
+    }
+    return { command: entry.exec, args: entry.args ?? [] };
+  }
   if (hasBash && hasPowershell) {
     logger?.warn(
       "Copilot CLI hook has both bash and powershell commands; using bash and ignoring powershell, so the imported config does not depend on the machine the import ran on.",
@@ -338,7 +405,9 @@ function copilotCliHooksToCanonical(rawHooks: unknown, logger?: Logger): HooksCo
 
   const canonical: HooksConfig["hooks"] = {};
   for (const [copilotEventName, hookEntries] of Object.entries(rawHooks)) {
-    const eventName = COPILOTCLI_TO_CANONICAL_EVENT_NAMES[copilotEventName] ?? copilotEventName;
+    const eventName =
+      lookupOwn({ record: COPILOTCLI_TO_CANONICAL_EVENT_NAMES, key: copilotEventName }) ??
+      copilotEventName;
     if (!Array.isArray(hookEntries)) continue;
     const defs: HooksConfig["hooks"][string] = [];
     for (const rawEntry of hookEntries) {
@@ -360,11 +429,12 @@ function copilotCliHooksToCanonical(rawHooks: unknown, logger?: Logger): HooksCo
       } else if (entry.type === "http") {
         defs.push({ type: "http", ...matcherPart, ...timeoutPart, ...passthrough });
       } else {
-        const { command, shell } = resolveImportCommand(entry, logger);
+        const { command, shell, args } = resolveImportCommand(entry, logger);
         defs.push({
           type: "command",
           ...(command !== undefined && { command }),
           ...(shell !== undefined && { shell }),
+          ...(args !== undefined && { args }),
           ...matcherPart,
           ...timeoutPart,
           ...passthrough,
@@ -378,12 +448,133 @@ function copilotCliHooksToCanonical(rawHooks: unknown, logger?: Logger): HooksCo
   return canonical;
 }
 
+/**
+ * The Copilot CLI settings file carrying the `disableAllHooks` switch:
+ * `.github/copilot/settings.json` (project) / `~/.copilot/settings.json`
+ * (global). Both scopes document the key ("Disable all hooks (both
+ * repository-level and user-level)"; the repository value takes precedence),
+ * see the CLI config dir reference:
+ * https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-config-dir-reference
+ */
+function copilotCliSettingsPaths({ global }: { global: boolean }): SharedWritePath {
+  return global
+    ? { relativeDirPath: COPILOT_DIR, relativeFilePath: COPILOTCLI_SETTINGS_FILE_NAME }
+    : {
+        relativeDirPath: COPILOTCLI_PROJECT_SETTINGS_DIR_PATH,
+        relativeFilePath: COPILOTCLI_SETTINGS_FILE_NAME,
+      };
+}
+
+/**
+ * Read `disableAllHooks` from the scope's settings file for import. A missing
+ * or unparsable file yields `undefined`: the hooks file is the import's
+ * subject, and the permissions feature reports a broken settings file itself.
+ */
+async function readDisableAllHooks({
+  outputRoot,
+  global,
+}: {
+  outputRoot: string;
+  global: boolean;
+}): Promise<boolean | undefined> {
+  const paths = copilotCliSettingsPaths({ global });
+  const fileContent = await readFileContentOrNull(
+    join(outputRoot, paths.relativeDirPath, paths.relativeFilePath),
+  );
+  if (fileContent === null) {
+    return undefined;
+  }
+  try {
+    const value = parseSharedConfig({ format: "json", fileContent }).disableAllHooks;
+    return typeof value === "boolean" ? value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * The settings file patched with the `copilotcli.disableAllHooks` override.
+ * Only that key is owned (through the shared-config gateway), so `model`,
+ * `deniedUrls` and every other user setting are preserved. It is a shared,
+ * user-owned file and is never deleted.
+ */
+export class CopilotcliHooksSettings extends ToolFile {
+  validate(): ValidationResult {
+    return { success: true, error: null };
+  }
+
+  override isDeletable(): boolean {
+    return false;
+  }
+
+  static async fromDisableAllHooks({
+    outputRoot = process.cwd(),
+    global = false,
+    disableAllHooks,
+  }: {
+    outputRoot?: string;
+    global?: boolean;
+    disableAllHooks: boolean;
+  }): Promise<CopilotcliHooksSettings> {
+    const paths = copilotCliSettingsPaths({ global });
+    const filePath = join(outputRoot, paths.relativeDirPath, paths.relativeFilePath);
+    const existingContent = (await readFileContentOrNull(filePath)) ?? "{}";
+    return new CopilotcliHooksSettings({
+      outputRoot,
+      relativeDirPath: paths.relativeDirPath,
+      relativeFilePath: paths.relativeFilePath,
+      fileContent: applySharedConfigPatch({
+        fileKey: sharedConfigFileKey(paths),
+        feature: "hooks",
+        existingContent,
+        patch: { disableAllHooks },
+        filePath,
+      }),
+      global,
+    });
+  }
+}
+
+type CopilotcliHooksParams = AiFileParams & {
+  /** The settings file to patch alongside the hooks file, when authored. */
+  settingsFile?: CopilotcliHooksSettings;
+  /** `disableAllHooks` read from the settings file, for import. */
+  disableAllHooks?: boolean;
+};
+
 export class CopilotcliHooks extends ToolHooks {
-  constructor(params: AiFileParams) {
+  private readonly settingsFile: CopilotcliHooksSettings | undefined;
+  private readonly disableAllHooks: boolean | undefined;
+
+  constructor({ settingsFile, disableAllHooks, ...params }: CopilotcliHooksParams) {
     super({
       ...params,
       fileContent: params.fileContent ?? "{}",
     });
+    this.settingsFile = settingsFile;
+    this.disableAllHooks = disableAllHooks;
+  }
+
+  // `disableAllHooks` is patched into the Copilot CLI settings file, which the
+  // permissions feature also writes. Declared here because it is not a
+  // settable path.
+  static getExtraSharedWritePaths({
+    global = false,
+  }: { global?: boolean } = {}): SharedWritePath[] {
+    return [copilotCliSettingsPaths({ global })];
+  }
+
+  static override async getAuxiliaryFiles({
+    toolHooks,
+  }: {
+    outputRoot?: string;
+    global?: boolean;
+    toolHooks?: ToolHooks;
+    logger?: Logger;
+  } = {}): Promise<ToolFile[]> {
+    return toolHooks instanceof CopilotcliHooks && toolHooks.settingsFile
+      ? [toolHooks.settingsFile]
+      : [];
   }
 
   static getSettablePaths({ global = false }: { global?: boolean } = {}): ToolHooksSettablePaths {
@@ -413,6 +604,7 @@ export class CopilotcliHooks extends ToolHooks {
       relativeFilePath: paths.relativeFilePath,
       fileContent,
       validate,
+      disableAllHooks: await readDisableAllHooks({ outputRoot, global }),
     });
   }
 
@@ -430,12 +622,20 @@ export class CopilotcliHooks extends ToolHooks {
     const config = rulesyncHooks.getJson();
     const copilotHooks = canonicalToCopilotCliHooks(config, logger);
     const fileContent = JSON.stringify({ version: 1, hooks: copilotHooks }, null, 2);
+    // The settings file is only touched when the switch is authored, so a value
+    // the user set by hand survives an unrelated regeneration.
+    const disableAllHooks = config.copilotcli?.disableAllHooks;
+    const settingsFile =
+      typeof disableAllHooks === "boolean"
+        ? await CopilotcliHooksSettings.fromDisableAllHooks({ outputRoot, global, disableAllHooks })
+        : undefined;
     return new CopilotcliHooks({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath: paths.relativeFilePath,
       fileContent,
       validate,
+      settingsFile,
     });
   }
 
@@ -452,7 +652,13 @@ export class CopilotcliHooks extends ToolHooks {
     const hooks = copilotCliHooksToCanonical(parsed.hooks, options?.logger);
     return this.toRulesyncHooksDefault({
       fileContent: JSON.stringify(
-        buildImportedHooksConfig({ hooks, overrideKey: "copilotcli" }),
+        buildImportedHooksConfig({
+          hooks,
+          overrideKey: "copilotcli",
+          ...(this.disableAllHooks !== undefined && {
+            extraOverride: { disableAllHooks: this.disableAllHooks },
+          }),
+        }),
         null,
         2,
       ),

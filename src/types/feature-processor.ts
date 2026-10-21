@@ -1,15 +1,19 @@
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { RULESYNC_RELATIVE_DIR_PATH } from "../constants/rulesync-paths.js";
+import { diffSharedConfigOwnedKeys } from "../features/shared/shared-config-gateway.js";
+import type { DeletedPath, KeyOperation } from "../lib/orphan-sweep.js";
 import { fileContentIsEmptyPayload, fileContentsEquivalent } from "../utils/content-equivalence.js";
-import { stripControlCharacters } from "../utils/control-characters.js";
+import { quoteForLog, stripControlCharacters } from "../utils/control-characters.js";
 import {
   addTrailingNewline,
   applyFileMode,
   fileExistsStrict,
   restoreMissingExecutableBit,
   readFileContentOrNull,
+  relativeWriteLanding,
   removeFile,
+  writablePathEscapesRoot,
   writeFileContent,
 } from "../utils/file.js";
 import type { Logger } from "../utils/logger.js";
@@ -38,6 +42,11 @@ export abstract class FeatureProcessor extends RulesyncSourceConsumer {
   protected readonly inputRoots: readonly [string, ...string[]];
   protected readonly dryRun: boolean;
   protected readonly logger: Logger;
+  /**
+   * Paths the orphan sweep deleted (or, under `--dry-run`, would delete),
+   * relative to the output root like the paths `writeAiFiles` reports.
+   */
+  private readonly removedPaths: DeletedPath[] = [];
   constructor({
     outputRoot = process.cwd(),
     inputRoots,
@@ -71,6 +80,18 @@ export abstract class FeatureProcessor extends RulesyncSourceConsumer {
   abstract convertToolFilesToRulesyncFiles(toolFiles: ToolFile[]): Promise<RulesyncFile[]>;
 
   /**
+   * Whether `convertRulesyncFilesToToolFiles` still yields tool files for an
+   * empty source list. A processor that aggregates into a shared file it may
+   * never delete (Pool's `settings.yaml` subagents) answers true so a run
+   * whose last source file is gone retracts what an earlier run generated;
+   * the default keeps a run with no source from writing anything. Consulted
+   * after `loadRulesyncFiles`, so the answer may depend on what that load saw.
+   */
+  emitsToolFilesForEmptySource(): boolean {
+    return false;
+  }
+
+  /**
    * Return tool targets that this feature supports.
    */
   static getToolTargets(
@@ -86,8 +107,22 @@ export abstract class FeatureProcessor extends RulesyncSourceConsumer {
   async writeAiFiles(aiFiles: AiFile[]): Promise<WriteResult> {
     let changedCount = 0;
     const changedPaths: string[] = [];
+    const keyOperations: KeyOperation[] = [];
     for (const aiFile of aiFiles) {
       const filePath = aiFile.getFilePath();
+
+      // `getFilePath` judges the path as spelled; the link check happens
+      // before anything is read or written.
+      if (
+        await refusesWriteOutsideRoot({
+          logger: this.logger,
+          rootPath: aiFile.getOutputRoot(),
+          targetPath: filePath,
+        })
+      ) {
+        continue;
+      }
+
       const existingFileContent = await readFileContentOrNull(filePath);
 
       if (existingFileContent !== null && aiFile.shouldMergeExistingFileContent()) {
@@ -138,10 +173,24 @@ export abstract class FeatureProcessor extends RulesyncSourceConsumer {
         }
       }
       changedCount++;
-      changedPaths.push(aiFile.getRelativePathFromCwd());
+      const relativePath = aiFile.getRelativePathFromCwd();
+      changedPaths.push(relativePath);
+      // Computed from the same two contents in a dry run and a real one, so a
+      // preview reports exactly the key operations the run it previews makes.
+      for (const { action, key } of diffSharedConfigOwnedKeys({
+        fileKey: relativePath,
+        existingContent: existingContent ?? "",
+        newContent: contentWithNewline,
+      })) {
+        keyOperations.push({ action, path: relativePath, key });
+      }
     }
 
-    return { count: changedCount, paths: changedPaths };
+    return {
+      count: changedCount,
+      paths: changedPaths,
+      ...(keyOperations.length > 0 && { keyOperations }),
+    };
   }
 
   async removeAiFiles(aiFiles: AiFile[]): Promise<void> {
@@ -155,11 +204,36 @@ export abstract class FeatureProcessor extends RulesyncSourceConsumer {
    * This only deletes files that are no longer in the rulesync source, not files that will be overwritten.
    */
   async removeOrphanAiFiles(existingFiles: AiFile[], generatedFiles: AiFile[]): Promise<number> {
-    const generatedPaths = new Set(generatedFiles.map((f) => f.getFilePath()));
-    const orphanFiles = existingFiles.filter((f) => !generatedPaths.has(f.getFilePath()));
+    // Case-folded so a rename that only changes case (e.g. `my-skill.md` ->
+    // `My-Skill.md`) is not treated as deleting one file and creating another:
+    // on a case-insensitive filesystem the write already landed on the
+    // existing path, and comparing exactly would classify it as an orphan and
+    // delete the file that was just (re)written.
+    const generatedPaths = new Set(generatedFiles.map((f) => caseFoldIdentity(f.getFilePath())));
+    const orphanFiles = existingFiles.filter(
+      (f) => !generatedPaths.has(caseFoldIdentity(f.getFilePath())),
+    );
 
+    // Keyed on the output root and the directory holding each orphan: every
+    // file in one linked directory gets the same answer, so a large directory
+    // reached through a link out of the root costs one walk and one warning
+    // instead of one of each per file.
+    const refusedDirs = new Map<string, boolean>();
+    let removedCount = 0;
     for (const aiFile of orphanFiles) {
       const filePath = aiFile.getFilePath();
+      const rootPath = aiFile.getOutputRoot();
+      const dirPath = dirname(filePath);
+      const cacheKey = JSON.stringify([rootPath, dirPath]);
+      let refused = refusedDirs.get(cacheKey);
+      if (refused === undefined) {
+        // Asked before the dry-run branch so `--check` and a real run agree.
+        refused = await refusesDeleteOutsideRoot({ logger: this.logger, rootPath, dirPath });
+        refusedDirs.set(cacheKey, refused);
+      }
+      if (refused) {
+        continue;
+      }
       // The path is an on-disk name rulesync did not choose, so it is stripped
       // like every other untrusted string this file logs: a name carrying
       // `\x1b[2K\r` would otherwise rewrite the line and hide what was deleted.
@@ -173,9 +247,19 @@ export abstract class FeatureProcessor extends RulesyncSourceConsumer {
         // another vendor disappeared without a trace.
         this.logger.info(`Deleted: ${loggedPath}`);
       }
+      this.removedPaths.push({ path: aiFile.getRelativePathFromCwd(), kind: "file" });
+      removedCount++;
     }
 
-    return orphanFiles.length;
+    return removedCount;
+  }
+
+  /**
+   * The paths {@link removeOrphanAiFiles} deleted, or would have deleted under
+   * `--dry-run`, so a preview and the run it previews report the same list.
+   */
+  getRemovedPaths(): readonly DeletedPath[] {
+    return this.removedPaths;
   }
 }
 
@@ -304,6 +388,122 @@ export function mergeByIdentity<T>({
   }
 
   return order.map((key) => winnerByKey.get(key)!);
+}
+
+/**
+ * Whether a write to `targetPath` has to be refused because a link on the way
+ * there leads out of `rootPath`, warning about the refusal.
+ *
+ * A checked-out repository can carry a symbolic link at an output path
+ * (`AGENTS.md -> ~/.bashrc`, a tool directory linked to `/etc`), and a write
+ * through it would land wherever the link points. Every writer that lets the
+ * OS follow links — file, directory, and config-rewrite alike — asks this first
+ * so that one warning describes the one behavior.
+ */
+export async function refusesWriteOutsideRoot({
+  logger,
+  rootPath,
+  targetPath,
+}: {
+  logger: Logger;
+  rootPath: string;
+  targetPath: string;
+}): Promise<boolean> {
+  if (!(await writablePathEscapesRoot({ rootPath, targetPath }))) {
+    return false;
+  }
+  logger.warn(
+    `Refusing to write ${quoteForLog(targetPath)}: it resolves outside ` +
+      `${quoteForLog(rootPath)} through a symbolic link`,
+  );
+  return true;
+}
+
+/**
+ * Whether deleting the files in `dirPath` has to be refused because a link on
+ * the way to that directory leads out of `rootPath`, warning about the refusal
+ * once for the whole directory.
+ *
+ * Deletion candidates are enumerated without following links *inside* the
+ * scanned directory, but the scanned directory itself is reached through
+ * whatever links its path contains: a checked-out repository can carry
+ * `.cursor/commands -> ~/notes`, and every file in `~/notes` would then read as
+ * an orphan. Only the directory is judged, never the file in it, because
+ * removing a file that is itself a link unlinks the link where it is spelled
+ * and never touches its target.
+ */
+async function refusesDeleteOutsideRoot({
+  logger,
+  rootPath,
+  dirPath,
+}: {
+  logger: Logger;
+  rootPath: string;
+  dirPath: string;
+}): Promise<boolean> {
+  if (!(await writablePathEscapesRoot({ rootPath, targetPath: dirPath }))) {
+    return false;
+  }
+  logger.warn(
+    `Refusing to delete files in ${quoteForLog(dirPath)}: it resolves outside ` +
+      `${quoteForLog(rootPath)} through a symbolic link`,
+  );
+  return true;
+}
+
+/**
+ * {@link refusesWriteOutsideRoot} over every path a single unit of output
+ * writes, stopping at the first refusal: a directory written as one unit is
+ * held back whole when any one file in it would land outside the root.
+ */
+export async function refusesAnyWriteOutsideRoot({
+  logger,
+  rootPath,
+  targetPaths,
+}: {
+  logger: Logger;
+  rootPath: string;
+  targetPaths: readonly string[];
+}): Promise<boolean> {
+  for (const targetPath of targetPaths) {
+    if (await refusesWriteOutsideRoot({ logger, rootPath, targetPath })) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a directory write to `dirPath` has to be refused because a link on
+ * the way there lands it on `rootPath` itself, warning about the refusal.
+ *
+ * A directory written as one unit owns what it writes: a `.claude/skills/foo ->
+ * ..` chain that lands on the project root (or on `$HOME` in global mode) would
+ * otherwise drop `SKILL.md` and its companions straight into the root,
+ * overwriting a hand-written file of the same name there. Refusing it is the
+ * same fail-safe answer {@link refusesWriteOutsideRoot} gives a link that leads
+ * out of the root.
+ *
+ * A link cycle answers false here: it is {@link refusesWriteOutsideRoot}'s to
+ * refuse, and callers ask that first.
+ */
+export async function refusesDirWriteOntoRoot({
+  logger,
+  rootPath,
+  dirPath,
+}: {
+  logger: Logger;
+  rootPath: string;
+  dirPath: string;
+}): Promise<boolean> {
+  if ((await relativeWriteLanding({ rootPath, targetPath: dirPath })) !== "") {
+    return false;
+  }
+  logger.warn(
+    `Refusing to write ${quoteForLog(dirPath)}: it resolves to ` +
+      `${quoteForLog(rootPath)} itself through a symbolic link`,
+  );
+  return true;
 }
 
 /**

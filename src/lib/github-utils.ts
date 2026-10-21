@@ -1,6 +1,9 @@
 import { Semaphore } from "es-toolkit/promise";
 
 import type { GitHubFileEntry } from "../types/fetch.js";
+import { stripControlCharacters } from "../utils/control-characters.js";
+import { formatError } from "../utils/error.js";
+import type { Logger } from "../utils/logger.js";
 import type { GitHubClient } from "./github-client.js";
 
 /**
@@ -56,7 +59,7 @@ export async function listDirectoryRecursive(params: {
   // entries it dropped itself — a capped page, or an item that did not parse.
   let dropped = false;
 
-  // Semaphore is released here before recursive Promise.all below to avoid deadlock
+  // Semaphore is released here before the recursive listings below to avoid deadlock
   const entries = await withSemaphore(semaphore, () =>
     client.listDirectory(owner, repo, path, ref, {
       onIncompleteListing: () => {
@@ -82,7 +85,14 @@ export async function listDirectoryRecursive(params: {
     onIncompleteDirectory?.(path);
   }
 
-  const subResults = await Promise.all(
+  // Settled rather than all, so a failed subdirectory does not return while its
+  // siblings are still listing: a caller that bounds how many walks run at once
+  // must see this one finished. The error thrown is the first failure to settle
+  // at this level; in a nested tree that can differ from the one `Promise.all`
+  // would have rejected with, since each level waits for all its siblings.
+  // In the order they arrived.
+  const failures: unknown[] = [];
+  const settled = await Promise.allSettled(
     directories.map((dir) =>
       listDirectoryRecursive({
         client,
@@ -93,9 +103,53 @@ export async function listDirectoryRecursive(params: {
         depth: depth + 1,
         semaphore,
         onIncompleteDirectory,
+      }).catch((error: unknown) => {
+        failures.push(error);
+        throw error;
       }),
     ),
   );
+  if (failures.length > 0) {
+    throw failures[0];
+  }
+  const subResults = settled.flatMap((result) =>
+    result.status === "fulfilled" ? [result.value] : [],
+  );
 
   return [...files, ...subResults.flat()];
+}
+
+/**
+ * The repository paths git records as executable, so a skill's script keeps
+ * its bit through a fetch or an install. The contents API carries no mode,
+ * and a run that cannot read the tree still completes -- the file is written
+ * and the bit is what it lacks.
+ */
+export async function resolveExecutablePaths({
+  client,
+  owner,
+  repo,
+  ref,
+  logger,
+}: {
+  client: GitHubClient;
+  owner: string;
+  repo: string;
+  ref: string;
+  logger: Logger;
+}): Promise<Set<string>> {
+  try {
+    const { paths, truncated } = await client.listExecutablePaths(owner, repo, ref);
+    if (truncated) {
+      logger.warn(
+        "The repository's tree listing was cut short by the API, so a script it left out is written without its executable bit. Run `chmod +x` on it by hand.",
+      );
+    }
+    return paths;
+  } catch (error) {
+    logger.warn(
+      `Could not read file modes from ${owner}/${repo}: ${stripControlCharacters(formatError(error))}. Scripts are written without their executable bit.`,
+    );
+    return new Set();
+  }
 }

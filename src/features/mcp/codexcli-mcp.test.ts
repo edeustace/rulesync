@@ -341,6 +341,47 @@ args = ["server.js"]
       expect(codexcliMcp.getRelativeFilePath()).toBe("config.toml");
     });
 
+    it("should drop keys Codex rejects for the server's transport (issue #2496)", async () => {
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({
+          mcpServers: {
+            local: {
+              command: "node",
+              args: ["server.js"],
+              oauth: { clientId: "abc" },
+              bearer_token_env_var: "TOKEN",
+            },
+            remote: {
+              url: "https://example.com/mcp",
+              args: ["--flag"],
+              cwd: "/tmp",
+              env: { KEY: "value" },
+            },
+          },
+        }),
+      });
+
+      const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({ outputRoot: testDir, rulesyncMcp });
+
+      expect(codexcliMcp.getToml().mcp_servers).toEqual({
+        local: { command: "node", args: ["server.js"] },
+        remote: { url: "https://example.com/mcp" },
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "Dropping 'bearer_token_env_var', 'oauth' from stdio MCP server \"local\"",
+        ),
+      );
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          "Dropping 'args', 'env', 'cwd' from url-based MCP server \"remote\"",
+        ),
+      );
+    });
+
     it("should normalize invalid Codex MCP server names and warn when the last collision wins", async () => {
       const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
       const rulesyncMcp = new RulesyncMcp({
@@ -560,6 +601,133 @@ approval_mode = "approve"
       expect(servers.srv?.tools).toEqual({ some_tool: { approval_mode: "approve" } });
     });
 
+    it("writes codexcliTools authored in the codexcli block as Codex's tools table (#3318)", async () => {
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "mcp.jsonc",
+        fileContent: JSON.stringify({
+          mcpServers: {},
+          codexcli: {
+            mcpServers: {
+              example: {
+                type: "http",
+                url: "https://example.com/mcp",
+                default_tools_approval_mode: "writes",
+                codexcliTools: { example_tool: { approval_mode: "approve" } },
+              },
+            },
+          },
+        }),
+        validate: true,
+      });
+
+      const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp: rulesyncMcp.forTarget({ toolTarget: "codexcli" }),
+      });
+
+      const content = codexcliMcp.getFileContent();
+      expect(content).toContain("[mcp_servers.example.tools.example_tool]");
+      expect(content).not.toContain("codexcliTools");
+      const servers = codexcliMcp.getToml().mcp_servers as Record<string, Record<string, unknown>>;
+      expect(servers.example).toEqual({
+        url: "https://example.com/mcp",
+        default_tools_approval_mode: "writes",
+        tools: { example_tool: { approval_mode: "approve" } },
+      });
+    });
+
+    it("merges authored codexcliTools over saved approvals field by field (#3318)", async () => {
+      // Saved approvals for tools and fields the source does not name survive
+      // (#1709); an authored field wins.
+      const existingToml = `[mcp_servers.srv]
+command = "node"
+
+[mcp_servers.srv.tools.saved_only]
+approval_mode = "approve"
+
+[mcp_servers.srv.tools.both]
+approval_mode = "approve"
+
+[mcp_servers.srv.tools.limit_only]
+approval_mode = "approve"
+`;
+      await ensureDir(join(testDir, ".codex"));
+      await writeFileContent(join(testDir, ".codex/config.toml"), existingToml);
+
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({
+          mcpServers: {
+            srv: {
+              command: "node",
+              codexcliTools: {
+                both: { approval_mode: "prompt" },
+                authored_only: { approval_mode: "writes" },
+                limit_only: { output_token_limit: 2000 },
+              },
+            },
+          },
+        }),
+      });
+
+      const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({ outputRoot: testDir, rulesyncMcp });
+
+      const servers = codexcliMcp.getToml().mcp_servers as Record<string, Record<string, unknown>>;
+      expect(servers.srv?.tools).toEqual({
+        saved_only: { approval_mode: "approve" },
+        both: { approval_mode: "prompt" },
+        authored_only: { approval_mode: "writes" },
+        limit_only: { approval_mode: "approve", output_token_limit: 2000 },
+      });
+      expect(codexcliMcp.getFileContent()).toContain("output_token_limit = 2000");
+    });
+
+    it("drops malformed codexcliTools entries and a canonical tools array on generate (#3318)", async () => {
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({
+          mcpServers: {
+            srv: {
+              command: "node",
+              tools: ["allowlisted"],
+              codexcliTools: {
+                good: { approval_mode: "approve" },
+                bad: { approval_mode: "always" },
+              },
+            },
+          },
+        }),
+      });
+
+      const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({ outputRoot: testDir, rulesyncMcp });
+
+      const servers = codexcliMcp.getToml().mcp_servers as Record<string, Record<string, unknown>>;
+      expect(servers.srv?.tools).toEqual({ good: { approval_mode: "approve" } });
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("'codexcliTools.bad'"));
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("'codexcliTools' for per-tool approval modes"),
+      );
+    });
+
+    it("round-trips codexcliTools through import and generate (#3318)", async () => {
+      const original = new CodexcliMcp({
+        relativeDirPath: ".codex",
+        relativeFilePath: "config.toml",
+        fileContent: `[mcp_servers.srv]\nurl = "https://example.com/mcp"\n\n[mcp_servers.srv.tools.t]\napproval_mode = "approve"\n`,
+      });
+
+      const regenerated = await CodexcliMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp: original.toRulesyncMcp(),
+      });
+
+      expect(regenerated.getToml().mcp_servers).toEqual(original.getToml().mcp_servers);
+    });
+
     it("should create instance from RulesyncMcp with custom outputRoot", async () => {
       const jsonData = {
         mcpServers: {
@@ -631,17 +799,18 @@ approval_mode = "approve"
         global: true,
       });
 
-      expect(codexcliMcp.getToml().mcp_servers).toEqual({});
+      expect(codexcliMcp.getToml().mcp_servers).toBeUndefined();
     });
 
-    it("should handle empty mcpServers object", async () => {
-      const jsonData = {
-        mcpServers: {},
-      };
+    it("should retract mcp_servers when no server is left, keeping unrelated keys", async () => {
+      await writeFileContent(
+        join(testDir, ".codex", "config.toml"),
+        'model = "gpt-5"\n\n[mcp_servers.old]\ncommand = "old"\n',
+      );
       const rulesyncMcp = new RulesyncMcp({
         relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
         relativeFilePath: ".mcp.json",
-        fileContent: JSON.stringify(jsonData),
+        fileContent: JSON.stringify({ mcpServers: {} }),
       });
 
       const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({
@@ -650,7 +819,9 @@ approval_mode = "approve"
         global: true,
       });
 
-      expect(codexcliMcp.getToml().mcp_servers).toEqual({});
+      // An empty `[mcp_servers]` table would leave a managed key behind that
+      // states nothing; the key is removed and the user's `model` survives.
+      expect(codexcliMcp.getToml()).toEqual({ model: "gpt-5" });
     });
 
     // codex CLI rejects empty `[mcp_servers.X.env]` for remote transports
@@ -1174,6 +1345,118 @@ args = ["server.js"]
       expect(mcpServers.remote.headers).toBeUndefined();
     });
 
+    describe("environment variable references (#3170)", () => {
+      const generate = async (mcpServers: Record<string, unknown>) => {
+        const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({
+          outputRoot: testDir,
+          rulesyncMcp: new RulesyncMcp({
+            relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+            relativeFilePath: ".mcp.json",
+            fileContent: JSON.stringify({ mcpServers }),
+          }),
+        });
+        return codexcliMcp.getToml().mcp_servers as any;
+      };
+
+      it("should convert Bearer and whole-value references into Codex env-sourced keys", async () => {
+        const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        const mcpServers = await generate({
+          remote: {
+            type: "http",
+            url: "https://mcp.example.com/mcp",
+            headers: {
+              Authorization: "Bearer ${API_KEY}",
+              "X-Api-Key": "${OTHER_KEY}",
+              "X-Static": "static-value",
+            },
+          },
+        });
+
+        expect(mcpServers.remote).toEqual({
+          url: "https://mcp.example.com/mcp",
+          bearer_token_env_var: "API_KEY",
+          env_http_headers: { "X-Api-Key": "OTHER_KEY" },
+          http_headers: { "X-Static": "static-value" },
+        });
+        expect(warnSpy).not.toHaveBeenCalled();
+      });
+
+      it("should match the Authorization header name and Bearer scheme case-insensitively", async () => {
+        const mcpServers = await generate({
+          remote: { url: "https://mcp.example.com", headers: { authorization: "bearer ${TOKEN}" } },
+        });
+
+        expect(mcpServers.remote.bearer_token_env_var).toBe("TOKEN");
+        expect(mcpServers.remote.http_headers).toBeUndefined();
+      });
+
+      it("should keep references Codex cannot express verbatim and warn with server and field", async () => {
+        const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        const mcpServers = await generate({
+          "api-server": {
+            type: "http",
+            url: "${API_BASE_URL:-https://api.example.com}/mcp",
+            headers: {
+              "X-Prefixed": "key-${API_KEY}",
+              "X-Default": "${API_KEY:-fallback}",
+            },
+          },
+        });
+
+        expect(mcpServers["api-server"]).toEqual({
+          url: "${API_BASE_URL:-https://api.example.com}/mcp",
+          http_headers: { "X-Prefixed": "key-${API_KEY}", "X-Default": "${API_KEY:-fallback}" },
+        });
+        const messages = warnSpy.mock.calls.map(([message]) => String(message));
+        expect(messages.some((m) => m.includes('"api-server"') && m.includes("'url'"))).toBe(true);
+        expect(
+          messages.some((m) => m.includes('"api-server"') && m.includes("header 'X-Prefixed'")),
+        ).toBe(true);
+        expect(
+          messages.some((m) => m.includes('"api-server"') && m.includes("header 'X-Default'")),
+        ).toBe(true);
+        // Warnings name the field only; values may carry secrets.
+        expect(
+          messages.every((m) => !m.includes("key-${API_KEY}") && !m.includes("API_BASE_URL:-")),
+        ).toBe(true);
+      });
+
+      it("should let explicit bearer_token_env_var and env_http_headers win over derived ones", async () => {
+        const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        const mcpServers = await generate({
+          remote: {
+            url: "https://mcp.example.com",
+            bearer_token_env_var: "EXPLICIT_TOKEN",
+            env_http_headers: { "X-Api-Key": "EXPLICIT_KEY" },
+            headers: {
+              Authorization: "Bearer ${DERIVED_TOKEN}",
+              "X-Api-Key": "${DERIVED_KEY}",
+              "X-Other": "${OTHER}",
+            },
+          },
+        });
+
+        expect(mcpServers.remote.bearer_token_env_var).toBe("EXPLICIT_TOKEN");
+        expect(mcpServers.remote.env_http_headers).toEqual({
+          "X-Api-Key": "EXPLICIT_KEY",
+          "X-Other": "OTHER",
+        });
+        // The explicit bearer already supplies Authorization, so the derived
+        // header is dropped rather than also sent as a literal.
+        expect(mcpServers.remote.http_headers).toBeUndefined();
+        expect(warnSpy).not.toHaveBeenCalled();
+      });
+
+      it("should still drop headers with references from a stdio server", async () => {
+        vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        const mcpServers = await generate({
+          local: { command: "node", headers: { Authorization: "Bearer ${TOKEN}" } },
+        });
+
+        expect(mcpServers.local).toEqual({ command: "node" });
+      });
+    });
+
     it("should drop headers from a stdio server rather than fail the entry (#2496)", async () => {
       // Codex errors with "http_headers is not supported for stdio", which
       // would take the whole server entry down.
@@ -1635,12 +1918,13 @@ Authorization = "Bearer token"
       );
     });
 
-    it("should not import Codex's per-tool approval table (#2496)", () => {
+    it("should import Codex's per-tool approval table into codexcliTools (#3318)", () => {
       const tomlContent = `[mcp_servers.srv]
 command = "node"
 
 [mcp_servers.srv.tools.some_tool]
 approval_mode = "approve"
+output_token_limit = 2000
 `;
       const codexcliMcp = new CodexcliMcp({
         relativeDirPath: ".codex",
@@ -1649,10 +1933,39 @@ approval_mode = "approve"
       });
 
       const rulesyncMcp = codexcliMcp.toRulesyncMcp();
-      // The canonical `tools` is a string array, so lifting Codex's table would
-      // produce a .rulesync/mcp.jsonc the schema rejects.
-      expect(JSON.parse(rulesyncMcp.getFileContent()).mcpServers.srv.tools).toBeUndefined();
+      const server = JSON.parse(rulesyncMcp.getFileContent()).mcpServers.srv;
+      // The canonical `tools` is a string array, so lifting Codex's table into
+      // it would produce a .rulesync/mcp.jsonc the schema rejects.
+      expect(server.tools).toBeUndefined();
+      expect(server.codexcliTools).toEqual({
+        some_tool: { approval_mode: "approve", output_token_limit: 2000 },
+      });
       expect(rulesyncMcp.validate().success).toBe(true);
+    });
+
+    it("should drop malformed per-tool entries on import (#3318)", () => {
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+      const tomlContent = `[mcp_servers.srv]
+command = "node"
+
+[mcp_servers.srv.tools.good]
+approval_mode = "prompt"
+
+[mcp_servers.srv.tools.bad]
+approval_mode = "always"
+`;
+      const codexcliMcp = new CodexcliMcp({
+        relativeDirPath: ".codex",
+        relativeFilePath: "config.toml",
+        fileContent: tomlContent,
+      });
+
+      const rulesyncMcp = codexcliMcp.toRulesyncMcp();
+      expect(JSON.parse(rulesyncMcp.getFileContent()).mcpServers.srv.codexcliTools).toEqual({
+        good: { approval_mode: "prompt" },
+      });
+      expect(rulesyncMcp.validate().success).toBe(true);
+      expect(warnSpy).toHaveBeenCalledWith(expect.stringContaining("'tools.bad'"));
     });
 
     it("should restate the http transport for a url server on import (#2496)", () => {
@@ -2293,7 +2606,7 @@ enabled_tools = ["search"]
   });
 
   describe("oauth client id mapping (#2158)", () => {
-    it("duplicates oauth.clientId to snake_case client_id on outbound conversion", async () => {
+    it("renames oauth.clientId and callbackPort to Codex's snake_case keys on outbound conversion", async () => {
       const jsonData = {
         mcpServers: {
           slack: {
@@ -2319,11 +2632,12 @@ enabled_tools = ["search"]
       });
 
       const oauth = (codexcliMcp.getToml().mcp_servers as any).slack.oauth;
-      // Both keys are emitted: camelCase for tools that read it, and snake_case
-      // for Codex CLI's login flow.
-      expect(oauth.client_id).toBe("1601185624273.8899143856786");
-      expect(oauth.clientId).toBe("1601185624273.8899143856786");
-      expect(oauth.callbackPort).toBe(3118);
+      // Renamed rather than duplicated: Codex reads only the snake_case keys
+      // and warns about the camelCase ones at startup.
+      expect(oauth).toEqual({
+        client_id: "1601185624273.8899143856786",
+        callback_port: 3118,
+      });
     });
 
     it("does not overwrite an existing client_id", async () => {
@@ -2352,7 +2666,7 @@ enabled_tools = ["search"]
       });
 
       const oauth = (codexcliMcp.getToml().mcp_servers as any).slack.oauth;
-      expect(oauth.client_id).toBe("snake-value");
+      expect(oauth).toEqual({ client_id: "snake-value" });
     });
 
     it("collapses client_id back to canonical clientId on inbound conversion", () => {
@@ -2377,15 +2691,16 @@ callbackPort = 3118
       });
     });
 
-    it("does not duplicate a non-string clientId", async () => {
+    it("drops a non-string clientId with a warning", async () => {
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
       const jsonData = {
         mcpServers: {
           slack: {
             type: "http",
             url: "https://mcp.slack.com/mcp",
             oauth: {
-              // A non-string client id is not a usable OAuth client id, so it is
-              // left as-is rather than duplicated into `client_id`.
+              // Codex reads `client_id` as a string, and a value of another
+              // type would fail the whole config.toml.
               clientId: 12345,
             },
           },
@@ -2403,9 +2718,152 @@ callbackPort = 3118
         global: false,
       });
 
-      const oauth = (codexcliMcp.getToml().mcp_servers as any).slack.oauth;
-      expect(oauth.clientId).toBe(12345);
-      expect("client_id" in oauth).toBe(false);
+      expect((codexcliMcp.getToml().mcp_servers as any).slack.oauth).toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Dropping malformed 'oauth.clientId' from MCP server \"slack\""),
+      );
+    });
+
+    it("passes Codex-native oauth keys through and drops keys Codex does not read", async () => {
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+      const jsonData = {
+        mcpServers: {
+          slack: {
+            type: "http",
+            url: "https://mcp.slack.com/mcp",
+            oauth: {
+              clientId: "client",
+              client_secret: "secret",
+              callback_url: "https://example.com/callback",
+              authorization_server_issuer: "https://issuer.example.com",
+              authServerMetadataUrl: "https://example.com/.well-known/oauth-authorization-server",
+            },
+          },
+        },
+      };
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify(jsonData),
+      });
+
+      const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp,
+        global: false,
+      });
+
+      expect((codexcliMcp.getToml().mcp_servers as any).slack.oauth).toEqual({
+        client_id: "client",
+        client_secret: "secret",
+        callback_url: "https://example.com/callback",
+        authorization_server_issuer: "https://issuer.example.com",
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Dropping 'oauth.authServerMetadataUrl' from MCP server \"slack\""),
+      );
+    });
+
+    it.each([
+      ["is blank", { clientId: "client", client_secret: "  " }, "it is empty"],
+      ["has no client id", { client_secret: "secret" }, "Codex requires a client id"],
+      [
+        "has a blank client id",
+        { client_id: " ", client_secret: "secret" },
+        "Codex requires a client id",
+      ],
+    ])("drops a client_secret that %s", async (_label, oauth, reason) => {
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({
+          mcpServers: { slack: { type: "http", url: "https://mcp.slack.com/mcp", oauth } },
+        }),
+      });
+
+      const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp,
+        global: false,
+      });
+
+      const written = (codexcliMcp.getToml().mcp_servers as any).slack.oauth;
+      expect(written?.client_secret).toBeUndefined();
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining(
+          `Dropping 'oauth.client_secret' from MCP server "slack": ${reason}`,
+        ),
+      );
+    });
+
+    it.each([
+      ["a non-integer", 3118.5],
+      ["a negative", -1],
+      ["an out-of-range", 70000],
+      ["a string", "3118"],
+    ])("drops %s callbackPort with a warning", async (_label, callbackPort) => {
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+      const jsonData = {
+        mcpServers: {
+          slack: {
+            type: "http",
+            url: "https://mcp.slack.com/mcp",
+            oauth: { clientId: "client", callbackPort },
+          },
+        },
+      };
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify(jsonData),
+      });
+
+      const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp,
+        global: false,
+      });
+
+      expect((codexcliMcp.getToml().mcp_servers as any).slack.oauth).toEqual({
+        client_id: "client",
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Dropping malformed 'oauth.callbackPort'"),
+      );
+    });
+
+    it("renames callback_port back to canonical callbackPort on import, preferring an existing callbackPort", () => {
+      const tomlContent = `[mcp_servers.slack]
+url = "https://mcp.slack.com/mcp"
+
+[mcp_servers.slack.oauth]
+client_id = "client"
+callback_port = 4000
+callback_url = "https://example.com/callback"
+
+[mcp_servers.legacy]
+url = "https://mcp.legacy.example.com/mcp"
+
+[mcp_servers.legacy.oauth]
+clientId = "client"
+client_id = "client"
+callbackPort = 3118
+callback_port = 4000
+`;
+      const codexcliMcp = new CodexcliMcp({
+        relativeDirPath: ".codex",
+        relativeFilePath: "config.toml",
+        fileContent: tomlContent,
+      });
+
+      const json = JSON.parse(codexcliMcp.toRulesyncMcp().getFileContent());
+      expect(json.mcpServers.slack.oauth).toEqual({
+        clientId: "client",
+        callbackPort: 4000,
+        callback_url: "https://example.com/callback",
+      });
+      expect(json.mcpServers.legacy.oauth).toEqual({ clientId: "client", callbackPort: 3118 });
     });
 
     it("keeps a full generate → import round-trip stable", async () => {
@@ -2461,6 +2919,72 @@ client_id = "camel-value"
 
       const json = JSON.parse(codexcliMcp.toRulesyncMcp().getFileContent());
       expect(json.mcpServers.slack.oauth).toEqual({ clientId: "camel-value" });
+    });
+  });
+  describe("transport normalization", () => {
+    const generate = async (mcpServers: Record<string, unknown>) => {
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({ mcpServers }),
+      });
+      const codexcliMcp = await CodexcliMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp,
+        global: false,
+      });
+      return codexcliMcp.getToml().mcp_servers as Record<string, Record<string, unknown>>;
+    };
+
+    it("splits an array command into a string command and leading args", async () => {
+      const servers = await generate({
+        local: { command: ["npx", "-y", "foo"], args: ["--verbose"] },
+        bare: { command: ["serve"] },
+      });
+
+      expect(servers.local).toEqual({ command: "npx", args: ["-y", "foo", "--verbose"] });
+      expect(servers.bare).toEqual({ command: "serve" });
+    });
+
+    it("maps httpUrl to url, letting an explicit url win", async () => {
+      const servers = await generate({
+        aliased: { type: "http", httpUrl: "https://alias.example.com/mcp" },
+        both: {
+          type: "http",
+          url: "https://url.example.com/mcp",
+          httpUrl: "https://alias.example.com/mcp",
+        },
+      });
+
+      expect(servers.aliased).toEqual({ url: "https://alias.example.com/mcp" });
+      expect(servers.both).toEqual({ url: "https://url.example.com/mcp" });
+    });
+
+    it("treats a server whose url came from httpUrl as remote when mapping headers", async () => {
+      const servers = await generate({
+        aliased: {
+          httpUrl: "https://alias.example.com/mcp",
+          headers: { "X-Team": "core" },
+        },
+      });
+
+      expect(servers.aliased).toEqual({
+        url: "https://alias.example.com/mcp",
+        http_headers: { "X-Team": "core" },
+      });
+    });
+
+    it("skips a server whose command array is empty and that has no url", async () => {
+      const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+      const servers = await generate({
+        empty: { command: [], args: ["x"] },
+        kept: { command: "serve" },
+      });
+
+      expect(servers).toEqual({ kept: { command: "serve" } });
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Skipping MCP server \"empty\": its 'command' array is empty"),
+      );
     });
   });
 });

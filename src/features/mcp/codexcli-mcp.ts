@@ -5,7 +5,7 @@ import * as smolToml from "smol-toml";
 
 import { CODEXCLI_DIR, CODEXCLI_MCP_FILE_NAME } from "../../constants/codexcli-paths.js";
 import { ValidationResult } from "../../types/ai-file.js";
-import { isEnvVarEntryArray, McpServers } from "../../types/mcp.js";
+import { isCodexcliToolConfig, isEnvVarEntryArray, McpServers } from "../../types/mcp.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
 import { warnWithFallback } from "../../utils/logger.js";
@@ -15,6 +15,11 @@ import {
 } from "../../utils/prototype-pollution.js";
 import { isPlainObject, isRecord, isStringArray } from "../../utils/type-guards.js";
 import { applySharedConfigPatch, sharedConfigFileKey } from "../shared/shared-config-gateway.js";
+import {
+  type McpServerConfig,
+  resolveLocalMcpCommand,
+  resolveRemoteMcpUrl,
+} from "./mcp-transport.js";
 import { RulesyncMcp } from "./rulesync-mcp.js";
 import {
   ToolMcp,
@@ -58,7 +63,8 @@ const MAX_REMOVE_EMPTY_ENTRIES_DEPTH = 32;
  * only add noise to a hand-edited `config.toml`. `type`/`transport` are safe to
  * drop because Codex infers the transport from `command` versus `url`.
  * `tools` is handled separately: it is fatal rather than inert.
- * @see https://github.com/openai/codex/blob/rust-v0.146.1/codex-rs/config/src/mcp_types.rs
+ * `codexcliTools` is handled separately too: it becomes Codex's `tools` table.
+ * @see https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/config/src/mcp_types.rs
  */
 const CODEX_UNSUPPORTED_CANONICAL_KEYS = new Set([
   "type",
@@ -133,41 +139,176 @@ function isValidRenamedArray(key: string, value: unknown): boolean {
 }
 
 /**
- * Translate a server's `oauth` table from the canonical rulesync shape (Claude
- * Code style camelCase) into the shape Codex CLI understands. Codex expects the
- * OAuth client id under snake_case `client_id`; without it `codex mcp login`
- * falls back to dynamic client registration and fails for providers that do not
- * support it (e.g. Slack, see #2158). The canonical `clientId` is kept alongside
- * the added `client_id` so tools that read the camelCase shape keep working and
- * the round-trip stays stable.
+ * The keys of Codex's `McpServerOAuthConfig`. Anything else in a server's
+ * `oauth` table is reported as an ignored setting at startup since Codex
+ * 0.155.0, and is never read.
+ * @see https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/config/src/mcp_types.rs
  */
-function mapOauthToCodex(oauth: Record<string, unknown>): Record<string, unknown> {
-  const result = omitPrototypePollutionKeys(oauth);
-  // Only a string client id is duplicated: Codex's `client_id` must be a bare
-  // string, and a non-string value would not be a usable OAuth client id anyway.
-  if (typeof oauth["clientId"] === "string" && !("client_id" in result)) {
-    result["client_id"] = oauth["clientId"];
+const CODEX_OAUTH_KEYS = new Set([
+  "client_id",
+  "client_secret",
+  "callback_url",
+  "callback_port",
+  "authorization_server_issuer",
+]);
+
+/** Canonical (Claude Code style) `oauth` keys Codex spells differently. */
+const RULESYNC_TO_CODEX_OAUTH_KEY_MAP: Record<string, string> = {
+  clientId: "client_id",
+  callbackPort: "callback_port",
+};
+
+const CODEX_TO_RULESYNC_OAUTH_KEY_MAP: Record<string, string> = Object.fromEntries(
+  Object.entries(RULESYNC_TO_CODEX_OAUTH_KEY_MAP).map(([canonical, codex]) => [codex, canonical]),
+);
+
+const MAX_PORT = 65535;
+
+/**
+ * Whether a value fits the Codex `oauth` key it is written to. Codex reads
+ * `callback_port` as a `u16` and every other key as a string, and a value of
+ * the wrong type fails the whole `config.toml`, not just the one server.
+ */
+function isValidCodexOauthValue(codexKey: string, value: unknown): boolean {
+  if (codexKey === "callback_port") {
+    return Number.isInteger(value) && Number(value) >= 0 && Number(value) <= MAX_PORT;
   }
-  return result;
+  return typeof value === "string";
 }
 
 /**
- * Reverse of {@link mapOauthToCodex}: collapse Codex's `oauth.client_id` back to
- * the canonical `clientId` on import. When both keys are present (the shape
- * rulesync itself emits) the canonical `clientId` wins and `client_id` is
- * dropped so a subsequent generate does not accumulate duplicates.
+ * Translate a server's `oauth` table from the canonical rulesync shape (Claude
+ * Code style camelCase) into the keys Codex CLI reads. Codex expects the OAuth
+ * client id under snake_case `client_id`; without it `codex mcp login` falls
+ * back to dynamic client registration and fails for providers that do not
+ * support it (e.g. Slack, see #2158). `clientId` → `client_id` and
+ * `callbackPort` → `callback_port` are renamed rather than duplicated, the
+ * Codex-native keys pass through (an explicit one wins over its canonical
+ * spelling), and every other key — such as Claude Code's
+ * `authServerMetadataUrl` — is dropped with a warning, since Codex would only
+ * warn about it at startup.
+ */
+function mapOauthToCodex(
+  oauth: Record<string, unknown>,
+  serverName: string,
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(oauth)) {
+    if (PROTOTYPE_POLLUTION_KEYS.has(key)) continue;
+    const codexKey = CODEX_OAUTH_KEYS.has(key)
+      ? key
+      : Object.hasOwn(RULESYNC_TO_CODEX_OAUTH_KEY_MAP, key)
+        ? RULESYNC_TO_CODEX_OAUTH_KEY_MAP[key]
+        : undefined;
+    if (codexKey === undefined) {
+      warnWithFallback(
+        undefined,
+        `[CodexCliMcp] Dropping 'oauth.${key}' from MCP server "${serverName}": Codex does not read that key in its oauth table.`,
+      );
+      continue;
+    }
+    if (codexKey !== key && Object.hasOwn(oauth, codexKey)) continue;
+    if (!isValidCodexOauthValue(codexKey, value)) {
+      warnWithFallback(
+        undefined,
+        `[CodexCliMcp] Dropping malformed 'oauth.${key}' from MCP server "${serverName}": expected ${codexKey === "callback_port" ? "a port number" : "a string"}, got ${typeof value}`,
+      );
+      continue;
+    }
+    result[codexKey] = value;
+  }
+  dropUnusableClientSecret(result, serverName);
+  return result;
+}
+
+function isBlankString(value: unknown): boolean {
+  return typeof value !== "string" || value.trim() === "";
+}
+
+/**
+ * Codex rejects a blank `client_secret`, and a `client_secret` without a
+ * non-blank `client_id`, and either error fails the whole `config.toml`. Checked
+ * after every key is translated, since the client id may arrive under either
+ * spelling and in any order.
+ */
+function dropUnusableClientSecret(oauth: Record<string, unknown>, serverName: string): void {
+  if (!Object.hasOwn(oauth, "client_secret")) return;
+  const reason = isBlankString(oauth["client_secret"])
+    ? "it is empty"
+    : isBlankString(oauth["client_id"])
+      ? "Codex requires a client id alongside it"
+      : undefined;
+  if (reason === undefined) return;
+  delete oauth["client_secret"];
+  warnWithFallback(
+    undefined,
+    `[CodexCliMcp] Dropping 'oauth.client_secret' from MCP server "${serverName}": ${reason}.`,
+  );
+}
+
+/**
+ * Reverse of {@link mapOauthToCodex}: rename Codex's `oauth.client_id` and
+ * `oauth.callback_port` back to the canonical `clientId` and `callbackPort` on
+ * import. When both spellings are present (the shape earlier rulesync versions
+ * emitted for the client id) the canonical key wins and the Codex one is
+ * dropped, so a subsequent generate does not accumulate duplicates.
  */
 function mapOauthFromCodex(oauth: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(oauth)) {
     if (PROTOTYPE_POLLUTION_KEYS.has(key)) continue;
-    if (key === "client_id") {
-      if (!("clientId" in oauth)) result["clientId"] = value;
+    const canonicalKey = Object.hasOwn(CODEX_TO_RULESYNC_OAUTH_KEY_MAP, key)
+      ? CODEX_TO_RULESYNC_OAUTH_KEY_MAP[key]
+      : undefined;
+    if (canonicalKey !== undefined) {
+      if (!Object.hasOwn(oauth, canonicalKey)) result[canonicalKey] = value;
       continue;
     }
     result[key] = value;
   }
   return result;
+}
+
+/**
+ * Rewrite the canonical transport spellings Codex cannot read into the ones it
+ * does. Codex declares `command` as a single string and accepts no `httpUrl`,
+ * and either mismatch — an array `command`, or a server left with neither
+ * `command` nor `url` — is a deserialization error that stops the whole
+ * `config.toml` from loading, not just the one server. So an array `command`
+ * is split into its program and leading `args`, and `httpUrl` becomes `url`
+ * (an explicit `url` wins). An array `command` with no program, on a server
+ * with no url either, is skipped with a warning instead. Returns a copy; the
+ * canonical config is left untouched.
+ * @see https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/config/src/mcp_types.rs
+ */
+function normalizeCodexTransport(
+  config: Record<string, unknown>,
+  serverName: string,
+): Record<string, unknown> | null {
+  const normalized = { ...config };
+  // Canonical server configs reach here already validated by RulesyncMcp.
+  const serverConfig = config as McpServerConfig;
+  if (Array.isArray(config["command"])) {
+    const [command, ...args] = resolveLocalMcpCommand(serverConfig);
+    delete normalized["command"];
+    delete normalized["args"];
+    if (command !== undefined) {
+      normalized["command"] = command;
+      if (args.length > 0) normalized["args"] = args;
+    } else if (resolveRemoteMcpUrl(serverConfig) === undefined) {
+      warnWithFallback(
+        undefined,
+        `[CodexCliMcp] Skipping MCP server "${serverName}": its 'command' array is empty and it has no url, which Codex rejects for the whole config.toml.`,
+      );
+      return null;
+    }
+  }
+  if (Object.hasOwn(config, "httpUrl")) {
+    const url = resolveRemoteMcpUrl(serverConfig);
+    delete normalized["httpUrl"];
+    if (url !== undefined) normalized["url"] = url;
+  }
+  return normalized;
 }
 
 const CODEX_MCP_SERVER_NAME_PATTERN = /^[a-zA-Z0-9_-]+$/;
@@ -194,6 +335,46 @@ function normalizeCodexMcpServerName(name: string): { codexName: string; usedFal
   return { codexName: `mcp_${hash}`, usedFallback: true };
 }
 
+/**
+ * Keep the well-formed entries of a per-tool settings table (the canonical
+ * `codexcliTools`, or Codex's own `tools`), warning about each entry dropped.
+ * Checked in both directions so a hand-written approval table can never be
+ * imported into a `.rulesync/mcp.jsonc` that the next generate would refuse
+ * to parse, and so a value that would make Codex reject the whole
+ * `config.toml` is never written. Returns `undefined` when nothing usable is
+ * left.
+ */
+function filterCodexToolConfigs({
+  value,
+  key,
+  serverName,
+}: {
+  value: unknown;
+  key: string;
+  serverName: string;
+}): Record<string, unknown> | undefined {
+  if (!isPlainObject(value)) {
+    warnWithFallback(
+      undefined,
+      `[CodexCliMcp] Ignored malformed value for '${key}' in MCP server "${serverName}": expected a table keyed by tool name`,
+    );
+    return undefined;
+  }
+  const result: Record<string, unknown> = {};
+  for (const [toolName, toolConfig] of Object.entries(value)) {
+    if (PROTOTYPE_POLLUTION_KEYS.has(toolName)) continue;
+    if (!isCodexcliToolConfig(toolConfig)) {
+      warnWithFallback(
+        undefined,
+        `[CodexCliMcp] Ignored malformed '${key}.${toolName}' in MCP server "${serverName}": approval_mode must be one of auto, prompt, writes, approve, and output_token_limit a positive integer`,
+      );
+      continue;
+    }
+    result[toolName] = omitPrototypePollutionKeys(toolConfig);
+  }
+  return Object.keys(result).length > 0 ? result : undefined;
+}
+
 /** Outcome of a key translation: no entry means the key is dropped. */
 type TranslatedKey = { entry?: [string, unknown] };
 
@@ -214,12 +395,11 @@ function translateCodexOnlyKey({
   serverName: string;
 }): TranslatedKey | undefined {
   if (key === "tools") {
-    // Codex's per-tool approval table is CLI-written state that rulesync does
-    // not model — and it is shaped nothing like the canonical `tools` string
-    // array, so lifting it would produce a `.rulesync/mcp.jsonc` the schema
-    // rejects. It stays in `config.toml`, where the generate path carries it
-    // across regenerates untouched.
-    return {};
+    // Codex's per-tool settings table is shaped nothing like the canonical
+    // `tools` string array, so it is lifted into the namespaced
+    // `codexcliTools` instead.
+    const tools = filterCodexToolConfigs({ value, key, serverName });
+    return tools ? { entry: ["codexcliTools", tools] } : {};
   }
   if (key === "http_headers") {
     // Codex's spelling of the canonical `headers`. A config rulesync wrote
@@ -281,17 +461,21 @@ function translateCanonicalKeyToCodex({
     // (`tools.<tool>.approval_mode`), while the canonical `tools` is a string
     // array. A TOML array where Codex expects a table is a serde type error
     // that takes the whole server entry down, so it is dropped rather than
-    // written. Codex's own per-tool approvals live in the same key and are
-    // preserved from the existing file instead. That is the "refuse the
+    // written. Codex's own table is authored through `codexcliTools` and
+    // preserved from the existing file. That is the "refuse the
     // canonical value" branch of the collision rule documented on
     // `enabledTools` in `src/types/mcp.ts` — it applies here because Codex's
     // same-named key means a different thing; `kiro-mcp.ts` merges instead and
     // `copilotcli-mcp.ts` lets the canonical value win instead.
     warnWithFallback(
       undefined,
-      `[CodexCliMcp] Dropping 'tools' from MCP server "${serverName}": Codex reads it as a per-tool approval table, not a tool allowlist. Use 'enabledTools' / 'disabledTools' instead.`,
+      `[CodexCliMcp] Dropping 'tools' from MCP server "${serverName}": Codex reads it as a per-tool approval table, not a tool allowlist. Use 'enabledTools' / 'disabledTools' for an allowlist, or 'codexcliTools' for per-tool approval modes.`,
     );
     return {};
+  }
+  if (key === "codexcliTools") {
+    const tools = filterCodexToolConfigs({ value, key, serverName });
+    return tools ? { entry: ["tools", tools] } : {};
   }
   if (CODEX_UNSUPPORTED_CANONICAL_KEYS.has(key)) {
     // Inert in Codex, and `type`/`transport` appear on nearly every remote
@@ -328,6 +512,110 @@ function translateCanonicalKeyToCodex({
     return {};
   }
   return undefined;
+}
+
+/**
+ * A header value that is exactly one canonical `${VAR}` reference. Anchored and
+ * without the `g` flag, so `.exec()` carries no `lastIndex` state between
+ * calls. `${VAR:-default}` does not match (the name excludes `:`), because
+ * Codex has no way to express the fallback.
+ */
+const WHOLE_ENV_VAR_REF_PATTERN = /^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$/;
+
+/**
+ * An `Authorization` value that is exactly `Bearer ${VAR}`. The scheme is
+ * matched case-insensitively, as HTTP authentication schemes are.
+ */
+const BEARER_ENV_VAR_REF_PATTERN = /^Bearer \$\{([A-Za-z_][A-Za-z0-9_]*)\}$/i;
+
+const AUTHORIZATION_HEADER_NAME = "authorization";
+
+/**
+ * Whether a string still contains an unexpanded `${…}` reference. Codex writes
+ * `url` and `http_headers` values as-is and never expands them, so such a value
+ * reaches the server literally.
+ */
+function hasUnexpandedEnvVarRef(value: string): boolean {
+  return value.includes("${");
+}
+
+/**
+ * Rewrite canonical `${VAR}` header references into the keys Codex reads them
+ * from, since Codex sends `http_headers` values verbatim:
+ * - `Authorization: Bearer ${VAR}` → `bearer_token_env_var = "VAR"`
+ * - a header whose whole value is `${VAR}` → `env_http_headers.<name> = "VAR"`
+ *
+ * Runs after every key is translated, so a `bearer_token_env_var` or
+ * `env_http_headers` the source already carries (they pass through under their
+ * own names) is seen regardless of key order. Those explicit values win: a
+ * derived bearer is not written over an existing one, and an existing
+ * `env_http_headers` entry for the same header is kept. Any value the rewrite
+ * cannot express — a partial reference, a `${VAR:-default}` fallback — stays in
+ * `http_headers` verbatim with a warning, as does a `${…}` in `url`, for which
+ * Codex has no environment-sourced counterpart at all.
+ * @see https://learn.chatgpt.com/docs/config-file/config-reference
+ */
+function convertEnvVarRefsForCodex({
+  converted,
+  serverName,
+}: {
+  converted: Record<string, unknown>;
+  serverName: string;
+}): void {
+  const url = converted["url"];
+  if (typeof url === "string" && hasUnexpandedEnvVarRef(url)) {
+    warnWithFallback(
+      undefined,
+      `[CodexCliMcp] MCP server "${serverName}": 'url' contains an environment variable reference that Codex does not expand, so it is written verbatim and the server will likely fail to start.`,
+    );
+  }
+
+  const httpHeaders = converted["http_headers"];
+  if (!isHeadersRecord(httpHeaders)) return;
+
+  const existingEnvHeaders = converted["env_http_headers"];
+  const canWriteEnvHeaders =
+    existingEnvHeaders === undefined || isHeadersRecord(existingEnvHeaders);
+  const envHeaders: Record<string, string> = {};
+  const staticHeaders: Record<string, string> = {};
+  let bearerTokenEnvVar: string | undefined;
+
+  for (const [name, value] of Object.entries(httpHeaders)) {
+    const bearerMatch = BEARER_ENV_VAR_REF_PATTERN.exec(value);
+    if (bearerMatch?.[1] && name.toLowerCase() === AUTHORIZATION_HEADER_NAME) {
+      // An explicit `bearer_token_env_var` already supplies the Authorization
+      // header, so the derived one is dropped rather than sent a second time
+      // as a literal — mirroring how an explicit `env_http_headers` entry
+      // replaces the header it names.
+      if (converted["bearer_token_env_var"] === undefined && bearerTokenEnvVar === undefined) {
+        bearerTokenEnvVar = bearerMatch[1];
+      }
+      continue;
+    }
+    const wholeMatch = WHOLE_ENV_VAR_REF_PATTERN.exec(value);
+    if (wholeMatch?.[1] && canWriteEnvHeaders) {
+      envHeaders[name] = wholeMatch[1];
+      continue;
+    }
+    if (hasUnexpandedEnvVarRef(value)) {
+      warnWithFallback(
+        undefined,
+        `[CodexCliMcp] MCP server "${serverName}": header '${name}' contains an environment variable reference that Codex cannot source from the environment, so it is written verbatim to 'http_headers' and sent literally. Only 'Authorization: Bearer \${VAR}' and a whole-value '\${VAR}' are converted.`,
+      );
+    }
+    staticHeaders[name] = value;
+  }
+
+  converted["http_headers"] = staticHeaders;
+  if (bearerTokenEnvVar !== undefined) {
+    converted["bearer_token_env_var"] = bearerTokenEnvVar;
+  }
+  if (Object.keys(envHeaders).length > 0) {
+    converted["env_http_headers"] = {
+      ...envHeaders,
+      ...(isHeadersRecord(existingEnvHeaders) ? existingEnvHeaders : {}),
+    };
+  }
 }
 
 /**
@@ -397,7 +685,46 @@ function convertFromCodexFormat(codexMcp: Record<string, unknown>): McpServers {
   return result;
 }
 
-function convertToCodexFormat(mcpServers: McpServers): Record<string, unknown> {
+/**
+ * Keys Codex refuses on each transport. Its `McpServerConfig` deserializer
+ * calls `throw_if_set` for these, and the error fails the whole `config.toml`,
+ * not just the one server, so they are dropped with a warning instead of
+ * written. Checked against `codex-rs/config/src/mcp_types.rs` at rust-v0.162.1.
+ */
+const CODEX_STDIO_REJECTED_KEYS = [
+  "url",
+  "bearer_token_env_var",
+  "bearer_token",
+  "http_headers_helper",
+  "http_headers",
+  "env_http_headers",
+  "oauth",
+  "oauth_resource",
+  "auth",
+] as const;
+const CODEX_HTTP_REJECTED_KEYS = ["args", "env", "env_vars", "cwd", "bearer_token"] as const;
+
+function dropTransportRejectedKeys({
+  converted,
+  isStdio,
+  serverName,
+}: {
+  converted: Record<string, unknown>;
+  isStdio: boolean;
+  serverName: string;
+}): void {
+  const rejected = isStdio ? CODEX_STDIO_REJECTED_KEYS : CODEX_HTTP_REJECTED_KEYS;
+  const dropped = rejected.filter((key) => converted[key] !== undefined);
+  for (const key of dropped) delete converted[key];
+  if (dropped.length > 0) {
+    warnWithFallback(
+      undefined,
+      `[CodexCliMcp] Dropping ${dropped.map((key) => `'${key}'`).join(", ")} from ${isStdio ? "stdio" : "url-based"} MCP server "${serverName}": Codex rejects ${dropped.length === 1 ? "this key" : "these keys"} on a ${isStdio ? "stdio" : "url-based"} server and would fail to load the whole config.toml.`,
+    );
+  }
+}
+
+function convertToCodexFormat(mcpServers: Record<string, unknown>): Record<string, unknown> {
   const result: Record<string, Record<string, unknown>> = {};
   const originalNames = new Map<string, string>();
 
@@ -410,9 +737,11 @@ function convertToCodexFormat(mcpServers: McpServers): Record<string, unknown> {
         `MCP server "${name}" cannot be represented as a Codex MCP server name (ASCII [a-zA-Z0-9_-] only), so the stable fallback name "${codexName}" was used. Rename the server in .rulesync/mcp.jsonc to choose a readable Codex name.`,
       );
     }
+    const normalized = normalizeCodexTransport(config, name);
+    if (!normalized) continue;
     const converted: Record<string, unknown> = {};
-    const isStdio = isCodexStdioServer(config);
-    for (const [key, value] of Object.entries(config)) {
+    const isStdio = isCodexStdioServer(normalized);
+    for (const [key, value] of Object.entries(normalized)) {
       if (PROTOTYPE_POLLUTION_KEYS.has(key)) continue;
       const translated = translateCanonicalKeyToCodex({ key, value, isStdio, serverName: name });
       if (translated) {
@@ -422,7 +751,7 @@ function convertToCodexFormat(mcpServers: McpServers): Record<string, unknown> {
           converted["enabled"] = false;
         }
       } else if (key === "oauth" && isRecord(value)) {
-        converted[key] = mapOauthToCodex(value);
+        converted[key] = mapOauthToCodex(value, name);
       } else if (Object.hasOwn(RULESYNC_TO_CODEX_FIELD_MAP, key)) {
         const mappedKey = RULESYNC_TO_CODEX_FIELD_MAP[key];
         if (mappedKey) {
@@ -451,6 +780,9 @@ function convertToCodexFormat(mcpServers: McpServers): Record<string, unknown> {
         converted[key] = value;
       }
     }
+
+    convertEnvVarRefsForCodex({ converted, serverName: name });
+    dropTransportRejectedKeys({ converted, isStdio, serverName: name });
 
     const previousName = originalNames.get(codexName);
     if (previousName !== undefined) {
@@ -559,10 +891,9 @@ export class CodexcliMcp extends ToolMcp {
     }
 
     const strippedMcpServers = rulesyncMcp.getMcpServers();
-    const rawMcpServers = rulesyncMcp.getJson().mcpServers;
     const mcpServersWithCodexFields = Object.fromEntries(
       Object.entries(strippedMcpServers).map(([serverName, serverConfig]) => {
-        const rawServer = isRecord(rawMcpServers) ? rawMcpServers[serverName] : undefined;
+        const rawServer = rulesyncMcp.getRawMcpServer(serverName);
         return [
           serverName,
           {
@@ -582,6 +913,9 @@ export class CodexcliMcp extends ToolMcp {
             ...(isRecord(rawServer) && typeof rawServer.experimentalEnvironment === "string"
               ? { experimentalEnvironment: rawServer.experimentalEnvironment }
               : {}),
+            ...(isRecord(rawServer) && rawServer.codexcliTools !== undefined
+              ? { codexcliTools: rawServer.codexcliTools }
+              : {}),
           },
         ];
       }),
@@ -600,15 +934,15 @@ export class CodexcliMcp extends ToolMcp {
 
     // Preserve per-tool approval state (`[mcp_servers.<server>.tools.<tool>]`
     // `approval_mode` decisions) that Codex's CLI writes when the user approves
-    // an MCP tool. rulesync does not model this nested `tools` table, so without
-    // re-merging it here a regenerate would wipe the user's saved approvals and
-    // re-introduce approval prompts (#1709). It is the only user/CLI-written
-    // nested state Codex persists under a server that rulesync does not own.
-    // rulesync never emits `tools` itself — the canonical `tools` array cannot
-    // be represented in Codex's approval table and is dropped on generate — so
-    // in practice the existing table is always carried over. The guard on
-    // `"tools" in serverRecord` is kept so that a future rulesync-owned `tools`
-    // value would win over the preserved table rather than be clobbered by it.
+    // an MCP tool. Without re-merging it here a regenerate would wipe the
+    // user's saved approvals and re-introduce approval prompts (#1709). It is
+    // the only user/CLI-written nested state Codex persists under a server.
+    // The table authored through `codexcliTools` is merged over it field by
+    // field: an authored field wins, and every saved tool and saved field the
+    // source does not name is kept — so authoring only `output_token_limit`
+    // for a tool does not wipe the `approval_mode` Codex saved for it.
+    // Additive like the Kiro lists, because the CLI-written and the authored
+    // entries are the same concept and both are meant to apply.
     const existingMcpServers = isRecord(configToml["mcp_servers"]) ? configToml["mcp_servers"] : {};
     const mergedMcpServers = Object.fromEntries(
       Object.entries(filteredMcpServers).map(([name, serverConfig]) => {
@@ -616,8 +950,17 @@ export class CodexcliMcp extends ToolMcp {
           ? existingMcpServers[name]
           : undefined;
         const serverRecord = serverConfig as Record<string, unknown>;
-        if (existingServer && isRecord(existingServer["tools"]) && !("tools" in serverRecord)) {
-          return [name, { ...serverRecord, tools: existingServer["tools"] }];
+        if (existingServer && isPlainObject(existingServer["tools"])) {
+          const tools = omitPrototypePollutionKeys(existingServer["tools"]);
+          const authoredTools = isPlainObject(serverRecord["tools"]) ? serverRecord["tools"] : {};
+          for (const [toolName, authored] of Object.entries(authoredTools)) {
+            const saved = tools[toolName];
+            tools[toolName] =
+              isPlainObject(saved) && isPlainObject(authored)
+                ? { ...omitPrototypePollutionKeys(saved), ...authored }
+                : authored;
+          }
+          return [name, { ...serverRecord, tools }];
         }
         return [name, serverConfig];
       }),
@@ -631,7 +974,12 @@ export class CodexcliMcp extends ToolMcp {
         fileKey: sharedConfigFileKey(paths),
         feature: "mcp",
         existingContent: configTomlFileContent,
-        patch: { mcp_servers: mergedMcpServers },
+        // With no server left the key is retracted rather than left as an
+        // empty `[mcp_servers]` table, so the file states nothing Rulesync
+        // no longer generates.
+        patch: {
+          mcp_servers: Object.keys(mergedMcpServers).length > 0 ? mergedMcpServers : undefined,
+        },
         filePath: configTomlFilePath,
       }),
       validate,

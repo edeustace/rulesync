@@ -23,6 +23,7 @@ import {
   getKimiCodeRulesyncOutputRoot,
 } from "../../utils/kimi-code.js";
 import type { Logger } from "../../utils/logger.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
 import {
   applySharedConfigPatch,
   parseSharedConfig,
@@ -84,9 +85,10 @@ function stripTrustedDirectoryWrapper(command: string): string {
  * to filter on in the first place.
  *
  * Keyed on native names because the check runs after the canonical → native
- * mapping: `SessionHeartbeat` and `Interrupt` have no canonical counterpart and
- * are only reachable through a per-tool `kimi-code` override naming them
- * directly.
+ * mapping: `SessionHeartbeat` and `Interrupt` are not mapped from a canonical
+ * event for Kimi (`Interrupt` is the shape of canonical `stopCancelled`, which
+ * other tools map, but stays native-only here) and are only reachable through
+ * a per-tool `kimi-code` override naming them directly.
  *
  * Deliberately narrower than Claude Code's equivalent set: Kimi Code's
  * `UserPromptSubmit` matches the submitted prompt text, and `PermissionResult`
@@ -140,7 +142,8 @@ function canonicalToKimiCodeHooks({
 }: {
   config: HooksConfig;
   toolOverrideHooks: HooksConfig["hooks"] | undefined;
-  trustedDirectory: string;
+  /** `undefined` emits commands verbatim, running in Kimi's session project directory. */
+  trustedDirectory: string | undefined;
   logger?: Logger;
 }): KimiCodeHookEntry[] {
   const result: KimiCodeHookEntry[] = [];
@@ -148,7 +151,8 @@ function canonicalToKimiCodeHooks({
   for (const [event, definitions] of Object.entries(
     buildEffectiveHooks(config, toolOverrideHooks),
   )) {
-    const nativeEvent = CANONICAL_TO_KIMI_CODE_EVENT_NAMES[event] ?? event;
+    const nativeEvent =
+      lookupOwn({ record: CANONICAL_TO_KIMI_CODE_EVENT_NAMES, key: event }) ?? event;
     if (!nativeEvents.has(nativeEvent)) {
       logger?.warn(`Kimi Code hooks: skipping unsupported event "${event}".`);
       continue;
@@ -167,10 +171,10 @@ function canonicalToKimiCodeHooks({
       }
       result.push({
         event: nativeEvent,
-        command: runFromTrustedDirectory({
-          command: definition.command,
-          trustedDirectory,
-        }),
+        command:
+          trustedDirectory === undefined
+            ? definition.command
+            : runFromTrustedDirectory({ command: definition.command, trustedDirectory }),
         ...resolveMatcherPart({ matcher: definition.matcher, nativeEvent, logger }),
         ...(validTimeout && timeout !== undefined && { timeout }),
       });
@@ -192,14 +196,17 @@ function kimiCodeHooksToCanonical(hooks: unknown): HooksConfig["hooks"] {
     if (typeof entry.event !== "string" || typeof entry.command !== "string") {
       continue;
     }
-    const event = KIMI_CODE_TO_CANONICAL_EVENT_NAMES[entry.event] ?? entry.event;
+    const event =
+      lookupOwn({ record: KIMI_CODE_TO_CANONICAL_EVENT_NAMES, key: entry.event }) ?? entry.event;
     const definition: HookDefinition = {
       type: "command",
       command: stripTrustedDirectoryWrapper(entry.command),
       ...(typeof entry.matcher === "string" && { matcher: entry.matcher }),
       ...(typeof entry.timeout === "number" && { timeout: entry.timeout }),
     };
-    (result[event] ??= []).push(definition);
+    const list = lookupOwn({ record: result, key: event }) ?? [];
+    list.push(definition);
+    result[event] = list;
   }
   return result;
 }
@@ -289,7 +296,12 @@ export class KimiCodeHooks extends ToolHooks {
           hooks: canonicalToKimiCodeHooks({
             config,
             toolOverrideHooks: config["kimi-code"]?.hooks,
-            trustedDirectory: resolve(rulesyncHooks.getOutputRoot()),
+            // `runFromSourceDirectory: false` opts out of the trusted-directory
+            // wrapper so hooks run in the session project, as Kimi does natively.
+            trustedDirectory:
+              config["kimi-code"]?.runFromSourceDirectory === false
+                ? undefined
+                : resolve(rulesyncHooks.getOutputRoot()),
             logger,
           }),
         },

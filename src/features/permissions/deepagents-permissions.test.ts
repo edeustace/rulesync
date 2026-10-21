@@ -1,0 +1,1569 @@
+import { join } from "node:path";
+
+import * as smolToml from "smol-toml";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+import { createMockLogger } from "../../test-utils/mock-logger.js";
+import { setupTestDirectory } from "../../test-utils/test-directories.js";
+import { fileExists, readFileContent, writeFileContent } from "../../utils/file.js";
+import { fallbackLogger } from "../../utils/logger.js";
+import { isRecord } from "../../utils/type-guards.js";
+import { DeepagentsPermissions } from "./deepagents-permissions.js";
+import { PermissionsProcessor } from "./permissions-processor.js";
+import { RulesyncPermissions } from "./rulesync-permissions.js";
+
+function rulesyncPermissions(config: Record<string, unknown>): RulesyncPermissions {
+  return new RulesyncPermissions({
+    relativeDirPath: ".rulesync",
+    relativeFilePath: "permissions.json",
+    fileContent: JSON.stringify(config),
+  });
+}
+
+function tableOf(tomlContent: string, key: string): Record<string, unknown> {
+  const parsed = smolToml.parse(tomlContent);
+  return isRecord(parsed[key]) ? parsed[key] : {};
+}
+
+function allowListOf(tomlContent: string): unknown {
+  return tableOf(tomlContent, "shell").allow_list;
+}
+
+describe("DeepagentsPermissions", () => {
+  let testDir: string;
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ testDir, cleanup } = await setupTestDirectory());
+    vi.spyOn(process, "cwd").mockReturnValue(testDir);
+  });
+
+  afterEach(async () => {
+    await cleanup();
+    vi.restoreAllMocks();
+  });
+
+  const generate = async ({
+    config,
+    logger,
+  }: {
+    config: Record<string, unknown>;
+    logger?: ReturnType<typeof createMockLogger>;
+  }): Promise<string> => {
+    const permissions = await DeepagentsPermissions.fromRulesyncPermissions({
+      outputRoot: testDir,
+      rulesyncPermissions: rulesyncPermissions(config),
+      global: true,
+      ...(logger !== undefined && { logger }),
+    });
+    return permissions.getFileContent();
+  };
+
+  const importFrom = (tomlContent: string): Record<string, unknown> => {
+    const permissions = new DeepagentsPermissions({
+      outputRoot: testDir,
+      relativeDirPath: ".deepagents",
+      relativeFilePath: "config.toml",
+      fileContent: tomlContent,
+      validate: false,
+      global: true,
+    });
+    return JSON.parse(permissions.toRulesyncPermissions().getFileContent());
+  };
+
+  describe("getSettablePaths", () => {
+    it("targets the user config, which lives beside the agent directory", () => {
+      const paths = DeepagentsPermissions.getSettablePaths({ global: true });
+      expect(paths.relativeDirPath).toBe(".deepagents");
+      expect(paths.relativeFilePath).toBe("config.toml");
+    });
+  });
+
+  describe("isDeletable", () => {
+    it("is never deletable (config.toml holds every dcode setting)", () => {
+      const permissions = new DeepagentsPermissions({
+        relativeDirPath: ".deepagents",
+        relativeFilePath: "config.toml",
+        fileContent: "",
+        validate: false,
+      });
+      expect(permissions.isDeletable()).toBe(false);
+    });
+  });
+
+  describe("shouldSkipCreationWhenPayloadEmpty", () => {
+    let homeDir: string;
+    let cleanupHome: () => Promise<void>;
+
+    beforeEach(async () => {
+      ({ testDir: homeDir, cleanup: cleanupHome } = await setupTestDirectory({ home: true }));
+      // `getHomeDirectory()` honours HOME_DIR ahead of everything else, so the
+      // pseudo-home is reached without module-mocking the whole file utils.
+      vi.stubEnv("HOME_DIR", homeDir);
+    });
+
+    afterEach(async () => {
+      vi.unstubAllEnvs();
+      await cleanupHome();
+    });
+
+    const configPath = (): string => join(homeDir, ".deepagents", "config.toml");
+
+    const generateThroughProcessor = async (config: Record<string, unknown>): Promise<void> => {
+      const processor = new PermissionsProcessor({
+        logger: createMockLogger(),
+        outputRoot: homeDir,
+        toolTarget: "deepagents",
+        global: true,
+      });
+      const toolFiles = await processor.convertRulesyncFilesToToolFiles([
+        rulesyncPermissions(config),
+      ]);
+      await processor.writeAiFiles(toolFiles);
+    };
+
+    it("is skipped: config.toml is dcode's file, not one to conjure for an empty payload", () => {
+      const permissions = new DeepagentsPermissions({
+        relativeDirPath: ".deepagents",
+        relativeFilePath: "config.toml",
+        fileContent: "",
+        validate: false,
+      });
+      expect(permissions.shouldSkipCreationWhenPayloadEmpty()).toBe(true);
+    });
+
+    it("does not create config.toml when nothing maps and the file does not exist", async () => {
+      // `permission: {}` maps to no allowlist, so `[shell]` is dropped and the
+      // serialized payload is a lone newline — a file that would say nothing.
+      await generateThroughProcessor({ permission: {} });
+
+      expect(await fileExists(configPath())).toBe(false);
+    });
+
+    it("still creates config.toml when an allow rule maps", async () => {
+      await generateThroughProcessor({ permission: { bash: { "git *": "allow" } } });
+
+      expect(allowListOf(await readFileContent(configPath()))).toEqual(["git"]);
+    });
+
+    it("still rewrites an existing config.toml when nothing maps", async () => {
+      await writeFileContent(
+        configPath(),
+        '[shell]\nallow_list = ["git"]\n\n[model]\nname = "gpt"\n',
+      );
+
+      await generateThroughProcessor({ permission: {} });
+
+      // The stale allowlist is removed, and the unrelated table survives, so
+      // the skip never withholds a write from a file the user already has.
+      const content = await readFileContent(configPath());
+      expect(allowListOf(content)).toBeUndefined();
+      expect(tableOf(content, "model")).toEqual({ name: "gpt" });
+    });
+  });
+
+  describe("global-only", () => {
+    it("fromRulesyncPermissions throws without global", async () => {
+      await expect(
+        DeepagentsPermissions.fromRulesyncPermissions({
+          outputRoot: testDir,
+          rulesyncPermissions: rulesyncPermissions({ permission: { bash: { "git *": "allow" } } }),
+        }),
+      ).rejects.toThrow(/global-only/);
+    });
+
+    it("fromFile throws without global", async () => {
+      await expect(DeepagentsPermissions.fromFile({ outputRoot: testDir })).rejects.toThrow(
+        /global-only/,
+      );
+    });
+  });
+
+  describe("fromRulesyncPermissions", () => {
+    it("writes bash allow rules as executable names", async () => {
+      const content = await generate({
+        config: { permission: { bash: { "git *": "allow", ls: "allow" } } },
+      });
+
+      expect(allowListOf(content)).toEqual(["git", "ls"]);
+    });
+
+    it("reduces a pattern that carries arguments and says it widened the rule", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "git commit:*": "allow" } } },
+        logger,
+      });
+
+      // dcode matches the executable name only, so `git push` is auto-approved
+      // too now. Silently narrowing to nothing would be worse, but this is a
+      // real widening and has to be visible.
+      expect(allowListOf(content)).toEqual(["git"]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("were widened"));
+    });
+
+    it("treats a trailing `:*` on the executable as 'any arguments'", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "git:*": "allow" } } },
+        logger,
+      });
+
+      expect(allowListOf(content)).toEqual(["git"]);
+      expect(logger.warn).not.toHaveBeenCalledWith(expect.stringContaining("were widened"));
+    });
+
+    it("emits the `all` sentinel alone for the wildcard pattern, and warns", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "*": "allow", "git *": "allow" } } },
+        logger,
+      });
+
+      // Upstream rejects the whole option when `all` shares the list, so the
+      // otherwise-redundant `git` entry must not be written beside it.
+      expect(allowListOf(content)).toEqual(["all"]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("skips its dangerous-pattern check"),
+      );
+    });
+
+    it("skips a pattern whose executable token still holds a glob", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "npm-*": "allow", ls: "allow" } } },
+        logger,
+      });
+
+      // Written verbatim it would match no command, which reads as an allow
+      // rule that quietly does nothing.
+      expect(allowListOf(content)).toEqual(["ls"]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("were therefore skipped"));
+    });
+
+    it("skips a pattern that reduces to a sentinel name", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "recommended *": "allow", ls: "allow" } } },
+        logger,
+      });
+
+      // `recommended` would splice in a list rulesync did not author.
+      expect(allowListOf(content)).toEqual(["ls"]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("as sentinels"));
+    });
+
+    it("reports bash deny rules it cannot represent", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "rm *": "deny", ls: "allow" } } },
+        logger,
+      });
+
+      expect(allowListOf(content)).toEqual(["ls"]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("has no command denylist"));
+    });
+
+    it("writes nothing for `ask` rules, which are already the default", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "curl *": "ask" } } },
+        logger,
+      });
+
+      expect(smolToml.parse(content).shell).toBeUndefined();
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("reports deny rules of categories it does not model", async () => {
+      const logger = createMockLogger();
+
+      await generate({
+        config: { permission: { read: { ".env": "deny" } } },
+        logger,
+      });
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("'read' deny and ask rules"),
+      );
+    });
+
+    it("merges into an existing config.toml and leaves unrelated tables alone", async () => {
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[models]\ndefault = "anthropic:claude-opus-4"\n\n[shell]\ntimeout = 120\nallow_list = ["cat"]\n',
+      );
+
+      const content = await generate({
+        config: { permission: { bash: { "git *": "allow" } } },
+      });
+
+      const parsed = smolToml.parse(content);
+      expect(isRecord(parsed.models) ? parsed.models.default : undefined).toBe(
+        "anthropic:claude-opus-4",
+      );
+      expect(tableOf(content, "shell").timeout).toBe(120);
+      // The allowlist itself is rulesync-owned, so it is replaced rather than
+      // added to.
+      expect(allowListOf(content)).toEqual(["git"]);
+    });
+
+    it("drops the allowlist when nothing maps, without leaving an empty table", async () => {
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[shell]\nallow_list = ["cat"]\n',
+      );
+
+      const content = await generate({ config: { permission: {} } });
+
+      expect(smolToml.parse(content).shell).toBeUndefined();
+    });
+
+    it("keeps the rest of [shell] when only the allowlist is dropped", async () => {
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[shell]\nallow_list = ["cat"]\ntimeout = 120\n',
+      );
+
+      const content = await generate({ config: { permission: {} } });
+
+      expect(tableOf(content, "shell")).toEqual({ timeout: 120 });
+    });
+
+    it("does not create the config file as a side effect of generating", async () => {
+      await generate({ config: { permission: { bash: { "git *": "allow" } } } });
+
+      // `fromRulesyncPermissions` only builds the content; nothing should have
+      // been written to the user's home directory by reading it.
+      const permissions = await DeepagentsPermissions.fromFile({
+        outputRoot: testDir,
+        global: true,
+      });
+      expect(permissions.getFileContent()).toBe("");
+    });
+
+    it("merges the deepagents override's startup keys", async () => {
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[startup]\nrecent = "auto"\n',
+      );
+
+      const content = await generate({
+        config: {
+          permission: {},
+          deepagents: { startup: { mode: "auto", yolo_switcher: false } },
+        },
+      });
+
+      expect(tableOf(content, "startup")).toEqual({
+        recent: "auto",
+        mode: "auto",
+        yolo_switcher: false,
+      });
+    });
+
+    it("treats the `*:*` spelling of the wildcard as the wildcard", async () => {
+      const content = await generate({ config: { permission: { bash: { "*:*": "allow" } } } });
+
+      expect(allowListOf(content)).toEqual(["all"]);
+    });
+
+    it("treats the `* *` spelling of the wildcard as the wildcard", async () => {
+      const content = await generate({ config: { permission: { bash: { "* *": "allow" } } } });
+
+      expect(allowListOf(content)).toEqual(["all"]);
+    });
+
+    it("skips an executable spelled with quotes, which dcode reads without them", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { '"git" *': "allow" } } },
+        logger,
+      });
+
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("were therefore skipped"));
+    });
+
+    it("skips an executable longer than any name a filesystem can hold", async () => {
+      const logger = createMockLogger();
+      const name = "a".repeat(300);
+
+      const content = await generate({
+        config: { permission: { bash: { [`${name} *`]: "allow" } } },
+        logger,
+      });
+
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("were therefore skipped"));
+    });
+
+    it("catches an escaped ask against the allow dcode reads it as", async () => {
+      const logger = createMockLogger();
+
+      await generate({
+        config: { permission: { bash: { "git *": "allow", "\\git push": "ask" } } },
+        logger,
+      });
+
+      // `shlex.split` drops the backslash, so dcode compares `git` either way.
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask rule(s) \\git push were withheld from allow_list"),
+      );
+    });
+
+    it("catches a quoted glob deny against the allow it covers", async () => {
+      const logger = createMockLogger();
+
+      await generate({
+        config: { permission: { bash: { "npm *": "allow", '"npm*" publish': "deny" } } },
+        logger,
+      });
+
+      // The quotes come off before the glob is walked, so the odd spelling does
+      // not hide the collision with `npm`.
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('deny rule(s) "npm*" publish were withheld from allow_list'),
+      );
+    });
+
+    it("catches a quoted ask against the allow it collides with once unquoted", async () => {
+      const logger = createMockLogger();
+
+      await generate({
+        config: { permission: { bash: { "git *": "allow", '"git" push': "ask" } } },
+        logger,
+      });
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('ask rule(s) "git" push were withheld from allow_list'),
+      );
+    });
+
+    it("refuses to write `all` when the config also denies commands", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "*": "allow", "rm -rf *": "deny" } } },
+        logger,
+      });
+
+      // `all` would switch off the dangerous-pattern check as well, leaving the
+      // user with less than dcode's own default in the name of a deny rule.
+      expect(smolToml.parse(content).shell).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("was not written as allow_list"),
+      );
+    });
+
+    it("withholds the allow whose executable a deny rule covers", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "git *": "allow", "git push": "deny" } } },
+        logger,
+      });
+
+      // dcode has no denylist to settle the collision in, so writing `git`
+      // would auto-approve the `git push` this config denies. Dropping it
+      // leaves `git` prompting, which is the closest dcode comes to a deny.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("deny rule(s) git push were withheld from allow_list"),
+      );
+      // The generic "asked about, not blocked" wording would be wrong here:
+      // the allow that covered `git push` is gone, so nothing was skipped.
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("has no command denylist"),
+      );
+    });
+
+    it("keeps the allow rules a deny rule does not cover", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "git *": "allow", "ls *": "allow", "git push": "deny" } } },
+        logger,
+      });
+
+      // Only the colliding executable goes: withholding the whole list would
+      // punish rules the deny rule says nothing about.
+      expect(allowListOf(content)).toEqual(["ls"]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("deny rule(s) git push were withheld from allow_list"),
+      );
+    });
+
+    it("withholds the allow an all-tools deny covers", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { "*": { "rm *": "deny" }, bash: { "rm *": "allow" } } },
+        logger,
+      });
+
+      // A rule under `*` covers shell commands too, so reading only `bash`
+      // would auto-approve the very command the file denies without saying so.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("deny rule(s) rm * were withheld from allow_list"),
+      );
+    });
+
+    it("refuses to write `all` when the all-tools category denies commands", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { "*": { "rm -rf *": "deny" }, bash: { "*": "allow" } } },
+        logger,
+      });
+
+      expect(smolToml.parse(content).shell).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("was not written as allow_list"),
+      );
+    });
+
+    it("withholds the allow an all-tools ask covers", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { "*": { "npm publish": "ask" }, bash: { "npm *": "allow" } } },
+        logger,
+      });
+
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask rule(s) npm publish were withheld from allow_list"),
+      );
+    });
+
+    it("ignores the all-tools category's allow rules, and says so", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { "*": { "src/**": "allow" }, bash: { "git *": "allow" } } },
+        logger,
+      });
+
+      // `src/**` is a path, not a command; carrying it into the allow_list
+      // would grant something the author never said about commands. The skip
+      // is still reported, so the rule is not dropped in silence.
+      expect(allowListOf(content)).toEqual(["git"]);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("deepagents-cli reads the all-tools '*' category"),
+      );
+    });
+
+    it("withholds the allow whose executable an ask rule covers", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "npm *": "allow", "npm publish": "ask" } } },
+        logger,
+      });
+
+      // Auto-approving `npm` would run the `npm publish` the author wanted to
+      // be asked about, so the allow gives way to the stricter rule.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask rule(s) npm publish were withheld from allow_list"),
+      );
+    });
+
+    it("skips a pattern whose executable dcode would never compare", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "git;rm *": "allow", ls: "allow" } } },
+        logger,
+      });
+
+      // Writing it would put a rule in the user's global config that can never
+      // fire, and the import direction already refuses to read one back.
+      expect(allowListOf(content)).toEqual(["ls"]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("were therefore skipped"));
+    });
+
+    it("reports a bare executable as widened, since dcode holds no arguments", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { rm: "allow" } } },
+        logger,
+      });
+
+      // Canonically `rm` means `rm` with no arguments; in dcode it auto-approves
+      // `rm -rf /` too, so the narrow spelling widens further than the loud one.
+      expect(allowListOf(content)).toEqual(["rm"]);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("were widened"));
+    });
+
+    it("catches an ask that names arguments even when its executable is a glob", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "npm *": "allow", "npm* publish": "ask" } } },
+        logger,
+      });
+
+      // The ask's executable is a glob, so it collides with every allowed name
+      // it matches — each of those entries is withheld.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask rule(s) npm* publish were withheld from allow_list"),
+      );
+    });
+
+    it("catches an ask spelled with the trailing `:*`", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "npm *": "allow", "npm:*": "ask" } } },
+        logger,
+      });
+
+      // The two spellings mean the same thing, so the ask cancels the allow
+      // outright rather than narrowing it.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask rule(s) npm:* were withheld from allow_list"),
+      );
+    });
+
+    it("catches a restriction that names arguments rather than an executable", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: {
+          permission: { bash: { "kubectl *": "allow" }, "*": { "*delete*": "deny" } },
+        },
+        logger,
+      });
+
+      // An allowed `kubectl` runs `kubectl delete pod foo` unasked, so the deny
+      // covers commands the entry auto-approves even though it names no
+      // executable of its own — reading only its first token would write the
+      // allow and drop the guardrail in silence.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("deny rule(s) *delete* were withheld from allow_list"),
+      );
+    });
+
+    it("catches an argument-only ask beside the allow it covers", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "docker *": "allow", "*--privileged*": "ask" } } },
+        logger,
+      });
+
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask rule(s) *--privileged* were withheld from allow_list"),
+      );
+    });
+
+    it("keeps an allow whose commands a restriction on other arguments never reaches", async () => {
+      const content = await generate({
+        config: { permission: { bash: { "git *": "allow", "npm publish *": "deny" } } },
+      });
+
+      // `npm publish *` matches nothing `git` runs, so the allow stands — the
+      // collision test withholds what a restriction covers, not everything.
+      expect(allowListOf(content)).toEqual(["git"]);
+    });
+
+    it("catches a bare-executable ask", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "npm *": "allow", npm: "ask" } } },
+        logger,
+      });
+
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask rule(s) npm were withheld from allow_list"),
+      );
+    });
+
+    it("catches a blanket ask, which the allow beside it does not narrow", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "*": "ask", "git *": "allow" } } },
+        logger,
+      });
+
+      // Canonically the stricter rule wins whatever its width, so this asks
+      // about `git` too — and the allow beside it gives way.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("ask rule(s) * were withheld from allow_list"),
+      );
+    });
+
+    it("catches a deny whose executable is itself a glob", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "npm *": "allow", "npm*": "deny" } } },
+        logger,
+      });
+
+      // `*` is only the widest spelling of a glob executable; `npm*` covers the
+      // generated `npm` just as surely, so it is withheld all the same.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("deny rule(s) npm* were withheld from allow_list"),
+      );
+    });
+
+    it("withholds every allow a blanket deny covers", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "*": "deny", "git *": "allow" } } },
+        logger,
+      });
+
+      // The widest deny an author can write covers the whole list, so nothing
+      // is auto-approved and dcode asks before every command.
+      expect(allowListOf(content)).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("deny rule(s) * were withheld from allow_list"),
+      );
+    });
+
+    it("refuses to write `all` when an ask rule asks to be prompted", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "*": "allow", "npm publish": "ask" } } },
+        logger,
+      });
+
+      // `all` approves every command unseen and switches the dangerous-pattern
+      // check off with it, which is the opposite of what an `ask` asks for — so
+      // the sentinel gives way exactly as it does to a deny rule.
+      expect(smolToml.parse(content).shell).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("your config asks before running commands"),
+      );
+    });
+
+    it("does not call a withheld allow rule auto-approved", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "git push": "allow", "git *": "deny" } } },
+        logger,
+      });
+
+      // Reducing `git push` to `git` widens it, but the deny rule then withholds
+      // that entry — so the warning about widening would announce an approval
+      // the file does not carry.
+      expect(smolToml.parse(content).shell).toBeUndefined();
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("were widened to their first token"),
+      );
+    });
+
+    it("refuses to write `all` when another tool's rule asks to be prompted", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: { bash: { "*": "allow" }, webfetch: { "*": "ask" } } },
+        logger,
+      });
+
+      // `all` switches dcode's dangerous-pattern check off for every command,
+      // so a config that asks about anything is already stricter than the
+      // sentinel — an `ask` written for another tool no less than a deny.
+      expect(smolToml.parse(content).shell).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("your config restricts 'webfetch'"),
+      );
+    });
+
+    it("names the other tool's rules when they are what blocked the sentinel", async () => {
+      const logger = createMockLogger();
+
+      await generate({
+        config: { permission: { bash: { "*": "allow" }, read: { "./.env": "deny" } } },
+        logger,
+      });
+
+      // No bash deny rule exists, so "your config denies commands" would describe
+      // a rule the author never wrote.
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("your config restricts 'read'"),
+      );
+    });
+
+    it("refuses to write dcode's app-managed `recent`", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { startup: { recent: "auto" } } },
+        logger,
+      });
+
+      // With no explicit `mode`, dcode restores `recent` at launch, so a
+      // repository could switch a machine into auto-approval through it.
+      expect(smolToml.parse(content).startup).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("dcode manages that key itself"),
+      );
+    });
+
+    it("says nothing about a startup key it could not write", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { startup: { future_key: null } } },
+        logger,
+      });
+
+      // TOML has no null, so smol-toml drops the key; naming it would describe
+      // a setting the file does not hold.
+      expect(smolToml.parse(content).startup).toBeUndefined();
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("names a startup key it cannot judge", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { startup: { something_new: true } } },
+        logger,
+      });
+
+      // The override is loose so upstream additions still reach the config,
+      // but the file it lands in is the machine's global one.
+      expect(tableOf(content, "startup")).toEqual({ something_new: true });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("something_new"));
+    });
+
+    it("says nothing about a boolean startup key already true by default", async () => {
+      const logger = createMockLogger();
+
+      await generate({
+        config: { permission: {}, deepagents: { startup: { read_project_dotenv: true } } },
+        logger,
+      });
+
+      // Upstream defaults it to true, so this grants nothing; warning here
+      // would bury the case where the user had turned it off.
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("warns that a startup override relaxes the machine's global config", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { startup: { mode: "yolo" } } },
+        logger,
+      });
+
+      expect(tableOf(content, "startup")).toEqual({ mode: "yolo" });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('mode = "yolo"'));
+    });
+
+    it("names the value a startup override replaces", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        "[startup]\nread_project_dotenv = false\n",
+      );
+
+      await generate({
+        config: { permission: {}, deepagents: { startup: { read_project_dotenv: true } } },
+        logger,
+      });
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("read_project_dotenv = true (was false)"),
+      );
+    });
+
+    it("says nothing about a startup override that grants nothing", async () => {
+      const logger = createMockLogger();
+
+      await generate({
+        config: { permission: {}, deepagents: { startup: { mode: "manual" } } },
+        logger,
+      });
+
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("writes the extensions gate into `[extensions]` (issue #2956)", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: {
+          permission: {},
+          deepagents: { extensions: { enabled: false, trust: "never" } },
+        },
+        logger,
+      });
+
+      expect(tableOf(content, "extensions")).toEqual({ enabled: false, trust: "never" });
+      // Both restrict what dcode loads, so neither is a relaxation to report.
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("keeps an extensions key the user set beside the gate", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[extensions]\nextra_paths = ["tools"]\n',
+      );
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { extensions: { trust: "never" } } },
+        logger,
+      });
+
+      expect(tableOf(content, "extensions")).toEqual({
+        extra_paths: ["tools"],
+        trust: "never",
+      });
+    });
+
+    it("names an extensions key it cannot judge", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { extensions: { extra_paths: ["tools"] } } },
+        logger,
+      });
+
+      // `extra_paths` is not modeled, but the override is loose so it still
+      // reaches the machine's global config — named rather than passed silently.
+      expect(tableOf(content, "extensions")).toEqual({ extra_paths: ["tools"] });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("extra_paths"));
+    });
+
+    it("warns that an extensions override relaxes the machine's global config", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { extensions: { trust: "always" } } },
+        logger,
+      });
+
+      // `always` imports a checked-out project's Python with no prompt at all.
+      expect(tableOf(content, "extensions")).toEqual({ trust: "always" });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('trust = "always"'));
+    });
+
+    it("says nothing about `enabled` already true by default", async () => {
+      const logger = createMockLogger();
+
+      await generate({
+        config: { permission: {}, deepagents: { extensions: { enabled: true } } },
+        logger,
+      });
+
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("names the value an extensions override replaces", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        "[extensions]\nenabled = false\n",
+      );
+
+      await generate({
+        config: { permission: {}, deepagents: { extensions: { enabled: true } } },
+        logger,
+      });
+
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("enabled = true (was false)"),
+      );
+    });
+
+    it("leaves an `extensions` that is not a table untouched", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(join(testDir, ".deepagents", "config.toml"), 'extensions = "none"\n');
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { extensions: { trust: "never" } } },
+        logger,
+      });
+
+      expect(smolToml.parse(content).extensions).toBe("none");
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("is not a table"));
+    });
+
+    it("writes the project MCP deny list into `[mcp]` (issue #3076)", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: {
+          permission: {},
+          deepagents: { mcp: { disabled_project_servers: ["filesystem", "shell"] } },
+        },
+        logger,
+      });
+
+      expect(tableOf(content, "mcp")).toEqual({
+        disabled_project_servers: ["filesystem", "shell"],
+      });
+      // A deny list only restricts, so there is no relaxation to report.
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("keeps the approval store the user built beside the deny list", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[mcp]\ndisabled_servers = ["old"]\n\n[mcp.enabled_project_server_approvals]\nfilesystem = { fingerprint = "abc" }\n',
+      );
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { mcp: { disabled_project_servers: ["shell"] } } },
+        logger,
+      });
+
+      expect(tableOf(content, "mcp")).toEqual({
+        disabled_servers: ["old"],
+        enabled_project_server_approvals: { filesystem: { fingerprint: "abc" } },
+        disabled_project_servers: ["shell"],
+      });
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("never writes the approval store from a permissions file", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: {
+          permission: {},
+          deepagents: {
+            mcp: {
+              disabled_project_servers: ["shell"],
+              enabled_project_server_approvals: { filesystem: { fingerprint: "abc" } },
+            },
+          },
+        },
+        logger,
+      });
+
+      // A repository must not pre-approve its own project MCP servers — and
+      // unlike a harmless unknown key, the attempt is named.
+      expect(tableOf(content, "mcp")).toEqual({ disabled_project_servers: ["shell"] });
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("'enabled_project_server_approvals' was not written"),
+      );
+    });
+
+    it("warns when the mcp override re-enables a server the machine had rejected", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[mcp]\ndisabled_project_servers = ["filesystem", "shell"]\n',
+      );
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { mcp: { disabled_project_servers: ["shell"] } } },
+        logger,
+      });
+
+      expect(tableOf(content, "mcp")).toEqual({ disabled_project_servers: ["shell"] });
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('removed "filesystem" from [mcp].disabled_project_servers'),
+      );
+    });
+
+    it("reads a comma-separated deny list the way dcode does before comparing", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[mcp]\ndisabled_project_servers = "filesystem, shell"\n',
+      );
+
+      await generate({
+        config: {
+          permission: {},
+          deepagents: { mcp: { disabled_project_servers: ["shell", "filesystem"] } },
+        },
+        logger,
+      });
+
+      // Same names in another order and another spelling: nothing re-enabled.
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+
+    it("names an mcp key it cannot judge", async () => {
+      const logger = createMockLogger();
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { mcp: { disabled_servers: ["viewer"] } } },
+        logger,
+      });
+
+      expect(tableOf(content, "mcp")).toEqual({ disabled_servers: ["viewer"] });
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("disabled_servers"));
+    });
+
+    it("leaves an `mcp` that is not a table untouched", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(join(testDir, ".deepagents", "config.toml"), 'mcp = "none"\n');
+
+      const content = await generate({
+        config: { permission: {}, deepagents: { mcp: { disabled_project_servers: ["shell"] } } },
+        logger,
+      });
+
+      expect(smolToml.parse(content).mcp).toBe("none");
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("is not a table"));
+    });
+
+    it("merges every override block into the same file", async () => {
+      const content = await generate({
+        config: {
+          permission: {},
+          deepagents: {
+            startup: { mode: "manual" },
+            extensions: { trust: "never" },
+            mcp: { disabled_project_servers: ["shell"] },
+          },
+        },
+      });
+
+      expect(tableOf(content, "startup")).toEqual({ mode: "manual" });
+      expect(tableOf(content, "extensions")).toEqual({ trust: "never" });
+      expect(tableOf(content, "mcp")).toEqual({ disabled_project_servers: ["shell"] });
+    });
+
+    it("leaves a `shell` that parsed as a datetime untouched", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(join(testDir, ".deepagents", "config.toml"), "shell = 1979-05-27\n");
+
+      const content = await generate({
+        config: { permission: { bash: { ls: "allow" } } },
+        logger,
+      });
+
+      // smol-toml returns a datetime as a `Date` subclass. That is a record but
+      // not a table, and spreading it would drop the value the file holds.
+      expect(smolToml.parse(content).shell).toBeInstanceOf(Date);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("is not a table"));
+    });
+
+    it("leaves a `shell` that is not a table untouched", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(join(testDir, ".deepagents", "config.toml"), 'shell = "bash"\n');
+
+      const content = await generate({
+        config: { permission: { bash: { ls: "allow" } } },
+        logger,
+      });
+
+      expect(smolToml.parse(content).shell).toBe("bash");
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("is not a table"));
+    });
+
+    it("says nothing about an allowlist it could not write", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(join(testDir, ".deepagents", "config.toml"), 'shell = "bash"\n');
+
+      const content = await generate({
+        config: { permission: { bash: { "*": "allow" } } },
+        logger,
+      });
+
+      // The `all` sentinel warning describes a global auto-approve. Nothing was
+      // written here, so saying it would describe a relaxation that never
+      // happened.
+      expect(smolToml.parse(content).shell).toBe("bash");
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("auto-approves every command"),
+      );
+    });
+
+    it("still reports a deny it could not express when it wrote nothing", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(join(testDir, ".deepagents", "config.toml"), 'shell = "bash"\n');
+
+      await generate({
+        config: { permission: { bash: { "git *": "allow", "git push": "deny" } } },
+        logger,
+      });
+
+      // dcode has no denylist whatever this run wrote, and "allow_list was left
+      // untouched" does not say so. The deny is *only* unenforced here, though:
+      // nothing was written for it to collide with.
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("has no command denylist"));
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("are not merely unenforced"),
+      );
+    });
+
+    it("reports removing an allowlist the user had curated", async () => {
+      const logger = createMockLogger();
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[shell]\nallow_list = ["recommended"]\n',
+      );
+
+      await generate({ config: { permission: {} }, logger });
+
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("was removed"));
+    });
+
+    it("throws a descriptive error when the existing config.toml is malformed", async () => {
+      await writeFileContent(join(testDir, ".deepagents", "config.toml"), "[shell\n");
+
+      await expect(generate({ config: { permission: { bash: { ls: "allow" } } } })).rejects.toThrow(
+        /Failed to parse existing deepagents config/,
+      );
+    });
+  });
+
+  describe("toRulesyncPermissions", () => {
+    it("lifts allowlist entries back as bash allow rules", () => {
+      expect(importFrom('[shell]\nallow_list = ["git", "ls"]\n')).toEqual({
+        permission: { bash: { git: "allow", ls: "allow" } },
+      });
+    });
+
+    it("reads the comma-separated string spelling too", () => {
+      expect(importFrom('[shell]\nallow_list = "git, ls"\n')).toEqual({
+        permission: { bash: { git: "allow", ls: "allow" } },
+      });
+    });
+
+    it("lifts the `all` sentinel as the wildcard pattern", () => {
+      expect(importFrom('[shell]\nallow_list = ["all"]\n')).toEqual({
+        permission: { bash: { "*": "allow" } },
+      });
+    });
+
+    it("imports nothing when `all` shares the list with command names", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      // dcode raises on that combination and ignores the option, so the
+      // commands beside it are not actually auto-approved.
+      expect(importFrom('[shell]\nallow_list = ["all", "git"]\n')).toEqual({ permission: {} });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("mixes 'all' with command names"));
+    });
+
+    it("drops the `recommended` sentinel rather than expanding it", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      expect(importFrom('[shell]\nallow_list = ["recommended", "git"]\n')).toEqual({
+        permission: { bash: { git: "allow" } },
+      });
+      // The next generate drops the curated commands, which fails closed but
+      // silently — so the drop is named where every other skipped entry is.
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("a curated list it owns"));
+    });
+
+    it("lifts the startup approval knobs into the deepagents override", () => {
+      expect(
+        importFrom('[startup]\nmode = "yolo"\nyolo_switcher = false\nrecent = "auto"\n'),
+      ).toEqual({
+        permission: {},
+        // `recent` is app-managed session state, so it stays out of a file
+        // that gets committed.
+        deepagents: { startup: { mode: "yolo", yolo_switcher: false } },
+      });
+    });
+
+    it("round-trips an allowlist through generate and import", async () => {
+      const content = await generate({
+        config: { permission: { bash: { "git *": "allow", ls: "allow" } } },
+      });
+
+      expect(importFrom(content)).toEqual({
+        permission: { bash: { git: "allow", ls: "allow" } },
+      });
+    });
+
+    it("skips entries dcode itself could never match", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      const config = importFrom('[shell]\nallow_list = ["git status", "npm-*", "ls"]\n');
+
+      // Neither entry auto-approves anything upstream, and importing them would
+      // let the next generate widen `git status` to every `git` invocation.
+      expect(config).toEqual({ permission: { bash: { ls: "allow" } } });
+      // Dropping them silently would read as "dcode approves these", which is
+      // the opposite of what upstream does with them.
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("git status, npm-*"));
+      // The wording is what tells the user the entries were inert upstream all
+      // along, not merely unsupported by rulesync.
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("auto-approve nothing"));
+    });
+
+    it("skips entries dcode splits or refuses before comparing", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      const config = importFrom('[shell]\nallow_list = ["git;rm", "$(id)", "ls"]\n');
+
+      // dcode splits a command on `;`/`&&`/`|` and rejects command substitution
+      // before it ever compares a name, so neither entry approves anything.
+      expect(config).toEqual({ permission: { bash: { ls: "allow" } } });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("git;rm, $(id)"));
+    });
+
+    it("skips a quoted entry, which dcode compares without its quotes", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      const config = importFrom('[shell]\nallow_list = [\'"git"\', "ls"]\n');
+
+      // `shlex.split` takes the quotes off the command being checked, so the
+      // quoted entry can never equal the name dcode ends up comparing.
+      expect(config).toEqual({ permission: { bash: { ls: "allow" } } });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('"git"'));
+    });
+
+    it("skips an entry longer than a command's own name can be", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      const name = "a".repeat(300);
+      const config = importFrom(`[shell]\nallow_list = ["${name}", "ls"]\n`);
+
+      expect(config).toEqual({ permission: { bash: { ls: "allow" } } });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining(name));
+    });
+
+    it("reads the sentinels case-insensitively, the way upstream lowercases them", () => {
+      const config = importFrom('[shell]\nallow_list = ["ALL"]\n');
+
+      expect(config).toEqual({ permission: { bash: { "*": "allow" } } });
+    });
+
+    it("imports nothing when the array holds a non-string entry", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      const config = importFrom('[shell]\nallow_list = ["git", 3]\n');
+
+      // dcode requires every element to be a string and drops the whole option
+      // otherwise, so `git` is not auto-approved there either.
+      expect(config).toEqual({ permission: {} });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("ignores 'allow_list' entirely"));
+    });
+
+    it("imports nothing from an allow_list that is neither a string nor an array", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      const config = importFrom("[shell]\nallow_list = 3\n");
+
+      expect(config).toEqual({ permission: {} });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining("ignores 'allow_list' entirely"));
+    });
+
+    it("leaves behind a startup value dcode cannot read", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      // dcode falls back to its own default for these, and the canonical schema
+      // is stricter than TOML — importing them would write a permissions file
+      // the next generate could not parse.
+      const config = importFrom('[startup]\nmode = "AUTO"\nyolo_switcher = "yes"\n');
+
+      expect(config).toEqual({ permission: {} });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('mode = "AUTO", yolo_switcher = "yes"'),
+      );
+    });
+
+    it("lifts the dotenv knob back into the override", () => {
+      const config = importFrom("[startup]\nread_project_dotenv = true\n");
+
+      expect(config).toEqual({
+        permission: {},
+        deepagents: { startup: { read_project_dotenv: true } },
+      });
+    });
+
+    it("lifts the extensions gate back into the override (issue #2956)", () => {
+      const config = importFrom('[extensions]\nenabled = false\ntrust = "never"\n');
+
+      expect(config).toEqual({
+        permission: {},
+        deepagents: { extensions: { enabled: false, trust: "never" } },
+      });
+    });
+
+    it("reads `trust` the way `parse_trust_policy` reads it", () => {
+      // Upstream trims and lowercases, so this is the policy dcode applies.
+      const config = importFrom('[extensions]\ntrust = " Always "\n');
+
+      expect(config).toEqual({
+        permission: {},
+        deepagents: { extensions: { trust: "always" } },
+      });
+    });
+
+    it("leaves behind an extensions value dcode cannot read", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      const config = importFrom('[extensions]\ntrust = "sometimes"\nenabled = "yes"\n');
+
+      expect(config).toEqual({ permission: {} });
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining('enabled = "yes", trust = "sometimes"'),
+      );
+    });
+
+    it("does not lift the machine-local extension paths", () => {
+      const config = importFrom('[extensions]\nextra_paths = ["/home/me/tools"]\n');
+
+      // Machine-local paths do not belong in a committed permissions file.
+      expect(config).toEqual({ permission: {} });
+    });
+
+    it("lifts the project MCP deny list back into the override (issue #3076)", () => {
+      const config = importFrom('[mcp]\ndisabled_project_servers = ["filesystem", "shell"]\n');
+
+      expect(config).toEqual({
+        permission: {},
+        deepagents: { mcp: { disabled_project_servers: ["filesystem", "shell"] } },
+      });
+    });
+
+    it("reads a comma-separated deny list the way `_toml_str_list` reads it", () => {
+      const config = importFrom('[mcp]\ndisabled_project_servers = " filesystem, shell,, "\n');
+
+      expect(config).toEqual({
+        permission: {},
+        deepagents: { mcp: { disabled_project_servers: ["filesystem", "shell"] } },
+      });
+    });
+
+    it("drops a non-string deny-list element while keeping the names around it", () => {
+      const config = importFrom('[mcp]\ndisabled_project_servers = ["filesystem", 3, "shell"]\n');
+
+      expect(config).toEqual({
+        permission: {},
+        deepagents: { mcp: { disabled_project_servers: ["filesystem", "shell"] } },
+      });
+    });
+
+    it("leaves behind a deny list dcode cannot read as names", () => {
+      const warn = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+
+      const config = importFrom("[mcp]\ndisabled_project_servers = 3\n");
+
+      expect(config).toEqual({ permission: {} });
+      // dcode fails closed on this rather than falling back to a default, and
+      // the warning must not claim otherwise.
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringMatching(
+          /rejects every project MCP server until it is fixed, so disabled_project_servers = 3 in .* was not imported/,
+        ),
+      );
+      expect(warn).not.toHaveBeenCalledWith(
+        expect.stringContaining("falls back to its own default"),
+      );
+    });
+
+    it("does not lift the machine-local approval store", () => {
+      const config = importFrom(
+        '[mcp.enabled_project_server_approvals]\nfilesystem = { fingerprint = "abc" }\n',
+      );
+
+      expect(config).toEqual({ permission: {} });
+    });
+
+    it("lifts every override block from the same file", () => {
+      const config = importFrom(
+        '[startup]\nmode = "manual"\n\n[extensions]\ntrust = "never"\n\n[mcp]\ndisabled_project_servers = ["shell"]\n',
+      );
+
+      expect(config).toEqual({
+        permission: {},
+        deepagents: {
+          startup: { mode: "manual" },
+          extensions: { trust: "never" },
+          mcp: { disabled_project_servers: ["shell"] },
+        },
+      });
+    });
+
+    it("throws a descriptive error when the file is malformed", () => {
+      expect(() => importFrom("[shell\n")).toThrow(/Failed to parse deepagents permissions/);
+    });
+  });
+
+  describe("fromFile", () => {
+    it("reads the global config file", async () => {
+      await writeFileContent(
+        join(testDir, ".deepagents", "config.toml"),
+        '[shell]\nallow_list = ["git"]\n',
+      );
+
+      const permissions = await DeepagentsPermissions.fromFile({
+        outputRoot: testDir,
+        global: true,
+      });
+
+      expect(allowListOf(permissions.getFileContent())).toEqual(["git"]);
+    });
+  });
+});
+
+describe("DeepagentsPermissions with DEEPAGENTS_HOME", () => {
+  const originalDeepagentsHome = process.env.DEEPAGENTS_HOME;
+  const originalHomeDir = process.env.HOME_DIR;
+
+  beforeEach(() => {
+    // `getDeepagentsHome` compares the override against the home directory,
+    // which the test environment refuses to resolve without `HOME_DIR`.
+    process.env.HOME_DIR = "/rulesync-home";
+  });
+
+  afterEach(() => {
+    if (originalDeepagentsHome === undefined) delete process.env.DEEPAGENTS_HOME;
+    else process.env.DEEPAGENTS_HOME = originalDeepagentsHome;
+    if (originalHomeDir === undefined) delete process.env.HOME_DIR;
+    else process.env.HOME_DIR = originalHomeDir;
+  });
+
+  it("drops the .deepagents prefix when DEEPAGENTS_HOME is the profile root itself", () => {
+    process.env.DEEPAGENTS_HOME = "/custom-deepagents";
+    expect(DeepagentsPermissions.getSettablePaths({ global: true })).toEqual({
+      relativeDirPath: ".",
+      relativeFilePath: "config.toml",
+    });
+
+    delete process.env.DEEPAGENTS_HOME;
+    expect(DeepagentsPermissions.getSettablePaths({ global: true })).toEqual({
+      relativeDirPath: ".deepagents",
+      relativeFilePath: "config.toml",
+    });
+  });
+
+  it("imports back into the rulesync home rather than the profile root", () => {
+    process.env.HOME_DIR = "/rulesync-home";
+    process.env.DEEPAGENTS_HOME = "/custom-deepagents";
+    const permissions = new DeepagentsPermissions({
+      outputRoot: "/custom-deepagents",
+      relativeDirPath: ".",
+      relativeFilePath: "config.toml",
+      fileContent: '[shell]\nallow_list = ["git status"]\n',
+      global: true,
+    });
+
+    expect(permissions.toRulesyncPermissions().getOutputRoot()).toBe("/rulesync-home");
+  });
+});

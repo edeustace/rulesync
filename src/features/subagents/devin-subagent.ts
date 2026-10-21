@@ -24,11 +24,12 @@ import {
 // Devin Local custom subagent profiles are native AGENT.md files with YAML
 // frontmatter, stored in a directory-per-agent layout where the directory name
 // is the profile id. See https://docs.devin.ai/cli/subagents
-//   - `name`, `description`: identity fields.
+//   - `name`, `description`: identity fields. `name` is optional; Devin
+//     defaults it to the file or directory name of the profile.
 //   - `model`, `allowed-tools`, `permissions`, `max-nesting`: optional
 //     configuration fields, passed through verbatim when present.
 const DevinSubagentFrontmatterSchema = z.looseObject({
-  name: z.string(),
+  name: z.optional(z.string()),
   description: z.optional(z.string()),
   model: z.optional(z.string()),
   "allowed-tools": z.optional(z.array(z.string())),
@@ -114,18 +115,20 @@ export class DevinSubagent extends ToolSubagent {
 
     const rulesyncFrontmatter: RulesyncSubagentFrontmatter = {
       targets: ["*"] as const,
-      name,
+      // Devin falls back to the file or directory name when `name` is absent.
+      name: name ?? this.getSubagentName(),
       description,
       ...(Object.keys(devinSection).length > 0 && { devin: devinSection }),
     };
 
     return new RulesyncSubagent({
-      outputRoot: this.getOutputRoot(),
+      outputRoot: ".", // RulesyncSubagent outputRoot is always the project root directory
       frontmatter: rulesyncFrontmatter,
       body: this.body,
       relativeDirPath: RULESYNC_SUBAGENTS_RELATIVE_DIR_PATH,
-      // The tool-side path is `<name>/AGENT.md`; the rulesync file is a flat
-      // `<name>.md`, so the subagent name comes from the parent directory.
+      // The tool-side path is `<name>/AGENT.md` or, on import, a flat
+      // `<name>.md`; getSubagentName() handles both, and the rulesync file is
+      // always a flat `<name>.md`.
       relativeFilePath: `${this.getSubagentName()}.md`,
       validate: true,
     });
@@ -135,8 +138,8 @@ export class DevinSubagent extends ToolSubagent {
    * Derive the subagent name from this instance's relative file path.
    *
    * The tool-side layout is `<name>/AGENT.md`, so the name is the parent
-   * directory of the file. If the path is unexpectedly flat (e.g. a legacy
-   * `<name>.md`), fall back to the basename without extension.
+   * directory of the file. Devin also reads a flat `<name>.md`, which import
+   * picks up too; its name is the basename without extension.
    */
   private getSubagentName(): string {
     const relativeFilePath = this.getRelativeFilePath();
@@ -185,7 +188,7 @@ export class DevinSubagent extends ToolSubagent {
       extname(rulesyncSubagent.getRelativeFilePath()),
     );
 
-    return new DevinSubagent({
+    return new this({
       outputRoot,
       frontmatter: devinFrontmatter,
       body,
@@ -231,14 +234,21 @@ export class DevinSubagent extends ToolSubagent {
     const paths = this.getSettablePaths({ global });
     const filePath = join(outputRoot, paths.relativeDirPath, relativeFilePath);
     const fileContent = await readFileContent(filePath);
-    const { frontmatter, body: content } = parseFrontmatter(fileContent, filePath);
+    const { frontmatter, body: content, hasFrontmatter } = parseFrontmatter(fileContent, filePath);
+
+    // `name` is optional, so a frontmatter block is what marks a Markdown file
+    // as a profile; without it, a README or notes file beside the agents would
+    // import as one.
+    if (!hasFrontmatter) {
+      throw new Error(`Missing frontmatter in ${filePath}`);
+    }
 
     const result = DevinSubagentFrontmatterSchema.safeParse(frontmatter);
     if (!result.success) {
       throw new Error(`Invalid frontmatter in ${filePath}: ${formatError(result.error)}`);
     }
 
-    return new DevinSubagent({
+    return new this({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath,
@@ -255,7 +265,7 @@ export class DevinSubagent extends ToolSubagent {
     relativeDirPath,
     relativeFilePath,
   }: ToolSubagentForDeletionParams): DevinSubagent {
-    return new DevinSubagent({
+    return new this({
       outputRoot,
       relativeDirPath,
       relativeFilePath,

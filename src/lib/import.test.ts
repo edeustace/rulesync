@@ -7,6 +7,7 @@ import {
   RULESYNC_MCP_LEGACY_RELATIVE_FILE_PATH,
   RULESYNC_MCP_RELATIVE_FILE_PATH,
   RULESYNC_PERMISSIONS_LEGACY_RELATIVE_FILE_PATH,
+  RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH,
   RULESYNC_RELATIVE_DIR_PATH,
 } from "../constants/rulesync-paths.js";
 import { ChecksProcessor } from "../features/checks/checks-processor.js";
@@ -23,7 +24,9 @@ import { SkillsProcessor } from "../features/skills/skills-processor.js";
 import { SubagentsProcessor } from "../features/subagents/subagents-processor.js";
 import { createMockLogger } from "../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../test-utils/test-directories.js";
+import { PACKAGING_TOOL_TARGETS } from "../types/tool-targets.js";
 import { ensureDir, writeFileContent } from "../utils/file.js";
+import { assertPluginRootSafe } from "../utils/plugin-root.js";
 import { importFromTool } from "./import.js";
 
 const logger = createMockLogger();
@@ -34,6 +37,7 @@ const createMockProcessor = ({
   loadToolFiles: vi.fn().mockResolvedValue([{ file: "tool" }]),
   convertToolFilesToRulesyncFiles: vi.fn().mockResolvedValue(convertedFiles),
   writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
+  warnForFoldImportDuplicationRisk: vi.fn().mockResolvedValue(undefined),
 });
 
 const createMockSkillsProcessor = () => ({
@@ -51,6 +55,13 @@ vi.mock("../features/skills/skills-processor.js");
 vi.mock("../features/hooks/hooks-processor.js");
 vi.mock("../features/permissions/permissions-processor.js");
 vi.mock("../features/checks/checks-processor.js");
+vi.mock("../utils/plugin-root.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../utils/plugin-root.js")>();
+  return {
+    ...actual,
+    assertPluginRootSafe: vi.fn(),
+  };
+});
 
 describe("importFromTool", () => {
   let mockConfig: {
@@ -60,6 +71,8 @@ describe("importFromTool", () => {
     getFeatures: ReturnType<typeof vi.fn>;
     getFeatureOptions: ReturnType<typeof vi.fn>;
     getGlobal: ReturnType<typeof vi.fn>;
+    getInputRoots: ReturnType<typeof vi.fn>;
+    getDeriveSubprojectPathFromGlobs: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
@@ -70,6 +83,8 @@ describe("importFromTool", () => {
       getFeatures: vi.fn().mockReturnValue(["rules"]),
       getFeatureOptions: vi.fn().mockReturnValue(undefined),
       getGlobal: vi.fn().mockReturnValue(false),
+      getInputRoots: vi.fn().mockReturnValue(["."]),
+      getDeriveSubprojectPathFromGlobs: vi.fn().mockReturnValue(false),
     };
 
     vi.mocked(RulesProcessor.getToolTargets).mockReturnValue(["claudecode"]);
@@ -141,6 +156,42 @@ describe("importFromTool", () => {
     vi.clearAllMocks();
   });
 
+  describe("packaging targets", () => {
+    it.each(PACKAGING_TOOL_TARGETS)(
+      "should reject %s in global mode without checking the home directory for symlinks",
+      async (tool) => {
+        mockConfig.getGlobal.mockReturnValue(true);
+        mockConfig.getOutputRoots.mockReturnValue(["/home/user"]);
+        mockConfig.getFeatures.mockReturnValue(["rules", "skills"]);
+        vi.mocked(RulesProcessor.getToolTargets).mockReturnValue([tool]);
+        vi.mocked(SkillsProcessor.getToolTargets).mockReturnValue([tool]);
+
+        await expect(importFromTool({ logger, config: mockConfig as never, tool })).rejects.toThrow(
+          `Target '${tool}' is a plugin packaging target and supports only project scope. Re-run without '--global'.`,
+        );
+
+        expect(assertPluginRootSafe).not.toHaveBeenCalled();
+        expect(RulesProcessor).not.toHaveBeenCalled();
+        expect(SkillsProcessor).not.toHaveBeenCalled();
+      },
+    );
+
+    it.each(PACKAGING_TOOL_TARGETS)(
+      "should check the plugin root of %s in project mode",
+      async (tool) => {
+        mockConfig.getOutputRoots.mockReturnValue(["/plugins/a"]);
+        mockConfig.getFeatures.mockReturnValue([]);
+
+        await importFromTool({ logger, config: mockConfig as never, tool });
+
+        expect(assertPluginRootSafe).toHaveBeenCalledWith({
+          toolTarget: tool,
+          outputRoot: "/plugins/a",
+        });
+      },
+    );
+  });
+
   describe("rules feature", () => {
     it("should import rules when feature is enabled", async () => {
       mockConfig.getFeatures.mockReturnValue(["rules"]);
@@ -188,6 +239,82 @@ describe("importFromTool", () => {
       expect(RulesProcessor).not.toHaveBeenCalled();
     });
 
+    it("should warn about fold-import duplication risk only once tool files were actually found", async () => {
+      mockConfig.getFeatures.mockReturnValue(["rules"]);
+
+      const result = await importFromTool({
+        logger,
+        config: mockConfig as never,
+        tool: "claudecode",
+      });
+
+      expect(result.rulesCount).toBe(1);
+      const processors = vi.mocked(RulesProcessor).mock.results.map((entry) => entry.value);
+      expect(
+        processors.some(
+          (processor) => processor.warnForFoldImportDuplicationRisk.mock.calls.length > 0,
+        ),
+      ).toBe(true);
+    });
+
+    it("should check fold-import duplication with generate's rules configuration", async () => {
+      mockConfig.getFeatures.mockReturnValue(["rules"]);
+      mockConfig.getInputRoots.mockReturnValue([".", "shared"]);
+      mockConfig.getDeriveSubprojectPathFromGlobs.mockReturnValue(true);
+      mockConfig.getFeatureOptions.mockReturnValue({ includeLocalRoot: false });
+
+      await importFromTool({
+        logger,
+        config: mockConfig as never,
+        tool: "claudecode",
+      });
+
+      const calls = vi.mocked(RulesProcessor).mock.calls;
+      const results = vi.mocked(RulesProcessor).mock.results;
+      const checkIndex = results.findIndex(
+        (entry) => entry.value.warnForFoldImportDuplicationRisk.mock.calls.length > 0,
+      );
+      const importIndex = results.findIndex(
+        (entry) => entry.value.convertToolFilesToRulesyncFiles.mock.calls.length > 0,
+      );
+      expect(checkIndex).toBeGreaterThanOrEqual(0);
+      expect(importIndex).toBeGreaterThanOrEqual(0);
+      expect(calls[checkIndex]?.[0]).toEqual(
+        expect.objectContaining({
+          inputRoots: [".", "shared"],
+          deriveSubprojectPathFromGlobs: true,
+          featureOptions: { includeLocalRoot: false },
+        }),
+      );
+      // The processor that imports the files keeps its plain configuration.
+      expect(calls[importIndex]?.[0]).not.toHaveProperty("featureOptions");
+    });
+
+    it("should keep importing when the duplication check throws", async () => {
+      mockConfig.getFeatures.mockReturnValue(["rules"]);
+      const importProcessor = createMockProcessor();
+      const failingCheckProcessor = {
+        ...createMockProcessor(),
+        warnForFoldImportDuplicationRisk: vi.fn().mockRejectedValue(new Error("bad frontmatter")),
+      };
+      vi.mocked(RulesProcessor)
+        .mockImplementationOnce(function () {
+          return importProcessor as unknown as RulesProcessor;
+        })
+        .mockImplementationOnce(function () {
+          return failingCheckProcessor as unknown as RulesProcessor;
+        });
+
+      const result = await importFromTool({
+        logger,
+        config: mockConfig as never,
+        tool: "claudecode",
+      });
+
+      expect(result.rulesCount).toBe(1);
+      expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining("bad frontmatter"));
+    });
+
     it("should return 0 when no tool files found", async () => {
       mockConfig.getFeatures.mockReturnValue(["rules"]);
 
@@ -195,6 +322,7 @@ describe("importFromTool", () => {
         loadToolFiles: vi.fn().mockResolvedValue([]),
         convertToolFilesToRulesyncFiles: vi.fn(),
         writeAiFiles: vi.fn(),
+        warnForFoldImportDuplicationRisk: vi.fn().mockResolvedValue(undefined),
       };
       vi.mocked(RulesProcessor).mockImplementation(function () {
         return mockProcessor as unknown as RulesProcessor;
@@ -209,6 +337,9 @@ describe("importFromTool", () => {
       expect(result.rulesCount).toBe(0);
       expect(mockProcessor.convertToolFilesToRulesyncFiles).not.toHaveBeenCalled();
       expect(mockProcessor.writeAiFiles).not.toHaveBeenCalled();
+      // A no-op import (nothing found to import) must not warn about
+      // fold-duplication risk — there is nothing being imported to duplicate.
+      expect(mockProcessor.warnForFoldImportDuplicationRisk).not.toHaveBeenCalled();
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining("No rule files found for claudecode"),
       );
@@ -879,6 +1010,115 @@ describe("importFromTool", () => {
 
         const writtenFiles = mockProcessor.writeAiFiles.mock.calls[0]?.[0] as RulesyncPermissions[];
         expect(writtenFiles[0]?.getRelativeFilePath()).toBe("permissions.json");
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it("should merge imported permissions into the existing source per category", async () => {
+      const { testDir, cleanup } = await setupTestDirectory();
+      try {
+        await ensureDir(join(testDir, RULESYNC_RELATIVE_DIR_PATH));
+        await writeFileContent(
+          join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+          [
+            "{",
+            '  "$schema": "https://example.com/permissions-schema.json",',
+            '  "permission": {',
+            "    // Imported from Claude Code earlier.",
+            '    "bash": { "git *": "allow" },',
+            '    "read": { ".env": "deny" },',
+            '    "edit": { "src/**": "allow" },',
+            "  },",
+            '  "claudecode": { "permissions": { "additionalDirectories": ["../old"] } },',
+            '  "opencode": { "permission": { "external_directory": "deny" } },',
+            "}",
+          ].join("\n"),
+        );
+        const mockProcessor = createMockProcessor({
+          convertedFiles: [
+            new RulesyncPermissions({
+              outputRoot: testDir,
+              relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+              relativeFilePath: "permissions.jsonc",
+              fileContent: JSON.stringify({
+                permission: { bash: { "npm *": "allow", "rm *": "deny" }, read: {} },
+                claudecode: { permissions: { defaultMode: "plan" } },
+              }),
+            }),
+          ],
+        });
+        vi.mocked(PermissionsProcessor).mockImplementation(function () {
+          return mockProcessor as unknown as PermissionsProcessor;
+        });
+        mockConfig.getFeatures.mockReturnValue(["permissions"]);
+        mockConfig.getOutputRoots.mockReturnValue([testDir]);
+
+        await importFromTool({
+          logger,
+          config: mockConfig as never,
+          tool: "claudecode",
+        });
+
+        const writtenFiles = mockProcessor.writeAiFiles.mock.calls[0]?.[0] as RulesyncPermissions[];
+        expect(writtenFiles).toHaveLength(1);
+        const written = writtenFiles[0];
+        expect(written?.getRelativeFilePath()).toBe("permissions.jsonc");
+        expect(written?.getJson()).toEqual({
+          $schema: "https://example.com/permissions-schema.json",
+          permission: {
+            // The imported category replaces the existing one wholesale.
+            bash: { "npm *": "allow", "rm *": "deny" },
+            // An empty imported category does not wipe the existing one.
+            read: { ".env": "deny" },
+            // A category the import does not carry is kept.
+            edit: { "src/**": "allow" },
+          },
+          // The importing tool's own block is replaced wholesale ...
+          claudecode: { permissions: { defaultMode: "plan" } },
+          // ... while another tool's block is kept.
+          opencode: { permission: { external_directory: "deny" } },
+        });
+        expect(written?.getFileContent()).toContain("// Imported from Claude Code earlier.");
+      } finally {
+        await cleanup();
+      }
+    });
+
+    it("should refuse to overwrite an existing permissions source that fails validation", async () => {
+      const { testDir, cleanup } = await setupTestDirectory();
+      try {
+        await ensureDir(join(testDir, RULESYNC_RELATIVE_DIR_PATH));
+        await writeFileContent(
+          join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+          '{ "permission": { "bash": { "git *": "sometimes" } } }',
+        );
+        const mockProcessor = createMockProcessor({
+          convertedFiles: [
+            new RulesyncPermissions({
+              outputRoot: testDir,
+              relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+              relativeFilePath: "permissions.jsonc",
+              fileContent: '{ "permission": { "bash": { "npm *": "allow" } } }',
+            }),
+          ],
+        });
+        vi.mocked(PermissionsProcessor).mockImplementation(function () {
+          return mockProcessor as unknown as PermissionsProcessor;
+        });
+        mockConfig.getFeatures.mockReturnValue(["permissions"]);
+        mockConfig.getOutputRoots.mockReturnValue([testDir]);
+
+        await expect(
+          importFromTool({
+            logger,
+            config: mockConfig as never,
+            tool: "claudecode",
+          }),
+        ).rejects.toThrow(
+          /Cannot merge imported permissions into .*permissions\.jsonc: the existing file is invalid/,
+        );
+        expect(mockProcessor.writeAiFiles).not.toHaveBeenCalled();
       } finally {
         await cleanup();
       }

@@ -466,6 +466,40 @@ describe("CopilotHooks", () => {
       expect(parsed.hooks.errorOccurred[0].command).toBe("error-handler.sh");
     });
 
+    it("should write an override event named toString as a plain string key (#2757)", async () => {
+      // The override block is only loosely validated, so an event named after an
+      // Object.prototype member reaches the generate-side reverse lookup
+      // exactly as it reaches the import side.
+      const config = {
+        version: 1,
+        hooks: {
+          sessionStart: [{ type: "command", command: "shared.sh" }],
+        },
+        copilot: {
+          hooks: {
+            toString: [{ type: "command", command: "crafted.sh" }],
+          },
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const copilotHooks = await CopilotHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+
+      const parsed = JSON.parse(copilotHooks.getFileContent());
+      expect(Object.keys(parsed.hooks).toSorted()).toEqual(["sessionStart", "toString"]);
+      expect(parsed.hooks["toString"][0].command).toBe("crafted.sh");
+    });
+
     it("should produce standalone file without merging existing content", async () => {
       const config = {
         version: 1,
@@ -835,6 +869,125 @@ describe("CopilotHooks", () => {
       expect(reExported.hooks.sessionStart[0].timeoutSec).toBe(30);
     });
 
+    it("should round-trip the VS Code per-OS command overrides through import and re-export", async () => {
+      const copilotHooks = new CopilotHooks({
+        outputRoot: testDir,
+        relativeDirPath: join(".github", "hooks"),
+        relativeFilePath: "copilot-hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: {
+            preToolUse: [
+              {
+                type: "command",
+                command: "./scripts/format.sh",
+                windows: "powershell -File scripts\\format.ps1",
+                linux: "./scripts/format-linux.sh",
+                osx: "./scripts/format-mac.sh",
+              },
+            ],
+            // Authored with per-OS overrides only, which VS Code accepts ("at
+            // least one command property"); before, this imported as a hook
+            // with no command and was regenerated empty.
+            sessionStart: [{ type: "command", windows: "echo win", osx: "echo mac" }],
+            // A shell field plus an override: the shell selector is recorded
+            // and the override rides along.
+            agentStop: [{ type: "command", bash: "echo bye", windows: "Write-Output bye" }],
+          },
+        }),
+        validate: false,
+      });
+
+      const logger = createMockLogger();
+      const imported = copilotHooks.toRulesyncHooks({ logger }).getJson();
+      expect(vi.mocked(logger.warn)).toHaveBeenCalledTimes(1);
+      expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+        expect.stringContaining("only VS Code per-OS overrides"),
+      );
+      expect(vi.mocked(logger.warn)).toHaveBeenCalledWith(
+        expect.stringContaining("'sessionStart'"),
+      );
+      expect(imported.hooks.preToolUse?.[0]).toMatchObject({
+        command: "./scripts/format.sh",
+        windows: "powershell -File scripts\\format.ps1",
+        linux: "./scripts/format-linux.sh",
+        osx: "./scripts/format-mac.sh",
+      });
+      expect(imported.hooks.preToolUse?.[0]?.shell).toBeUndefined();
+      expect(imported.hooks.sessionStart?.[0]).toEqual({
+        type: "command",
+        windows: "echo win",
+        osx: "echo mac",
+      });
+      expect(imported.hooks.stop?.[0]).toEqual({
+        type: "command",
+        command: "echo bye",
+        shell: "bash",
+        windows: "Write-Output bye",
+      });
+
+      const reExported = JSON.parse(
+        (
+          await CopilotHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks: copilotHooks.toRulesyncHooks(),
+            validate: false,
+          })
+        ).getFileContent(),
+      );
+      expect(reExported.hooks.preToolUse[0]).toEqual({
+        type: "command",
+        command: "./scripts/format.sh",
+        windows: "powershell -File scripts\\format.ps1",
+        linux: "./scripts/format-linux.sh",
+        osx: "./scripts/format-mac.sh",
+      });
+      expect(reExported.hooks.sessionStart[0]).toEqual({
+        type: "command",
+        windows: "echo win",
+        osx: "echo mac",
+      });
+      expect(reExported.hooks.agentStop[0]).toEqual({
+        type: "command",
+        bash: "echo bye",
+        windows: "Write-Output bye",
+      });
+    });
+
+    it("should pass canonical per-OS overrides through on generate", async () => {
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".rulesync",
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: {
+            preToolUse: [
+              {
+                type: "command",
+                command: "./fmt.sh",
+                linux: "./fmt-linux.sh",
+                osx: "./fmt-mac.sh",
+              },
+            ],
+          },
+        }),
+        validate: false,
+      });
+
+      const generated = JSON.parse(
+        (
+          await CopilotHooks.fromRulesyncHooks({ outputRoot: testDir, rulesyncHooks })
+        ).getFileContent(),
+      );
+      expect(generated.hooks.preToolUse[0]).toEqual({
+        type: "command",
+        command: "./fmt.sh",
+        linux: "./fmt-linux.sh",
+        osx: "./fmt-mac.sh",
+      });
+    });
+
     it("should read the timeout alias when timeoutSec is absent", () => {
       const copilotHooks = new CopilotHooks({
         outputRoot: testDir,
@@ -917,6 +1070,35 @@ describe("CopilotHooks", () => {
       const entry = json.hooks.sessionStart?.[0] as Record<string, unknown>;
       expect(entry.command).toBe("run.sh");
       expect(entry.customKey).toBeUndefined();
+    });
+
+    it("should carry an event named toString through as a plain string key (#2757)", () => {
+      const copilotHooks = new CopilotHooks({
+        outputRoot: testDir,
+        relativeDirPath: join(".github", "hooks"),
+        relativeFilePath: "copilot-hooks.json",
+        // JSON.parse yields an own enumerable `toString` key, unlike an object
+        // literal whose `toString` the lookup map would inherit from
+        // Object.prototype.
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: {
+            sessionStart: [{ type: "command", bash: "echo start" }],
+            toString: [{ type: "command", bash: "echo crafted" }],
+          },
+        }),
+        validate: false,
+      });
+
+      const json = copilotHooks.toRulesyncHooks().getJson();
+      expect(json.hooks.sessionStart?.[0]?.command).toBe("echo start");
+      expect(Object.keys(json.hooks)).toEqual(["sessionStart"]);
+      // The unmapped name must fall through verbatim rather than resolving to
+      // Object.prototype.toString and landing under its stringified source.
+      const overrideHooks = (json as { copilot?: { hooks?: Record<string, unknown[]> } }).copilot
+        ?.hooks;
+      expect(Object.keys(overrideHooks ?? {})).toEqual(["toString"]);
+      expect(overrideHooks?.["toString"]?.[0]).toMatchObject({ command: "echo crafted" });
     });
   });
 

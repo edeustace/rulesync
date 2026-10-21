@@ -1,4 +1,4 @@
-import { basename, join } from "node:path";
+import { join } from "node:path";
 
 import { z } from "zod/mini";
 
@@ -34,12 +34,58 @@ export const RulesyncSubagentFrontmatterSchema = z.looseObject({
       groups: z.optional(z.array(z.unknown())),
     }),
   ),
+  // IBM Bob custom modes: Roo's mode fields, in their own section because Bob
+  // spells its tool groups differently (`execute` rather than `command`).
+  bob: z.optional(
+    z.looseObject({
+      slug: z.optional(z.string()),
+      whenToUse: z.optional(z.string()),
+      roleDefinition: z.optional(z.string()),
+      customInstructions: z.optional(z.string()),
+      groups: z.optional(z.array(z.unknown())),
+      // `allowedSubagents` is left untyped: import lifts whatever a hand-written
+      // file holds, and generation emits it only when it is a string list.
+    }),
+  ),
   // Zoo Code (community continuation of Roo Code): shared mode fields ride the
   // `roo:` section above; this section carries only the post-fork divergence.
   zoocode: z.optional(
     z.looseObject({
       /** Per-mode MCP server allowlist (Zoo Code v3.60.0+); omitted = all. */
       allowedMcpServers: z.optional(z.array(z.string())),
+    }),
+  ),
+  // ZCode's documented subagent keys, spelled out so their types are checked
+  // here rather than only once the file is written. They are camelCase and
+  // case-sensitive; unknown keys still ride through, as everywhere else.
+  zcode: z.optional(
+    z.looseObject({
+      model: z.optional(z.string()),
+      thoughtLevel: z.optional(z.string()),
+      color: z.optional(z.string()),
+      tools: z.optional(z.array(z.string())),
+      disallowedTools: z.optional(z.array(z.string())),
+      maxTurns: z.optional(z.number().check(z.int(), z.positive())),
+      injectAgentsMd: z.optional(z.boolean()),
+      mcpServers: z.optional(z.array(z.string())),
+    }),
+  ),
+  // Pool's documented per-agent keys (`subagents.agents.<name>` of its
+  // settings file), spelled out so their types are checked when the rulesync
+  // file is read. `description`/`instructions` override the shared field and
+  // the body; unknown keys still ride through, as everywhere else.
+  pool: z.optional(
+    z.looseObject({
+      type: z.optional(z.enum(["in_process", "command", "agent_server"])),
+      description: z.optional(z.string()),
+      instructions: z.optional(z.string()),
+      command: z.optional(z.string()),
+      args: z.optional(z.array(z.string())),
+      env: z.optional(z.record(z.string(), z.string())),
+      agent_server: z.optional(z.string()),
+      session_config_options: z.optional(z.record(z.string(), z.unknown())),
+      inherit_agent_config: z.optional(z.boolean()),
+      disabled: z.optional(z.boolean()),
     }),
   ),
   vibe: z.optional(
@@ -165,12 +211,10 @@ export class RulesyncSubagent extends RulesyncFile {
       throw new Error(`Invalid frontmatter in ${relativeFilePath}: ${formatError(result.error)}`);
     }
 
-    const filename = basename(relativeFilePath);
-
     return new RulesyncSubagent({
       outputRoot,
       relativeDirPath: dirPath,
-      relativeFilePath: filename,
+      relativeFilePath,
       frontmatter: result.data,
       body: content.trim(),
     });

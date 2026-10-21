@@ -33,6 +33,11 @@ export const REASONIX_COMMANDS_DIR_PATH = join(REASONIX_DIR, "commands");
 // `~/.reasonix/REASONIX.md` (global scope, via the processor's home-relative
 // outputRoot under REASONIX_GLOBAL_DIR).
 export const REASONIX_RULE_FILE_NAME = "REASONIX.md";
+// The personal, uncommitted counterpart Reasonix loads next to each `REASONIX.md`
+// in the workspace chain, ahead of it (`LocalDocumentNames` in upstream
+// `internal/instruction/resolver.go`). Project scope only: the Reasonix home
+// directory loads no local variant.
+export const REASONIX_LOCAL_RULE_FILE_NAME = "REASONIX.local.md";
 
 // Skills: Anthropic-style directory-layout skills under `.reasonix/skills/`
 // (project) / `~/.reasonix/skills/` (global), each `<name>/SKILL.md`.
@@ -50,5 +55,9 @@ export const REASONIX_SUBAGENTS_DIR_PATH = REASONIX_SKILLS_DIR_PATH;
 // subagents features so each can tell its own files apart inside the shared
 // `.reasonix/skills/` directory: `runAs` is the discriminator both features
 // check when deciding whether a discovered SKILL.md belongs to them.
-export const REASONIX_SUBAGENT_INVOCATION = "manual";
+// The `invocation` value that keeps any Reasonix skill out of the model's
+// catalog while it stays callable by name. Regular skills use it as the v1
+// spelling of `disable-model-invocation`.
+export const REASONIX_MANUAL_INVOCATION = "manual";
+export const REASONIX_SUBAGENT_INVOCATION = REASONIX_MANUAL_INVOCATION;
 export const REASONIX_SUBAGENT_RUN_AS = "subagent";

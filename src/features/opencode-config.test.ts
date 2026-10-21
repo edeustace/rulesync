@@ -2,13 +2,22 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { MIMOCODE_LAYOUT } from "../constants/mimocode-paths.js";
 import { setupTestDirectory } from "../test-utils/test-directories.js";
 import { writeFileContent } from "../utils/file.js";
 import {
   asOpencodeEntries,
+  getOpencodeAgentEntries,
+  getOpencodeCommandEntries,
   getOpencodeConfigDir,
+  getOpencodeSkillPaths,
+  mergeOpencodeConfigValues,
+  mergeOpencodeEntryLayers,
   readOpencodeConfig,
+  readOpencodeConfigLayers,
+  readOpencodeDotDirConfigLayers,
   resolveOpencodeFileTemplate,
+  warnOpencodeDotDirOverrides,
 } from "./opencode-config.js";
 
 describe("opencode-config", () => {
@@ -47,6 +56,120 @@ describe("opencode-config", () => {
     });
   });
 
+  describe("readOpencodeDotDirConfigLayers", () => {
+    it("reads .opencode/opencode.json, then .opencode/opencode.jsonc", async () => {
+      await writeFileContent(join(testDir, ".opencode", "opencode.jsonc"), '{ "x": 2 // c\n}');
+      await writeFileContent(join(testDir, ".opencode", "opencode.json"), JSON.stringify({ x: 1 }));
+      expect(await readOpencodeDotDirConfigLayers({ outputRoot: testDir })).toEqual([
+        {
+          relativeFilePath: join(".opencode", "opencode.json"),
+          configDir: join(testDir, ".opencode"),
+          config: { x: 1 },
+        },
+        {
+          relativeFilePath: join(".opencode", "opencode.jsonc"),
+          configDir: join(testDir, ".opencode"),
+          config: { x: 2 },
+        },
+      ]);
+    });
+
+    it("returns no layers in global mode or for a layout without the location", async () => {
+      await writeFileContent(join(testDir, ".opencode", "opencode.json"), JSON.stringify({ x: 1 }));
+      expect(await readOpencodeDotDirConfigLayers({ outputRoot: testDir, global: true })).toEqual(
+        [],
+      );
+      expect(
+        await readOpencodeDotDirConfigLayers({ outputRoot: testDir, layout: MIMOCODE_LAYOUT }),
+      ).toEqual([]);
+    });
+  });
+
+  describe("readOpencodeConfigLayers", () => {
+    it("returns the root config first, then the .opencode files", async () => {
+      await writeFileContent(join(testDir, "opencode.json"), JSON.stringify({ x: 0 }));
+      await writeFileContent(join(testDir, ".opencode", "opencode.json"), JSON.stringify({ x: 1 }));
+      const layers = await readOpencodeConfigLayers({ outputRoot: testDir });
+      expect(layers.map(({ config, configDir }) => ({ config, configDir }))).toEqual([
+        { config: { x: 0 }, configDir: testDir },
+        { config: { x: 1 }, configDir: join(testDir, ".opencode") },
+      ]);
+    });
+  });
+
+  describe("mergeOpencodeConfigValues", () => {
+    it("merges objects deeply and lets other values replace", () => {
+      expect(
+        mergeOpencodeConfigValues(
+          { mcp: { a: { type: "local", command: ["a"] } }, list: [1], keep: true },
+          { mcp: { a: { enabled: false }, b: { type: "remote" } }, list: [2] },
+        ),
+      ).toEqual({
+        mcp: { a: { type: "local", command: ["a"], enabled: false }, b: { type: "remote" } },
+        list: [2],
+        keep: true,
+      });
+      expect(
+        mergeOpencodeConfigValues({ permission: { bash: "ask" } }, { permission: "allow" }),
+      ).toEqual({ permission: "allow" });
+    });
+
+    it("keeps a __proto__ key as an own entry", () => {
+      const merged = mergeOpencodeConfigValues({}, JSON.parse('{"__proto__": {"polluted": 1}}'));
+      expect(Object.hasOwn(merged as object, "__proto__")).toBe(true);
+      expect(({} as Record<string, unknown>).polluted).toBeUndefined();
+    });
+  });
+
+  describe("mergeOpencodeEntryLayers", () => {
+    it("merges entries across layers, later layers winning", () => {
+      expect(
+        mergeOpencodeEntryLayers([
+          { a: { template: "root", agent: "build" } },
+          null,
+          { a: { template: "dot" }, b: { template: "b" } },
+        ]),
+      ).toEqual({ a: { template: "dot", agent: "build" }, b: { template: "b" } });
+    });
+
+    it("returns null when no layer has entries", () => {
+      expect(mergeOpencodeEntryLayers([null, null])).toBeNull();
+    });
+  });
+
+  describe("warnOpencodeDotDirOverrides", () => {
+    const overlay = (config: Record<string, unknown>) => ({
+      relativeFilePath: join(".opencode", "opencode.json"),
+      configDir: join(testDir, ".opencode"),
+      config,
+    });
+
+    it("warns about generated entries the .opencode file also sets", () => {
+      const logger = { warn: vi.fn() };
+      warnOpencodeDotDirOverrides({
+        generated: { mcp: { a: {}, b: {} }, permission: "allow", tools: undefined },
+        overlays: [overlay({ mcp: { b: {}, c: {} }, permission: { bash: "ask" }, tools: {} })],
+        rootFileName: "opencode.json",
+        logger: logger as never,
+      });
+      expect(logger.warn).toHaveBeenCalledTimes(1);
+      expect(logger.warn.mock.calls[0]?.[0]).toBe(
+        'OpenCode merges ".opencode/opencode.json" over the generated "opencode.json", so its values for these generated entries take precedence: "mcp" > "b", "permission".',
+      );
+    });
+
+    it("does not warn when nothing overlaps", () => {
+      const logger = { warn: vi.fn() };
+      warnOpencodeDotDirOverrides({
+        generated: { mcp: { a: {} } },
+        overlays: [overlay({ mcp: { c: {} }, instructions: ["x.md"] })],
+        rootFileName: "opencode.json",
+        logger: logger as never,
+      });
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+  });
+
   describe("asOpencodeEntries", () => {
     it("returns the record for plain objects", () => {
       expect(asOpencodeEntries({ a: { template: "x" } })).toEqual({ a: { template: "x" } });
@@ -57,6 +180,151 @@ describe("opencode-config", () => {
       expect(asOpencodeEntries([1, 2])).toBeNull();
       expect(asOpencodeEntries("str")).toBeNull();
       expect(asOpencodeEntries(undefined)).toBeNull();
+    });
+  });
+
+  describe("getOpencodeAgentEntries", () => {
+    it("lowers V2 agents entries into the V1 agent shape", () => {
+      expect(
+        getOpencodeAgentEntries({
+          config: {
+            agents: {
+              reviewer: {
+                description: "Reviews code",
+                mode: "subagent",
+                system: "You review.",
+                disabled: true,
+                hidden: true,
+                color: "#ff0000",
+                steps: 5,
+                model: "anthropic/claude-sonnet#high",
+                request: { headers: { "x-a": "1" }, body: { reasoning: true } },
+                permissions: [{ action: "edit", resource: "*", effect: "deny" }],
+              },
+              planner: { model: { providerID: "openai", model: "gpt-5", variant: "low" } },
+            },
+          },
+        }),
+      ).toEqual({
+        reviewer: {
+          description: "Reviews code",
+          mode: "subagent",
+          prompt: "You review.",
+          disable: true,
+          hidden: true,
+          color: "#ff0000",
+          steps: 5,
+          model: "anthropic/claude-sonnet",
+          variant: "high",
+          options: { reasoning: true },
+        },
+        planner: { model: "openai/gpt-5", variant: "low" },
+      });
+    });
+
+    it("keeps the V1 agent entry when both spellings define the same name", () => {
+      expect(
+        getOpencodeAgentEntries({
+          config: {
+            agent: { reviewer: { prompt: "V1" } },
+            agents: { reviewer: { system: "V2" }, helper: { system: "Help" } },
+          },
+        }),
+      ).toEqual({ reviewer: { prompt: "V1" }, helper: { prompt: "Help" } });
+    });
+
+    it("ignores V2 agents when the V1 agent key is not an object", () => {
+      expect(
+        getOpencodeAgentEntries({ config: { agent: "oops", agents: { a: { system: "x" } } } }),
+      ).toBeNull();
+    });
+
+    it("ignores V2 agents for a layout that does not read V2 spellings", () => {
+      expect(
+        getOpencodeAgentEntries({
+          config: { agents: { a: { system: "x" } } },
+          layout: MIMOCODE_LAYOUT,
+        }),
+      ).toBeNull();
+    });
+  });
+
+  describe("getOpencodeCommandEntries", () => {
+    it("merges V2 commands entries, lowering the model and skipping entries without a template", () => {
+      expect(
+        getOpencodeCommandEntries({
+          config: {
+            command: { ship: { template: "V1 ship" } },
+            commands: {
+              ship: { template: "V2 ship" },
+              review: { template: "Review", model: "openai/gpt-5#high", subagent: true },
+              broken: { description: "no template" },
+            },
+          },
+        }),
+      ).toEqual({
+        ship: { template: "V1 ship" },
+        review: { template: "Review", model: "openai/gpt-5", variant: "high", subagent: true },
+      });
+    });
+
+    it("lowers an object model selection and ignores V2 commands when command is not an object", () => {
+      expect(
+        getOpencodeCommandEntries({
+          config: {
+            commands: { a: { template: "x", model: { providerID: "openai", model: "gpt-5" } } },
+          },
+        }),
+      ).toEqual({ a: { template: "x", model: "openai/gpt-5" } });
+      expect(
+        getOpencodeCommandEntries({
+          config: { commands: { a: { template: "x", model: "o/m#" } } },
+        }),
+      ).toEqual({ a: { template: "x", model: "o/m" } });
+      expect(
+        getOpencodeCommandEntries({ config: { command: [], commands: { a: { template: "x" } } } }),
+      ).toBeNull();
+    });
+
+    it("keeps a V2 entry named __proto__ as an own entry", () => {
+      const entries = getOpencodeCommandEntries({
+        config: JSON.parse('{"commands":{"__proto__":{"template":"x"}}}'),
+      });
+      expect(Object.getPrototypeOf(entries)).toBe(Object.prototype);
+      expect(Object.keys(entries ?? {})).toEqual(["__proto__"]);
+    });
+
+    it("ignores V2 commands for a layout that does not read V2 spellings", () => {
+      expect(
+        getOpencodeCommandEntries({
+          config: { commands: { a: { template: "x" } } },
+          layout: MIMOCODE_LAYOUT,
+        }),
+      ).toBeNull();
+    });
+  });
+
+  describe("getOpencodeSkillPaths", () => {
+    it("reads skills.paths", () => {
+      expect(getOpencodeSkillPaths({ config: { skills: { paths: ["a", 1] } } })).toEqual(["a", 1]);
+      expect(getOpencodeSkillPaths({ config: {} })).toEqual([]);
+    });
+
+    it("reads the non-URL entries of a flat V2 skills array", () => {
+      expect(
+        getOpencodeSkillPaths({
+          config: {
+            skills: ["team/skills", "https://example.com/.well-known/skills/", "HTTP://x"],
+          },
+        }),
+      ).toEqual(["team/skills"]);
+    });
+
+    it("ignores a flat skills array with a non-string entry or for a layout without V2 spellings", () => {
+      expect(getOpencodeSkillPaths({ config: { skills: ["a", 1] } })).toEqual([]);
+      expect(getOpencodeSkillPaths({ config: { skills: ["a"] }, layout: MIMOCODE_LAYOUT })).toEqual(
+        [],
+      );
     });
   });
 

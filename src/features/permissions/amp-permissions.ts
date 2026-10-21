@@ -1,7 +1,6 @@
 import { join } from "node:path";
 
 import { uniq } from "es-toolkit";
-import { parse as parseJsonc, type ParseError, printParseErrorCode } from "jsonc-parser";
 
 import {
   AMP_DIR,
@@ -15,6 +14,7 @@ import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
 import { isPrototypePollutionKey } from "../../utils/prototype-pollution.js";
 import { isPlainObject } from "../../utils/type-guards.js";
+import { parseAmpSettings } from "../shared/amp-settings.js";
 import { applySharedConfigPatch, sharedConfigFileKey } from "../shared/shared-config-gateway.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
 import {
@@ -31,7 +31,7 @@ import {
  * builtin of that name). It lives in the shared Amp settings file:
  * `.amp/settings.json` (project) and `~/.config/amp/settings.json` (global).
  *
- * Reference: https://ampcode.com/manual ("amp.tools.disable").
+ * Reference: https://ampcode.com/docs/cli/settings ("amp.tools.disable").
  */
 const AMP_TOOLS_DISABLE_KEY = "amp.tools.disable";
 
@@ -43,12 +43,16 @@ const AMP_TOOLS_DISABLE_KEY = "amp.tools.disable";
  * glob. Rules are evaluated **first-match-wins**. It lives in the same shared
  * Amp settings file as `amp.tools.disable`.
  *
- * `amp.permissions` is Amp's documented legacy/backwards-compat surface — it
- * remains functional and is the only place to express `allow`/`ask` and
- * argument-specific `reject` rules (the simpler `amp.tools.disable` array can
- * only disable whole tools).
+ * `amp.permissions` is Amp's legacy/backwards-compat surface — it remains
+ * functional in the shipped CLI and is the only place to express `allow`/`ask`
+ * and argument-specific `reject` rules (the simpler `amp.tools.disable` array
+ * can only disable whole tools). The web docs no longer describe it (the
+ * permissions section only points at custom plugins), but the shipped CLI
+ * still lists it in its built-in settings reference (`amp --help`) and
+ * evaluates it through `amp permissions list|test`.
  *
- * Reference: https://ampcode.com/manual ("amp.permissions").
+ * Reference: https://ampcode.com/docs/tools#permissions and
+ * https://ampcode.com/docs/customize/plugins#example-plugin-permissions.
  */
 const AMP_PERMISSIONS_KEY = "amp.permissions";
 
@@ -71,7 +75,10 @@ type AmpPermissionEntry = {
  * The `amp.guardedFiles.allowlist` array (file globs allowed without
  * confirmation), `amp.dangerouslyAllowAll` boolean (disable all confirmation),
  * and `amp.mcpPermissions` array — sibling settings authored through the `amp`
- * permissions override. Reference: https://ampcode.com/manual.
+ * permissions override. Only `amp.mcpPermissions` is still on the web docs
+ * (https://ampcode.com/docs/cli/settings); the other two, like
+ * `amp.permissions`, survive only in the CLI's built-in settings reference
+ * (see `AMP_PERMISSIONS_KEY`).
  */
 const AMP_GUARDED_FILES_ALLOWLIST_KEY = "amp.guardedFiles.allowlist";
 const AMP_DANGEROUSLY_ALLOW_ALL_KEY = "amp.dangerouslyAllowAll";
@@ -103,26 +110,6 @@ function isCanonicalAmpEntry(entry: AmpPermissionEntry): boolean {
   if (matches === undefined) return true;
   const keys = Object.keys(matches);
   return keys.length === 0 || (keys.length === 1 && typeof matches.cmd === "string");
-}
-
-function parseAmpSettings(fileContent: string): Record<string, unknown> {
-  const errors: ParseError[] = [];
-  const parsed: unknown = parseJsonc(fileContent || "{}", errors, { allowTrailingComma: true });
-
-  if (errors.length > 0) {
-    const details = errors
-      .map((error) => `${printParseErrorCode(error.error)} at offset ${error.offset}`)
-      .join(", ");
-    throw new Error(`Failed to parse Amp settings: ${details}`);
-  }
-
-  // `isPlainObject` (not `isRecord`) rejects class instances for
-  // prototype-pollution hardening; the JSONC parser always yields a plain object.
-  if (!isPlainObject(parsed)) {
-    throw new Error("Amp settings must be a JSON object");
-  }
-
-  return parsed;
 }
 
 function toDisableList(value: unknown): string[] {
@@ -249,7 +236,7 @@ export class AmpPermissions extends ToolPermissions {
     const jsonDir = join(outputRoot, basePaths.relativeDirPath);
     const { fileContent, relativeFilePath } = await this.resolveSettingsFile(jsonDir);
 
-    const json = fileContent ? parseAmpSettings(fileContent) : {};
+    const json = fileContent ? parseAmpSettings({ fileContent }) : {};
     const newJson = {
       ...json,
       [AMP_TOOLS_DISABLE_KEY]: toDisableList(json[AMP_TOOLS_DISABLE_KEY]),
@@ -268,12 +255,13 @@ export class AmpPermissions extends ToolPermissions {
     outputRoot = process.cwd(),
     rulesyncPermissions,
     global = false,
+    logger,
   }: ToolPermissionsFromRulesyncPermissionsParams): Promise<AmpPermissions> {
     const basePaths = AmpPermissions.getSettablePaths({ global });
     const jsonDir = join(outputRoot, basePaths.relativeDirPath);
     const { fileContent, relativeFilePath } = await this.resolveSettingsFile(jsonDir);
 
-    const json = fileContent ? parseAmpSettings(fileContent) : {};
+    const json = fileContent ? parseAmpSettings({ fileContent }) : {};
 
     const config = rulesyncPermissions.getJson();
     const { disable, permissions } = convertRulesyncToAmp(config);
@@ -333,13 +321,14 @@ export class AmpPermissions extends ToolPermissions {
         existingContent: fileContent ?? "",
         patch,
         filePath: join(jsonDir, relativeFilePath),
+        logger,
       }),
       validate: true,
     });
   }
 
   toRulesyncPermissions(): RulesyncPermissions {
-    const json = parseAmpSettings(this.getFileContent());
+    const json = parseAmpSettings({ fileContent: this.getFileContent() });
     const allPermissions = toPermissionsList(json[AMP_PERMISSIONS_KEY]);
 
     // Canonical-expressible entries drive the shared `permission` block; the rest
@@ -380,7 +369,7 @@ export class AmpPermissions extends ToolPermissions {
 
   validate(): ValidationResult {
     try {
-      const json = parseAmpSettings(this.fileContent);
+      const json = parseAmpSettings({ fileContent: this.fileContent });
       const disable = json[AMP_TOOLS_DISABLE_KEY];
       if (disable !== undefined && !Array.isArray(disable)) {
         return {

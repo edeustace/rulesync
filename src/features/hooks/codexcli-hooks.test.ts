@@ -2,8 +2,10 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
+import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
+import { ClaudecodeHooks } from "./claudecode-hooks.js";
 import { CodexcliConfigToml, CodexcliHooks } from "./codexcli-hooks.js";
 import { RulesyncHooks } from "./rulesync-hooks.js";
 
@@ -59,6 +61,58 @@ describe("CodexcliHooks", () => {
       expect(parsed.hooks.PreToolUse[0].matcher).toBe("Bash");
       expect(parsed.hooks.PreToolUse[0].hooks[0].command).toBe("./scripts/lint.sh");
       expect(parsed.hooks.PreToolUse[0].hooks[0].timeout).toBe(30);
+    });
+
+    // https://github.com/dyoshikawa/rulesync/issues/3171 — Codex CLI does not
+    // set CLAUDE_PROJECT_DIR, so a Claude Code hook imported and regenerated for
+    // Codex must not carry the variable anywhere in its command.
+    it("should not leak $CLAUDE_PROJECT_DIR from imported Claude Code hooks", async () => {
+      const claudeCommands = [
+        '"$CLAUDE_PROJECT_DIR"/.claude/hooks/a.sh',
+        '"$CLAUDE_PROJECT_DIR/.claude/hooks/b.sh"',
+        "$CLAUDE_PROJECT_DIR/.claude/hooks/c.sh",
+        "${CLAUDE_PROJECT_DIR}/.claude/hooks/d.sh",
+        'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/e.py"',
+        'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/f.py',
+        "node $CLAUDE_PROJECT_DIR/.claude/hooks/g.js",
+      ];
+      const claudecodeHooks = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: "Bash",
+                hooks: claudeCommands.map((command) => ({ type: "command", command })),
+              },
+            ],
+          },
+        }),
+        validate: false,
+      });
+
+      const codexHooks = await CodexcliHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks: claudecodeHooks.toRulesyncHooks(),
+        validate: true,
+      });
+
+      const parsed = JSON.parse(codexHooks.getFileContent());
+      const commands = parsed.hooks.PreToolUse[0].hooks.map(
+        (hook: { command: string }) => hook.command,
+      );
+      expect(commands).toEqual([
+        "./.claude/hooks/a.sh",
+        '"./.claude/hooks/b.sh"',
+        "./.claude/hooks/c.sh",
+        "./.claude/hooks/d.sh",
+        'python3 "./.claude/hooks/e.py"',
+        "python3 ./.claude/hooks/f.py",
+        "node ./.claude/hooks/g.js",
+      ]);
+      expect(codexHooks.getFileContent()).not.toContain("CLAUDE_PROJECT_DIR");
     });
 
     it("should filter unsupported events", async () => {
@@ -280,6 +334,36 @@ describe("CodexcliHooks", () => {
       expect(parsed.hooks.PreCompact).toBeUndefined();
     });
 
+    it("should convert stopCancelled to Interrupt, forwarding the timeout as authored", async () => {
+      // Codex ignores any `matcher` on Interrupt and caps command timeouts at
+      // 3s; neither is enforced here, they are forwarded as authored.
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              stopCancelled: [{ command: "./scripts/on-interrupt.sh", timeout: 2 }],
+            },
+          }),
+        }),
+      );
+
+      const codexHooks = await CodexcliHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+      });
+
+      const parsed = JSON.parse(codexHooks.getFileContent());
+      expect(parsed.hooks.Interrupt).toBeDefined();
+      expect(parsed.hooks.Interrupt[0].hooks[0]).toEqual({
+        type: "command",
+        command: "./scripts/on-interrupt.sh",
+        timeout: 2,
+      });
+      expect(parsed.hooks.Stop).toBeUndefined();
+      expect(parsed.hooks.StopCancelled).toBeUndefined();
+    });
+
     it("should not prefix commands with a project dir variable", async () => {
       const rulesyncHooks = new RulesyncHooks(
         createMockAiFileParams({
@@ -435,6 +519,263 @@ describe("CodexcliHooks", () => {
       expect(parsed.hooks.SessionStart[0].hooks[0].command).toBe("echo start");
       // preToolUse had only prompt hooks, so it should be excluded entirely
       expect(parsed.hooks.PreToolUse).toBeUndefined();
+    });
+
+    it("should emit mcp_tool hooks with server, tool, input, timeout and statusMessage", async () => {
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              postToolUse: [
+                {
+                  type: "mcp_tool",
+                  matcher: "apply_patch",
+                  server: "scanner",
+                  tool: "scan_patch",
+                  input: { patch: "${tool_input.command}" },
+                  timeout: 30,
+                  statusMessage: "Scanning edited files",
+                },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const codexHooks = await CodexcliHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+      });
+
+      const parsed = JSON.parse(codexHooks.getFileContent());
+      expect(parsed.hooks.PostToolUse).toEqual([
+        {
+          matcher: "apply_patch",
+          hooks: [
+            {
+              type: "mcp_tool",
+              server: "scanner",
+              tool: "scan_patch",
+              input: { patch: "${tool_input.command}" },
+              timeout: 30,
+              statusMessage: "Scanning edited files",
+            },
+          ],
+        },
+      ]);
+    });
+
+    it("should drop command-only fields from mcp_tool hooks with a warning", async () => {
+      const logger = createMockLogger();
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              stop: [
+                {
+                  type: "mcp_tool",
+                  server: "scanner",
+                  tool: "summarize",
+                  commandWindows: "scan.cmd",
+                  additionalContextLimit: 100,
+                  async: true,
+                },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const codexHooks = await CodexcliHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+        logger,
+      });
+
+      const parsed = JSON.parse(codexHooks.getFileContent());
+      expect(parsed.hooks.Stop[0].hooks[0]).toEqual({
+        type: "mcp_tool",
+        server: "scanner",
+        tool: "summarize",
+      });
+      const warnings = logger.warn.mock.calls.map(([message]) => String(message));
+      for (const field of ["commandWindows", "additionalContextLimit", "async"]) {
+        expect(warnings.some((message) => message.includes(`"${field}"`))).toBe(true);
+      }
+    });
+
+    it("should skip mcp_tool hooks Codex cannot load, keeping the rest of the file", async () => {
+      const logger = createMockLogger();
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              preToolUse: [
+                { type: "mcp_tool", tool: "scan" },
+                { type: "mcp_tool", server: "scanner" },
+                { type: "mcp_tool", server: "scanner", tool: "scan", input: { a: [1, null] } },
+              ],
+              stop: [{ type: "mcp_tool", server: "scanner", tool: "scan", input: { a: null } }],
+              sessionStart: [{ command: "echo start" }],
+            },
+          }),
+        }),
+      );
+
+      const codexHooks = await CodexcliHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+        logger,
+      });
+
+      const parsed = JSON.parse(codexHooks.getFileContent());
+      expect(parsed.hooks.PreToolUse).toBeUndefined();
+      expect(parsed.hooks.Stop).toBeUndefined();
+      expect(parsed.hooks.SessionStart[0].hooks[0].command).toBe("echo start");
+      const warnings = logger.warn.mock.calls.map(([message]) => String(message));
+      const skipped = warnings.filter((message) => message.includes('Skipping a "mcp_tool" hook'));
+      expect(skipped).toHaveLength(4);
+      expect(skipped.every((message) => message.includes("whole hooks file"))).toBe(true);
+    });
+
+    it("should skip an mcp_tool hook with an empty server or tool as unresolvable", async () => {
+      const logger = createMockLogger();
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              preToolUse: [
+                { type: "mcp_tool", server: "", tool: "scan" },
+                { type: "mcp_tool", server: "scanner", tool: "" },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const codexHooks = await CodexcliHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+        logger,
+      });
+
+      expect(JSON.parse(codexHooks.getFileContent()).hooks.PreToolUse).toBeUndefined();
+      const warnings = logger.warn.mock.calls.map(([message]) => String(message));
+      const skipped = warnings.filter((message) => message.includes("can never resolve"));
+      expect(skipped).toHaveLength(2);
+      expect(skipped.some((message) => message.includes("whole hooks file"))).toBe(false);
+    });
+
+    it("should skip hooks whose timeout Codex cannot read as a non-negative integer", async () => {
+      const logger = createMockLogger();
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              preToolUse: [
+                { type: "mcp_tool", server: "scanner", tool: "scan", timeout: 1.5 },
+                { type: "mcp_tool", server: "scanner", tool: "scan", timeout: -1 },
+                { command: "echo pre", timeout: 2.5 },
+                { type: "mcp_tool", server: "scanner", tool: "kept", timeout: 0 },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const codexHooks = await CodexcliHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+        logger,
+      });
+
+      const parsed = JSON.parse(codexHooks.getFileContent());
+      expect(parsed.hooks.PreToolUse[0].hooks).toEqual([
+        { type: "mcp_tool", server: "scanner", tool: "kept", timeout: 0 },
+      ]);
+      const warnings = logger.warn.mock.calls.map(([message]) => String(message));
+      expect(warnings.filter((message) => message.includes('"timeout"'))).toHaveLength(3);
+    });
+
+    it("should warn that Codex skips mcp_tool hooks on SessionEnd", async () => {
+      const logger = createMockLogger();
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              sessionEnd: [
+                { type: "mcp_tool", server: "scanner", tool: "flush" },
+                { type: "mcp_tool", server: "scanner", tool: "close" },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const codexHooks = await CodexcliHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+        logger,
+      });
+
+      const parsed = JSON.parse(codexHooks.getFileContent());
+      expect(parsed.hooks.SessionEnd[0].hooks.map((h: { tool: string }) => h.tool)).toEqual([
+        "flush",
+        "close",
+      ]);
+      const sessionEndWarnings = logger.warn.mock.calls
+        .map(([message]) => String(message))
+        .filter((message) => message.includes('"SessionEnd"'));
+      expect(sessionEndWarnings).toHaveLength(1);
+      expect(sessionEndWarnings[0]).toContain("scanner/flush, scanner/close");
+    });
+
+    it("should keep an existing third-party command when preserveUnowned is set", async () => {
+      await ensureDir(join(testDir, ".codex"));
+      await writeFileContent(
+        join(testDir, ".codex", "hooks.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  { type: "command", command: "echo start" },
+                  { type: "command", command: "other-tool-hook codex-hook" },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: { sessionStart: [{ command: "echo start" }] },
+          }),
+        }),
+      );
+
+      const parsed = JSON.parse(
+        (
+          await CodexcliHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks,
+            preserveUnowned: true,
+            validate: true,
+          })
+        ).getFileContent(),
+      );
+      const commands = parsed.hooks.SessionStart[0].hooks.map(
+        (handler: { command: string }) => handler.command,
+      );
+      expect(commands).toEqual(["echo start", "other-tool-hook codex-hook"]);
     });
   });
 
@@ -648,6 +989,69 @@ describe("CodexcliHooks", () => {
         type: "command",
         command: "echo post-compact",
         matcher: "manual",
+      });
+    });
+
+    it("should convert Interrupt to canonical stopCancelled", () => {
+      const codexHooks = new CodexcliHooks(
+        createMockAiFileParams({
+          relativeDirPath: ".codex",
+          relativeFilePath: "hooks.json",
+          fileContent: JSON.stringify({
+            hooks: {
+              Interrupt: [{ hooks: [{ command: "./scripts/on-interrupt.sh", timeout: 2 }] }],
+            },
+          }),
+        }),
+      );
+
+      const rulesyncHooks = codexHooks.toRulesyncHooks();
+      const parsed = rulesyncHooks.getJson();
+
+      expect(parsed.hooks.stopCancelled?.[0]).toEqual({
+        type: "command",
+        command: "./scripts/on-interrupt.sh",
+        timeout: 2,
+      });
+      expect(parsed.hooks.stop).toBeUndefined();
+    });
+
+    it("should import mcp_tool hooks", () => {
+      const codexHooks = new CodexcliHooks(
+        createMockAiFileParams({
+          relativeDirPath: ".codex",
+          relativeFilePath: "hooks.json",
+          fileContent: JSON.stringify({
+            hooks: {
+              PostToolUse: [
+                {
+                  matcher: "apply_patch",
+                  hooks: [
+                    {
+                      type: "mcp_tool",
+                      server: "scanner",
+                      tool: "scan_patch",
+                      input: { patch: "${tool_input.command}" },
+                      timeout: 30,
+                      statusMessage: "Scanning edited files",
+                    },
+                  ],
+                },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const parsed = codexHooks.toRulesyncHooks().getJson();
+      expect(parsed.hooks.postToolUse?.[0]).toEqual({
+        type: "mcp_tool",
+        server: "scanner",
+        tool: "scan_patch",
+        input: { patch: "${tool_input.command}" },
+        timeout: 30,
+        statusMessage: "Scanning edited files",
+        matcher: "apply_patch",
       });
     });
 

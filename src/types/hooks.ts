@@ -35,6 +35,34 @@ export const HOOK_TYPES = ["command", "prompt", "http", "agent", "mcp_tool", "fu
 export type HookType = (typeof HOOK_TYPES)[number];
 
 /**
+ * One choice offered by a Kiro `confirm` prompt: `run` decides whether picking
+ * it executes the hook command. The prompt text is written back into JSON,
+ * never embedded in generated code, so it is a plain string.
+ */
+export const HookConfirmOptionSchema = z.looseObject({
+  id: z.string(),
+  label: z.string(),
+  run: z.boolean(),
+});
+
+/**
+ * Kiro's confirmation prompt shown before a `Stop`-trigger command hook runs.
+ * `confirmCommand` (optional, inside the block) names a command whose JSON
+ * stdout drives the prompt at run time: `{ "skip": true }` suppresses it, a
+ * replacement `question` / `options` object overrides the static prompt, and
+ * on failure or timeout the static prompt is used. Stored verbatim: Kiro is
+ * the only consumer, and it owns the shape.
+ * https://kiro.dev/docs/hooks/
+ */
+export const HookConfirmSchema = z.looseObject({
+  question: z.string(),
+  options: z.array(HookConfirmOptionSchema),
+  confirmCommand: z.optional(safeString),
+});
+
+export type HookConfirm = z.infer<typeof HookConfirmSchema>;
+
+/**
  * Canonical hook definition.
  * Used in .rulesync/hooks.jsonc and mapped to tool-specific formats.
  */
@@ -53,9 +81,17 @@ export const HookDefinitionSchema = z.looseObject({
   // Kiro IDE: whether the hook is active. Kiro writes `enabled` on every hook
   // entry and defaults it to `true`; without a canonical home, importing a
   // deliberately disabled hook and regenerating would silently switch it back
-  // on. Only the Kiro IDE emitter reads and writes it.
+  // on. The Kiro IDE emitter and ZCode's per-hook passthrough read and write
+  // it; other targets warn and emit the hook as active.
   // https://kiro.dev/docs/hooks/
   enabled: z.optional(z.boolean()),
+  // Kiro: a confirmation prompt (`question` + `options[{ id, label, run }]`,
+  // optionally driven at run time by a nested `confirmCommand`) shown before a
+  // `Stop`-trigger command hook runs. Forwarded verbatim by the standalone
+  // Kiro hooks emitter and round-tripped on import; no other target has an
+  // equivalent.
+  // https://kiro.dev/docs/hooks/
+  confirm: z.optional(HookConfirmSchema),
   prompt: z.optional(safeString),
   loop_limit: z.optional(z.nullable(z.number())),
   name: z.optional(safeString),
@@ -119,6 +155,19 @@ export const HookDefinitionSchema = z.looseObject({
   // per definition here, like `sequential`, since the canonical model is a flat
   // list. https://docs.augmentcode.com/cli/hooks
   metadata: z.optional(z.looseObject({})),
+  // Snowflake Cortex Code command hooks: a "remote hook" fetches the script
+  // from a Git repository instead of the local tree — `source.source` is the
+  // `github:<org>/<repo>/<path>` locator and `source.ref` the branch or commit.
+  // `command` then names the interpreter (e.g. `bash`) the fetched file runs
+  // under, so dropping this object would leave a bare interpreter with nothing
+  // to execute. Only Cortex Code documents the field.
+  // https://docs.snowflake.com/en/user-guide/cortex-code/extensibility#remote-hooks
+  source: z.optional(
+    z.looseObject({
+      source: safeString,
+      ref: z.optional(safeString),
+    }),
+  ),
   // Claude Code tool events (PreToolUse/PostToolUse/PostToolUseFailure/
   // PermissionRequest/PermissionDenied): `if` filters a hook by tool arguments,
   // holding a single permission rule with the same syntax as settings.json
@@ -208,6 +257,8 @@ export const HOOK_EVENTS = [
   "elicitation",
   "elicitationResult",
   "sessionDelete",
+  "preModelSwitch",
+  "postModelSwitch",
 ] as const;
 
 /** All canonical hook event names. */
@@ -236,6 +287,30 @@ export const CURSOR_HOOK_EVENTS: readonly HookEvent[] = [
   "beforeTabFileRead",
   "afterTabFileEdit",
   "workspaceOpen",
+];
+
+/**
+ * Hook events supported by Firebender.
+ *
+ * Firebender's `hooks.json` follows Cursor's layout, and every event it fires
+ * is spelled like its canonical counterpart, so no name mapping is needed.
+ * @see https://docs.firebender.com/multi-agent/hooks
+ */
+export const FIREBENDER_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "sessionEnd",
+  "subagentStart",
+  "subagentStop",
+  "preToolUse",
+  "postToolUse",
+  "beforeShellExecution",
+  "afterShellExecution",
+  "beforeMCPExecution",
+  "afterMCPExecution",
+  "beforeReadFile",
+  "afterFileEdit",
+  "preCompact",
+  "stop",
 ];
 
 /**
@@ -281,6 +356,12 @@ export const CLAUDE_HOOK_EVENTS: readonly HookEvent[] = [
   "postCompact",
   "elicitation",
   "elicitationResult",
+  // Added in 2.1.251. `PreModelSwitch` runs before a requested model switch and
+  // can block it; `PostModelSwitch` runs after the session's model changes. Both
+  // match on the canonical name of the model being switched to.
+  // https://code.claude.com/docs/en/hooks
+  "preModelSwitch",
+  "postModelSwitch",
 ];
 
 /**
@@ -290,10 +371,13 @@ export const CLAUDE_HOOK_EVENTS: readonly HookEvent[] = [
  * eight events: `PreToolUse`, `PostToolUse`, `PermissionRequest`,
  * `UserPromptSubmit`, `Stop`, `SessionStart`, `SessionEnd`, and
  * `PostCompaction` (fires after context compaction; added in the Devin CLI
- * stable changelog — https://docs.devin.ai/cli/changelog/stable). The
- * tool/permission events (`PreToolUse`/`PostToolUse`/`PermissionRequest`) carry
- * a `matcher` (regex against `tool_name`); the session/turn/compaction events
- * do not.
+ * stable changelog — https://docs.devin.ai/cli/changelog/stable). CLI
+ * v3000.11.92 added `PreCompact` and `PostCompact`, which run before and after
+ * compaction with `manual` / `auto` trigger matchers; `PostCompaction` stays
+ * supported. The tool/permission events (`PreToolUse`/`PostToolUse`/
+ * `PermissionRequest`) carry a `matcher` (regex against `tool_name`) and
+ * `PreCompact` a trigger matcher; the other session/turn/compaction events do
+ * not.
  *
  * Hooks live in `.devin/hooks.v1.json` (project, standalone — the hooks object
  * is the entire file) or under the `"hooks"` key of `.devin/config.json` /
@@ -309,6 +393,7 @@ export const DEVIN_HOOK_EVENTS: readonly HookEvent[] = [
   "beforeSubmitPrompt",
   "stop",
   "permissionRequest",
+  "preCompact",
   "postCompact",
 ];
 
@@ -338,12 +423,16 @@ export const OPENCODE_HOOK_EVENTS: readonly HookEvent[] = [
   "notification",
   "permissionDenied",
   "beforeSubmitPrompt",
+  "sessionDelete",
+  "userPromptExpansion",
+  "preModelInvocation",
 ];
 
 /**
  * Hook events supported by Kilo. Kilo's plugin docs list the same event surface
  * as OpenCode's — including `session.compacted`, `session.error`,
- * `file.watcher.updated`, `permission.replied`, `chat.message` and the
+ * `file.watcher.updated`, `permission.replied`, `session.deleted`,
+ * `chat.message`, `chat.params`, `command.execute.before` and the
  * experimental compaction hook — with one exception: they document no TUI
  * events at all, so `tui.toast.show` (canonical `notification`) is left out
  * rather than emitted into a plugin where it may never fire.
@@ -353,6 +442,19 @@ export const OPENCODE_HOOK_EVENTS: readonly HookEvent[] = [
 export const KILO_HOOK_EVENTS: readonly HookEvent[] = OPENCODE_HOOK_EVENTS.filter(
   (event) => event !== "notification",
 );
+
+/**
+ * OpenCode-style (OpenCode, Kilo, MiMo Code) events whose generated handler
+ * can honor a `matcher`: the named hooks that expose a matchable subject —
+ * `tool.execute.before/after` (`input.tool`) and `command.execute.before`
+ * (`input.command`). See `NAMED_HOOK_MATCHER_SUBJECTS` in
+ * `opencode-style-generator.ts`.
+ */
+export const OPENCODE_MATCHER_HOOK_EVENTS: readonly HookEvent[] = [
+  "preToolUse",
+  "postToolUse",
+  "userPromptExpansion",
+];
 
 /**
  * Hook events supported by Pi Coding Agent, bridged through a generated
@@ -369,9 +471,40 @@ export const PI_HOOK_EVENTS: readonly HookEvent[] = [
   "sessionEnd",
   "preToolUse",
   "postToolUse",
+  // Derived from `tool_result`, which carries `isError`; the generated handler
+  // gates on it. See CANONICAL_TO_PI_EVENT_NAMES.
+  "postToolUseFailure",
   "preModelInvocation",
   "postModelInvocation",
   "beforeSubmitPrompt",
+  // `agent_before_settle` (Pi v0.87.0+). See CANONICAL_TO_PI_EVENT_NAMES.
+  "stop",
+  // `ui_prompt_start` (Pi v0.84.4) fires when an extension opens a blocking
+  // UI prompt — Pi's "waiting for user" signal. See CANONICAL_TO_PI_EVENT_NAMES.
+  "notification",
+  "preCompact",
+  "postCompact",
+];
+
+/**
+ * Hook events supported by oh-my-pi (`omp`), Pi's fork, through the same
+ * generated TypeScript extension. oh-my-pi keeps Pi's names for every event
+ * listed here except `stop`: it has no `agent_before_settle`, so `stop` maps to
+ * its own `session_stop` event instead. It has no `ui_prompt_start` either, so
+ * `notification` is not mapped. See CANONICAL_TO_OMP_EVENT_NAMES.
+ *
+ * @see https://github.com/can1357/oh-my-pi/blob/fa5ff4a3a977a28b93d025f4cf50f046e019f18c/docs/extensions.md
+ */
+export const OMP_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "sessionEnd",
+  "preToolUse",
+  "postToolUse",
+  "postToolUseFailure",
+  "preModelInvocation",
+  "postModelInvocation",
+  "beforeSubmitPrompt",
+  // `session_stop`, oh-my-pi's own stop event. See CANONICAL_TO_OMP_EVENT_NAMES.
   "stop",
   "preCompact",
   "postCompact",
@@ -382,7 +515,7 @@ export const PI_HOOK_EVENTS: readonly HookEvent[] = [
  * adapter. Amp's `agent.start` / `agent.end` events describe the main agent
  * turn, not a subagent lifecycle, so they map to `beforeSubmitPrompt` / `stop`.
  *
- * @see https://ampcode.com/manual/plugin-api
+ * @see https://ampcode.com/docs/plugin-api
  */
 export const AMP_HOOK_EVENTS: readonly HookEvent[] = [
   "sessionStart",
@@ -391,6 +524,17 @@ export const AMP_HOOK_EVENTS: readonly HookEvent[] = [
   "beforeSubmitPrompt",
   "stop",
 ];
+
+/**
+ * Amp Plugin API events with no canonical equivalent. They are accepted only
+ * under the `amp.hooks` override block, keyed by their native Amp name, and are
+ * emitted under that same name. `changes.prompt` fires while a client prepares
+ * the prompt behind its Ship or Push to Branch button; its handler may return
+ * `{ append }` to add instructions after that prompt.
+ *
+ * @see https://ampcode.com/docs/plugin-api
+ */
+export const AMP_OVERRIDE_ONLY_HOOK_EVENTS: readonly string[] = ["changes.prompt"];
 
 /**
  * Hook events supported by Cline's file-based hooks. Cline resolves one
@@ -414,9 +558,13 @@ export const AMP_HOOK_EVENTS: readonly HookEvent[] = [
  * the platform the other one owns — see `generateClineHookScript` and
  * `generateClineHookPowerShellScript`.
  *
- * `TaskResume` and `TaskCancel` have no canonical counterpart and stay
- * unmapped rather than being approximated by `sessionEnd` / `stop`, whose
- * semantics differ.
+ * `TaskCancel` is the shape of canonical `stopCancelled` (as Grok CLI's
+ * `StopCancelled` and Codex CLI's `Interrupt` are): both runtimes fire it
+ * *instead of* `TaskComplete` when the run ends aborted — the VS Code
+ * extension from `afterRun` when the result status is `aborted`, the SDK/CLI
+ * as `agent_abort` — and neither lets the script cancel anything. `TaskResume`
+ * has no canonical counterpart and stays unmapped rather than being
+ * approximated by `sessionStart`, whose semantics differ.
  *
  * @see https://github.com/cline/cline/blob/main/apps/vscode/src/core/hooks/utils.ts
  * @see https://github.com/cline/cline/blob/main/sdk/packages/core/src/hooks/hook-file-config.ts
@@ -431,6 +579,7 @@ export const CLINE_HOOK_EVENTS: readonly HookEvent[] = [
   "notification",
   "taskCompleted",
   "afterError",
+  "stopCancelled",
 ];
 
 /**
@@ -566,6 +715,13 @@ export const CODEXCLI_HOOK_EVENTS: readonly HookEvent[] = [
   "postToolUse",
   "beforeSubmitPrompt",
   "stop",
+  // Codex's `Interrupt` (shipped in rust-v0.150.0) runs when the user
+  // interrupts an active turn on the main thread; it never fires for idle
+  // threads or subagents. Codex ignores any `matcher` on it, exactly as it
+  // does on `Stop` and `UserPromptSubmit`, so it is forwarded as authored like
+  // those two; command timeouts (1s default, capped at 3s) are the tool's to
+  // enforce. https://learn.chatgpt.com/docs/hooks.md
+  "stopCancelled",
   "permissionRequest",
   "subagentStart",
   "subagentStop",
@@ -693,6 +849,81 @@ export const AUGMENTCODE_HOOK_EVENTS: readonly HookEvent[] = [
 export const VIBE_HOOK_EVENTS: readonly HookEvent[] = ["preToolUse", "postToolUse", "stop"];
 
 /**
+ * Hook events supported by Codewhale.
+ *
+ * Codewhale fires fifteen snake_case events from `[[hooks]]` entries in
+ * `~/.codewhale/config.toml` (`[hooks]` table) and the workspace
+ * `.codewhale/hooks.toml`. The ten below have a canonical counterpart; the
+ * rest (`mode_change`, `shell_env`, `session_idle`, `waiting_for_user`,
+ * `session_busy`) have none. Only the tool-context events (`tool_call_before`,
+ * `tool_call_after`, `on_error`) accept a `tool_name` condition, which is what
+ * a canonical matcher becomes.
+ * @see https://github.com/Hmbown/Codewhale/blob/main/docs/HOOKS.md
+ * @see https://github.com/Hmbown/Codewhale/blob/main/crates/tui/src/hooks/config.rs
+ */
+export const CODEWHALE_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "sessionEnd",
+  "stop",
+  "beforeSubmitPrompt",
+  "preToolUse",
+  "postToolUse",
+  "afterError",
+  "subagentStart",
+  "subagentStop",
+  "stopFailure",
+];
+
+/** The Codewhale events whose hooks can carry a tool-name matcher. */
+export const CODEWHALE_MATCHER_HOOK_EVENTS: readonly HookEvent[] = [
+  "preToolUse",
+  "postToolUse",
+  "afterError",
+];
+
+/**
+ * Hook events supported by Pool.
+ *
+ * Pool's `hooks` settings block fires six events, spelled the Claude Code
+ * way: `PreToolUse`, `PostToolUse`, `UserPromptSubmit` (← `beforeSubmitPrompt`),
+ * `PreCompact`, `SessionStart` and `Stop`. Every entry carries a `matcher`
+ * (required by Pool's schema; `""`/`*` match any tool, a bare name is an exact
+ * match, `a|b` lists names, anything else is a regular expression), which only
+ * `PreToolUse`/`PostToolUse` test against the tool name.
+ * @see https://docs.poolside.ai/hooks
+ */
+export const POOL_HOOK_EVENTS: readonly HookEvent[] = [
+  "preToolUse",
+  "postToolUse",
+  "beforeSubmitPrompt",
+  "preCompact",
+  "sessionStart",
+  "stop",
+];
+
+export const CANONICAL_TO_POOL_EVENT_NAMES: Record<string, string> = {
+  preToolUse: "PreToolUse",
+  postToolUse: "PostToolUse",
+  beforeSubmitPrompt: "UserPromptSubmit",
+  preCompact: "PreCompact",
+  sessionStart: "SessionStart",
+  stop: "Stop",
+};
+
+export const POOL_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_POOL_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by Crush.
+ *
+ * Crush's `hooks` config block currently fires a single event, `PreToolUse`
+ * (Claude Code-compatible payload; `matcher` is a regex on the tool name).
+ * @see https://github.com/charmbracelet/crush/blob/main/docs/hooks/README.md
+ */
+export const CRUSH_HOOK_EVENTS: readonly HookEvent[] = ["preToolUse"];
+
+/**
  * Hook events supported by JetBrains Junie CLI.
  *
  * Junie CLI exposes seven lifecycle events under the `"hooks"` key of
@@ -712,6 +943,22 @@ export const JUNIE_HOOK_EVENTS: readonly HookEvent[] = [
   "stop",
   "stopFailure",
   "permissionRequest",
+  "sessionEnd",
+];
+
+/**
+ * Hook events supported by the GitLab Duo CLI. `SessionStart` is documented;
+ * `PreToolUse` and `SessionEnd` ship in gitlab-lsp (`HOOK_EVENT_NAMES`, v9.28.0+)
+ * but are not on docs.gitlab.com yet. The optional regex matcher filters on the
+ * session source (`startup`, `resume`) for `SessionStart`, on `tool_name` for
+ * `PreToolUse`, and on the end reason for `SessionEnd`. Only `type: "command"`
+ * hooks are supported.
+ * @see https://docs.gitlab.com/user/gitlab_duo_cli/customize/
+ * @see https://gitlab.com/gitlab-org/editor-extensions/gitlab-lsp/-/blob/v9.28.0/packages/core/hooks/src/schema.ts
+ */
+export const GITLABDUO_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "preToolUse",
   "sessionEnd",
 ];
 
@@ -764,23 +1011,32 @@ export const QWENCODE_HOOK_EVENTS: readonly HookEvent[] = [
  * Hook events supported by Reasonix.
  *
  * Reasonix's `.reasonix/settings.json` (project) / `~/.reasonix/settings.json`
- * (global) documents a ten-event surface (`PreToolUse`, `PostToolUse`,
- * `UserPromptSubmit`, `Stop`, `PostLLMCall`, `SessionStart`, `SessionEnd`,
- * `SubagentStop`, `Notification`, `PreCompact`). All ten have a clean canonical
+ * (global) accepts the thirteen events declared in `internal/hook/hook.go`
+ * (`var Events`): `PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+ * `PermissionRequest`, `UserPromptSubmit`, `Stop`, `StopFailure`,
+ * `PostLLMCall`, `SessionStart`, `SessionEnd`, `SubagentStop`, `Notification`,
+ * `PreCompact`. The zh-CN desktop hooks page documents only ten of them, so the
+ * source file is the authoritative list. All thirteen have a clean canonical
  * equivalent and are mapped: `PreToolUse`, `PostToolUse`,
- * `UserPromptSubmit` ← `beforeSubmitPrompt`, `Stop`, `SessionStart`,
- * `SessionEnd`, `SubagentStop`, `PostLLMCall` ← `postModelInvocation`,
- * `Notification` ← `notification`, and `PreCompact` ← `preCompact`.
- * `match` (Reasonix's matcher field name) is honored only on
- * `PreToolUse`/`PostToolUse`, matching the canonical `matcher` field's
- * tool-event scoping used by other adapters.
+ * `PostToolUseFailure`, `PermissionRequest`, `UserPromptSubmit` ←
+ * `beforeSubmitPrompt`, `Stop`, `StopFailure`, `SessionStart`, `SessionEnd`,
+ * `SubagentStop`, `PostLLMCall` ← `postModelInvocation`, `Notification` ←
+ * `notification`, and `PreCompact` ← `preCompact`.
+ * `match` (Reasonix's matcher field name) is honored on the four tool-scoped
+ * events (`PreToolUse`, `PostToolUse`, `PostToolUseFailure`,
+ * `PermissionRequest` — `UsesToolMatcher` in `internal/hook/inspect.go`) and
+ * ignored everywhere else.
+ * @see https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/internal/hook/hook.go
  * @see https://github.com/esengine/DeepSeek-Reasonix/blob/main-v2/docs/DESKTOP_HOOKS.zh-CN.md
  */
 export const REASONIX_HOOK_EVENTS: readonly HookEvent[] = [
   "preToolUse",
   "postToolUse",
+  "postToolUseFailure",
+  "permissionRequest",
   "beforeSubmitPrompt",
   "stop",
+  "stopFailure",
   "sessionStart",
   "sessionEnd",
   "subagentStop",
@@ -830,9 +1086,14 @@ export const GROKCLI_HOOK_EVENTS: readonly HookEvent[] = [
  *
  * Kimi Code also exposes `PermissionResult`, `Interrupt`, and the four events
  * added in 0.32.0 (`TurnStarted`, `UserPromptQueued`, `TaskStarted`,
- * `SessionHeartbeat`), none of which have a canonical rulesync event. They are
- * listed in `KIMI_CODE_NATIVE_HOOK_EVENTS` so a per-tool `kimi-code` override
- * can address them by their native name.
+ * `SessionHeartbeat`), none of which is mapped onto a canonical rulesync event
+ * here. `Interrupt` (fires instead of `Stop` when the user interrupts a turn)
+ * does have a canonical shape — `stopCancelled`, which Grok CLI, Codex CLI and
+ * Cline map — but Kimi keeps it native-only for now, since an existing `kimi-code`
+ * override addressing it by name would otherwise double up with a canonical
+ * `stopCancelled` block; folding it in is a follow-up. All six are listed in
+ * `KIMI_CODE_NATIVE_HOOK_EVENTS` so a per-tool `kimi-code` override can
+ * address them by their native name.
  *
  * @see https://moonshotai.github.io/kimi-code/en/customization/hooks.html
  */
@@ -901,10 +1162,501 @@ export const KIMI_CODE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object
 );
 
 /**
+ * Hook events supported by ZCode.
+ *
+ * ZCode's configuration-file hooks expose exactly seven PascalCase events, all
+ * of which have a clean canonical equivalent: `SessionStart`, `PreToolUse`,
+ * `PostToolUse`, `PostToolUseFailure`, `PermissionRequest`, `Stop`, and
+ * `UserPromptSubmit` ← `beforeSubmitPrompt`. An optional matcher is honored on
+ * all of them except `UserPromptSubmit` and `Stop`, which expose no value to
+ * match against. ZCode reads the matcher in one of two ways: a value made up
+ * solely of letters, digits, underscores and `|` is an exact name list
+ * (`Write|Edit` matches those two tool names, not the regex alternation), and
+ * any other character makes the whole value a case-sensitive JavaScript regex.
+ * Rulesync passes matchers through verbatim, so an authored value keeps
+ * whichever reading ZCode gives it — worth knowing before escaping one.
+ * Configuration hooks are read from the workspace config
+ * `<project>/.zcode/config.json` (run only once the user trusts them) and the
+ * user config `~/.zcode/cli/config.json`, and additionally require
+ * `hooks.enabled: true` to run.
+ *
+ * ZCode also accepts a native `process` hook type (an argv run without a
+ * shell) which has no canonical equivalent; see ZcodeHooks.
+ *
+ * @see https://zcode.z.ai/en/docs
+ */
+export const ZCODE_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "beforeSubmitPrompt",
+  "preToolUse",
+  "postToolUse",
+  "postToolUseFailure",
+  "permissionRequest",
+  "stop",
+];
+
+export const CANONICAL_TO_ZCODE_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "SessionStart",
+  beforeSubmitPrompt: "UserPromptSubmit",
+  preToolUse: "PreToolUse",
+  postToolUse: "PostToolUse",
+  postToolUseFailure: "PostToolUseFailure",
+  permissionRequest: "PermissionRequest",
+  stop: "Stop",
+};
+
+export const ZCODE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_ZCODE_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by IBM Bob's lifecycle hooks.
+ *
+ * Bob reads `hooks` from `.bob/settings.json` (project) and
+ * `~/.bob/settings/settings.json` (user) in the Claude-Code shape and fires
+ * seven events: SessionStart, UserPromptSubmit, PreToolUse, PostToolUse,
+ * PreCompact, PostCompact (both added by Bob Shell 2.0.3) and Stop. Handlers
+ * are `command` or `https` hooks, and `matcher` (a regex over the tool name)
+ * applies to the two tool events.
+ *
+ * @see https://bob.ibm.com/docs/shell/configuration/lifecycle-hooks
+ * @see https://bob.ibm.com/docs/ide/configuration/lifecycle-hooks
+ */
+export const BOB_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "beforeSubmitPrompt",
+  "preToolUse",
+  "postToolUse",
+  "preCompact",
+  "postCompact",
+  "stop",
+];
+
+export const CANONICAL_TO_BOB_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "SessionStart",
+  beforeSubmitPrompt: "UserPromptSubmit",
+  preToolUse: "PreToolUse",
+  postToolUse: "PostToolUse",
+  preCompact: "PreCompact",
+  postCompact: "PostCompact",
+  stop: "Stop",
+};
+
+export const BOB_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_BOB_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by Tabnine CLI.
+ *
+ * Tabnine CLI reads `hooks` from `.tabnine/agent/settings.json` (project) and
+ * `~/.tabnine/agent/settings.json` (user) and fires eleven events with
+ * PascalCase names. Only `command` hooks exist; `matcher` is a regex over the
+ * tool name for the two tool events and an exact string for the lifecycle
+ * events, and `timeout` is expressed in milliseconds.
+ *
+ * @see https://docs.tabnine.com/main/getting-started/tabnine-cli/features/hooks
+ * @see https://docs.tabnine.com/main/getting-started/tabnine-cli/features/hooks/configuration
+ */
+export const TABNINE_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "sessionEnd",
+  "beforeSubmitPrompt",
+  "stop",
+  "preModelInvocation",
+  "postModelInvocation",
+  "beforeToolSelection",
+  "preToolUse",
+  "postToolUse",
+  "preCompact",
+  "notification",
+];
+
+export const CANONICAL_TO_TABNINE_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "SessionStart",
+  sessionEnd: "SessionEnd",
+  beforeSubmitPrompt: "BeforeAgent",
+  stop: "AfterAgent",
+  preModelInvocation: "BeforeModel",
+  postModelInvocation: "AfterModel",
+  beforeToolSelection: "BeforeToolSelection",
+  preToolUse: "BeforeTool",
+  postToolUse: "AfterTool",
+  preCompact: "PreCompress",
+  notification: "Notification",
+};
+
+export const TABNINE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_TABNINE_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by Snowflake Cortex Code.
+ *
+ * Cortex Code reads `hooks` from `.cortex/settings.json` (project) and
+ * `~/.snowflake/cortex/hooks.json` (user) in the Claude-Code-shaped layout:
+ * PascalCase event names, a regex `matcher` over the tool name, and `command`
+ * or `prompt` hooks with a `timeout` in seconds and an optional `enabled`
+ * flag. `$CORTEX_PROJECT_DIR` resolves to the project root inside commands.
+ *
+ * @see https://docs.snowflake.com/en/user-guide/cortex-code/extensibility
+ * @see https://docs.snowflake.com/en/user-guide/cortex-code/settings
+ */
+export const CORTEXCODE_HOOK_EVENTS: readonly HookEvent[] = [
+  "preToolUse",
+  "postToolUse",
+  "permissionRequest",
+  "beforeSubmitPrompt",
+  "sessionStart",
+  "sessionEnd",
+  "preCompact",
+  "stop",
+  "subagentStop",
+  "notification",
+  "setup",
+];
+
+export const CANONICAL_TO_CORTEXCODE_EVENT_NAMES: Record<string, string> = {
+  preToolUse: "PreToolUse",
+  postToolUse: "PostToolUse",
+  permissionRequest: "PermissionRequest",
+  beforeSubmitPrompt: "UserPromptSubmit",
+  sessionStart: "SessionStart",
+  sessionEnd: "SessionEnd",
+  preCompact: "PreCompact",
+  stop: "Stop",
+  subagentStop: "SubagentStop",
+  notification: "Notification",
+  setup: "Setup",
+};
+
+export const CORTEXCODE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_CORTEXCODE_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by CodeBuddy Code.
+ *
+ * CodeBuddy Code reads hooks from the `hooks` key of `.codebuddy/settings.json`
+ * (project) and `~/.codebuddy/settings.json` (user) in the Claude-Code shape:
+ * PascalCase event names, a regex `matcher`, and `command`, `http`, `prompt`
+ * or `agent` hooks with a `timeout` in seconds. The hooks reference documents ten events; the
+ * plugins reference lists the full set, stating that plugin hooks "respond to
+ * the same lifecycle events as user-defined hooks", so every event listed
+ * there is supported here. The hooks reference also names `Setup`
+ * (bootstrap/maintenance), and the published package's settings schema
+ * (`@tencent-ai/codebuddy-code` 2.167.0) accepts `UserPromptExpansion`, whose
+ * matcher filters on `command_name` as in Claude Code.
+ *
+ * @see https://www.codebuddy.ai/docs/cli/hooks
+ * @see https://www.codebuddy.ai/docs/cli/plugins-reference
+ * @see https://www.npmjs.com/package/@tencent-ai/codebuddy-code/v/2.167.0
+ */
+export const CODEBUDDY_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "beforeSubmitPrompt",
+  "preToolUse",
+  "permissionRequest",
+  "permissionDenied",
+  "postToolUse",
+  "postToolUseFailure",
+  "notification",
+  "subagentStart",
+  "subagentStop",
+  "taskCreated",
+  "taskCompleted",
+  "stop",
+  "stopFailure",
+  "teammateIdle",
+  "instructionsLoaded",
+  "configChange",
+  "cwdChanged",
+  "fileChanged",
+  "worktreeCreate",
+  "worktreeRemove",
+  "preCompact",
+  "postCompact",
+  "elicitation",
+  "elicitationResult",
+  "sessionEnd",
+  "setup",
+  "userPromptExpansion",
+];
+
+/**
+ * CodeBuddy Code events that fire on every occurrence and take no `matcher`.
+ * The hooks reference's event matrix marks UserPromptSubmit, Stop,
+ * SubagentStop and PostCompact as matcher-less; the plugin-only events that
+ * fire on every occurrence follow Claude Code's documented set.
+ * @see https://www.codebuddy.ai/docs/cli/hooks
+ */
+export const CODEBUDDY_NO_MATCHER_HOOK_EVENTS: readonly HookEvent[] = [
+  "beforeSubmitPrompt",
+  "stop",
+  "subagentStop",
+  "postCompact",
+  "taskCreated",
+  "taskCompleted",
+  "teammateIdle",
+  "cwdChanged",
+  "worktreeCreate",
+  "worktreeRemove",
+];
+
+/** CodeBuddy Code events whose hooks accept a `matcher`. */
+export const CODEBUDDY_MATCHER_HOOK_EVENTS: readonly HookEvent[] = CODEBUDDY_HOOK_EVENTS.filter(
+  (event) => !CODEBUDDY_NO_MATCHER_HOOK_EVENTS.includes(event),
+);
+
+export const CANONICAL_TO_CODEBUDDY_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "SessionStart",
+  beforeSubmitPrompt: "UserPromptSubmit",
+  preToolUse: "PreToolUse",
+  permissionRequest: "PermissionRequest",
+  permissionDenied: "PermissionDenied",
+  postToolUse: "PostToolUse",
+  postToolUseFailure: "PostToolUseFailure",
+  notification: "Notification",
+  subagentStart: "SubagentStart",
+  subagentStop: "SubagentStop",
+  taskCreated: "TaskCreated",
+  taskCompleted: "TaskCompleted",
+  stop: "Stop",
+  stopFailure: "StopFailure",
+  teammateIdle: "TeammateIdle",
+  instructionsLoaded: "InstructionsLoaded",
+  configChange: "ConfigChange",
+  cwdChanged: "CwdChanged",
+  fileChanged: "FileChanged",
+  worktreeCreate: "WorktreeCreate",
+  worktreeRemove: "WorktreeRemove",
+  preCompact: "PreCompact",
+  postCompact: "PostCompact",
+  elicitation: "Elicitation",
+  elicitationResult: "ElicitationResult",
+  sessionEnd: "SessionEnd",
+  setup: "Setup",
+  userPromptExpansion: "UserPromptExpansion",
+};
+
+export const CODEBUDDY_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_CODEBUDDY_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by Qoder (the Qoder CLI, IDE and JetBrains plugin).
+ *
+ * Qoder reads `hooks` from `~/.qoder/settings.json` (user),
+ * `<project>/.qoder/settings.json` and `<project>/.qoder/settings.local.json`
+ * in the Claude-Code-shaped layout: PascalCase event names, a `matcher` per
+ * group, and `command` / `http` / `prompt` / `agent` handlers with a `timeout`
+ * in seconds. These are the 27 documented events; Claude Code's
+ * `MessageDisplay`, `UserPromptExpansion`, `PostToolBatch` and `DirectoryAdded`
+ * have no Qoder counterpart.
+ *
+ * @see https://docs.qoder.com/en/cli/hooks-reference
+ * @see https://docs.qoder.com/en/cli/hooks
+ */
+export const QODER_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "sessionEnd",
+  "preToolUse",
+  "postToolUse",
+  "postToolUseFailure",
+  "beforeSubmitPrompt",
+  "stop",
+  "stopFailure",
+  "subagentStart",
+  "subagentStop",
+  "preCompact",
+  "postCompact",
+  "notification",
+  "configChange",
+  "instructionsLoaded",
+  "cwdChanged",
+  "fileChanged",
+  "worktreeCreate",
+  "worktreeRemove",
+  "elicitation",
+  "elicitationResult",
+  "taskCreated",
+  "taskCompleted",
+  "permissionRequest",
+  "permissionDenied",
+  "teammateIdle",
+  "setup",
+];
+
+export const CANONICAL_TO_QODER_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "SessionStart",
+  sessionEnd: "SessionEnd",
+  preToolUse: "PreToolUse",
+  postToolUse: "PostToolUse",
+  postToolUseFailure: "PostToolUseFailure",
+  beforeSubmitPrompt: "UserPromptSubmit",
+  stop: "Stop",
+  stopFailure: "StopFailure",
+  subagentStart: "SubagentStart",
+  subagentStop: "SubagentStop",
+  preCompact: "PreCompact",
+  postCompact: "PostCompact",
+  notification: "Notification",
+  configChange: "ConfigChange",
+  instructionsLoaded: "InstructionsLoaded",
+  cwdChanged: "CwdChanged",
+  fileChanged: "FileChanged",
+  worktreeCreate: "WorktreeCreate",
+  worktreeRemove: "WorktreeRemove",
+  elicitation: "Elicitation",
+  elicitationResult: "ElicitationResult",
+  taskCreated: "TaskCreated",
+  taskCompleted: "TaskCompleted",
+  permissionRequest: "PermissionRequest",
+  permissionDenied: "PermissionDenied",
+  teammateIdle: "TeammateIdle",
+  setup: "Setup",
+};
+
+export const QODER_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_QODER_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by Command Code.
+ *
+ * Command Code reads hooks from the `hooks` key of `.commandcode/settings.json`
+ * (project) and `~/.commandcode/settings.json` (user) in the Claude-Code shape.
+ * Four events are documented: PreToolUse, PostToolUse, Stop and SessionStart.
+ * Only `command` hooks exist; `timeout` is in seconds (default 30, max 600)
+ * and `$COMMANDCODE_PROJECT_DIR` resolves to the project root.
+ *
+ * @see https://commandcode.ai/docs/hooks
+ */
+export const COMMANDCODE_HOOK_EVENTS: readonly HookEvent[] = [
+  "preToolUse",
+  "postToolUse",
+  "stop",
+  "sessionStart",
+];
+
+export const CANONICAL_TO_COMMANDCODE_EVENT_NAMES: Record<string, string> = {
+  preToolUse: "PreToolUse",
+  postToolUse: "PostToolUse",
+  stop: "Stop",
+  sessionStart: "SessionStart",
+};
+
+export const COMMANDCODE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_COMMANDCODE_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by Letta Code.
+ *
+ * Letta Code reads hooks from the `hooks` key of `.letta/settings.json`
+ * (project), `.letta/settings.local.json` (personal project) and
+ * `~/.letta/settings.json` (user) in the Claude-Code shape. The four tool
+ * events take a regex `matcher`; the other events carry none. `timeout` is in
+ * milliseconds (default 60000) and hooks run with the project directory as
+ * their working directory.
+ *
+ * @see https://github.com/letta-ai/letta-code/blob/main/src/hooks/types.ts
+ */
+export const LETTACODE_HOOK_EVENTS: readonly HookEvent[] = [
+  "sessionStart",
+  "sessionEnd",
+  "preToolUse",
+  "postToolUse",
+  "postToolUseFailure",
+  "permissionRequest",
+  "beforeSubmitPrompt",
+  "notification",
+  "stop",
+  "subagentStop",
+  "preCompact",
+];
+
+export const CANONICAL_TO_LETTACODE_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "SessionStart",
+  sessionEnd: "SessionEnd",
+  preToolUse: "PreToolUse",
+  postToolUse: "PostToolUse",
+  postToolUseFailure: "PostToolUseFailure",
+  permissionRequest: "PermissionRequest",
+  beforeSubmitPrompt: "UserPromptSubmit",
+  notification: "Notification",
+  stop: "Stop",
+  subagentStop: "SubagentStop",
+  preCompact: "PreCompact",
+};
+
+export const LETTACODE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_LETTACODE_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Hook events supported by the Continue CLI (`cn`).
+ *
+ * Continue reads a Claude-Code-compatible `hooks` key from
+ * `~/.continue/settings.json` (user) and `.continue/settings.json` (project):
+ * PascalCase event names, a regex `matcher` over the event's subject (tool
+ * name, session source, ...), and `command` / `http` / `prompt` / `agent`
+ * handlers with a `timeout` in seconds. `$CONTINUE_PROJECT_DIR` resolves to
+ * the working directory inside commands. The event list is the CLI's
+ * `HOOK_EVENT_NAMES`.
+ *
+ * @see https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/extensions/cli/src/hooks/types.ts
+ * @see https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/extensions/cli/src/hooks/hookConfig.ts
+ */
+export const CONTINUE_HOOK_EVENTS: readonly HookEvent[] = [
+  "preToolUse",
+  "postToolUse",
+  "postToolUseFailure",
+  "permissionRequest",
+  "beforeSubmitPrompt",
+  "sessionStart",
+  "sessionEnd",
+  "stop",
+  "notification",
+  "subagentStart",
+  "subagentStop",
+  "preCompact",
+  "configChange",
+  "teammateIdle",
+  "taskCompleted",
+  "worktreeCreate",
+  "worktreeRemove",
+];
+
+export const CANONICAL_TO_CONTINUE_EVENT_NAMES: Record<string, string> = {
+  preToolUse: "PreToolUse",
+  postToolUse: "PostToolUse",
+  postToolUseFailure: "PostToolUseFailure",
+  permissionRequest: "PermissionRequest",
+  beforeSubmitPrompt: "UserPromptSubmit",
+  sessionStart: "SessionStart",
+  sessionEnd: "SessionEnd",
+  stop: "Stop",
+  notification: "Notification",
+  subagentStart: "SubagentStart",
+  subagentStop: "SubagentStop",
+  preCompact: "PreCompact",
+  configChange: "ConfigChange",
+  teammateIdle: "TeammateIdle",
+  taskCompleted: "TaskCompleted",
+  worktreeCreate: "WorktreeCreate",
+  worktreeRemove: "WorktreeRemove",
+};
+
+export const CONTINUE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_CONTINUE_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
  * Hook events supported by Hermes Agent's native Shell Hooks system.
  *
- * Hermes validates hook events against a fixed `VALID_HOOKS` set — 37 entries as
- * of v0.20.2 (`v2026.8.16`); see {@link HERMESAGENT_NATIVE_HOOK_EVENTS} for the
+ * Hermes validates hook events against a fixed `VALID_HOOKS` set — 44 entries as
+ * of v0.21.6 (tag `v0.21.6`); see {@link HERMESAGENT_NATIVE_HOOK_EVENTS} for the
  * full list. Only the events with a clean 1:1 canonical equivalent are mapped
  * here. All other native events round-trip through `hermesagent.hooks`.
  * @see https://github.com/NousResearch/hermes-agent/blob/main/website/docs/user-guide/features/hooks.md
@@ -929,11 +1681,15 @@ export const HERMESAGENT_HOOK_EVENTS: readonly HookEvent[] = [
  * observers, `gateway_platform_event` and `transform_api_error_classification`.
  * Shell hooks are gated on the same set.
  *
- * Verified against the tag `v2026.8.16` (v0.20.2): `VALID_HOOKS` holds 37
- * entries, grown from 23 at `v2026.8.3` (v0.20.0). This list holds 36 of them —
- * see {@link HERMESAGENT_SHELL_UNSUPPORTED_HOOK_EVENTS} for the exclusion.
+ * Verified against the tag `v0.21.6`: `VALID_HOOKS` holds 44 entries, grown
+ * from 23 at `v2026.8.3` (v0.20.0) and 37 at `v2026.8.16` (v0.20.2) — v0.21
+ * added `agent_loop_stopped` and `on_room_member_activity`, v0.21.5 added
+ * `pre_auxiliary_call` and `post_auxiliary_call`, and v0.21.6 added
+ * `post_gateway_admission`, `on_human_input_request` and
+ * `on_human_input_resolved`. This list holds 43 of them — see
+ * {@link HERMESAGENT_SHELL_UNSUPPORTED_HOOK_EVENTS} for the exclusion.
  *
- * @see https://github.com/NousResearch/hermes-agent/blob/v2026.8.16/hermes_cli/plugins.py
+ * @see https://github.com/NousResearch/hermes-agent/blob/v0.21.6/hermes_cli/plugins.py
  */
 export const HERMESAGENT_NATIVE_HOOK_EVENTS = [
   "pre_tool_call",
@@ -951,6 +1707,8 @@ export const HERMESAGENT_NATIVE_HOOK_EVENTS = [
   "pre_api_request",
   "post_api_request",
   "api_request_error",
+  "pre_auxiliary_call",
+  "post_auxiliary_call",
   "on_session_start",
   "on_session_end",
   "on_session_finalize",
@@ -959,8 +1717,13 @@ export const HERMESAGENT_NATIVE_HOOK_EVENTS = [
   "subagent_start",
   "subagent_stop",
   "pre_gateway_dispatch",
+  "post_gateway_admission",
+  "agent_loop_stopped",
   "pre_approval_request",
   "post_approval_response",
+  "on_human_input_request",
+  "on_human_input_resolved",
+  "on_room_member_activity",
   "pre_transcription",
   "kanban_task_claimed",
   "kanban_task_completed",
@@ -984,8 +1747,8 @@ export const HERMESAGENT_NATIVE_HOOK_EVENTS = [
  * rulesync only ever writes shell hooks, so these are excluded from
  * {@link HERMESAGENT_NATIVE_HOOK_EVENTS} and warned about with their own message.
  *
- * @see https://github.com/NousResearch/hermes-agent/blob/v2026.8.16/hermes_cli/plugins.py — `SHELL_UNSUPPORTED_HOOKS`
- * @see https://github.com/NousResearch/hermes-agent/blob/v2026.8.16/agent/shell_hooks.py — `_parse_hooks_block`
+ * @see https://github.com/NousResearch/hermes-agent/blob/v0.21.6/hermes_cli/plugins.py — `SHELL_UNSUPPORTED_HOOKS`
+ * @see https://github.com/NousResearch/hermes-agent/blob/v0.21.6/agent/shell_hooks.py — `_parse_hooks_block`
  */
 export const HERMESAGENT_SHELL_UNSUPPORTED_HOOK_EVENTS = [
   "transform_api_error_classification",
@@ -1047,12 +1810,22 @@ export const HooksConfigSchema = z.looseObject({
   version: z.optional(z.number()),
   hooks: canonicalHooksRecordSchema,
   cursor: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  firebender: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   claudecode: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   copilot: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
-  copilotcli: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  copilotcli: z.optional(
+    z.looseObject({
+      hooks: z.optional(hooksRecordSchema),
+      // Copilot CLI settings switch that disables every hook when true. It
+      // lives in `settings.json`, not in the hooks file.
+      disableAllHooks: z.optional(z.boolean()),
+    }),
+  ),
   opencode: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   kilo: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  mimocode: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   pi: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  omp: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   amp: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   factorydroid: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   codexcli: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
@@ -1067,10 +1840,29 @@ export const HooksConfigSchema = z.looseObject({
   "antigravity-cli": z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   hermesagent: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   junie: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  gitlabduo: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   vibe: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  codewhale: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   reasonix: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   grokcli: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
-  "kimi-code": z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  "kimi-code": z.optional(
+    z.looseObject({
+      hooks: z.optional(hooksRecordSchema),
+      // When false, commands are emitted verbatim instead of being wrapped to
+      // `cd` into the directory holding the source `.rulesync/hooks.jsonc`.
+      runFromSourceDirectory: z.optional(z.boolean()),
+    }),
+  ),
+  zcode: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  crush: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  pool: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  bob: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  codebuddy: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  cortexcode: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  commandcode: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  lettacode: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  continue: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
+  tabnine: z.optional(z.looseObject({ hooks: z.optional(hooksRecordSchema) })),
   qwencode: z.optional(
     z.looseObject({
       hooks: z.optional(hooksRecordSchema),
@@ -1117,6 +1909,8 @@ export const CANONICAL_TO_CLAUDE_EVENT_NAMES: Record<string, string> = {
   postCompact: "PostCompact",
   elicitation: "Elicitation",
   elicitationResult: "ElicitationResult",
+  preModelSwitch: "PreModelSwitch",
+  postModelSwitch: "PostModelSwitch",
 };
 
 /**
@@ -1141,17 +1935,24 @@ export const CANONICAL_TO_DEVIN_EVENT_NAMES: Record<string, string> = {
   beforeSubmitPrompt: "UserPromptSubmit",
   stop: "Stop",
   permissionRequest: "PermissionRequest",
-  // Devin's post-context-compaction event uses the `PostCompaction` PascalCase
-  // key (not `PostCompact`). https://docs.devin.ai/cli/changelog/stable
+  // `PreCompact` (CLI v3000.11.92) runs before context compaction and takes a
+  // `manual` / `auto` trigger matcher.
+  preCompact: "PreCompact",
+  // Devin's post-context-compaction event is emitted under the long-standing
+  // `PostCompaction` key, which v3000.11.92 keeps supported next to the new
+  // `PostCompact` and which older CLIs also read.
+  // https://docs.devin.ai/cli/changelog/stable
   postCompact: "PostCompaction",
 };
 
 /**
- * Map Devin Local PascalCase event names to canonical camelCase.
+ * Map Devin Local PascalCase event names to canonical camelCase. `PostCompact`
+ * (CLI v3000.11.92) is accepted on import as an alias of `PostCompaction`.
  */
-export const DEVIN_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
-  Object.entries(CANONICAL_TO_DEVIN_EVENT_NAMES).map(([k, v]) => [v, k]),
-);
+export const DEVIN_TO_CANONICAL_EVENT_NAMES: Record<string, string> = {
+  ...Object.fromEntries(Object.entries(CANONICAL_TO_DEVIN_EVENT_NAMES).map(([k, v]) => [v, k])),
+  PostCompact: "postCompact",
+};
 
 /**
  * Map canonical camelCase event names to AugmentCode PascalCase.
@@ -1274,9 +2075,15 @@ export const CANONICAL_TO_OPENCODE_EVENT_NAMES: Record<string, string> = {
   // `NAMED_HOOK_MATCHER_SUBJECTS` in `opencode-style-generator.ts`.
   preCompact: "experimental.session.compacting",
   beforeSubmitPrompt: "chat.message",
+  // Fires only for slash commands, on the expanded parts right before they
+  // are submitted (`chat.message` covers every prompt).
+  userPromptExpansion: "command.execute.before",
+  // Fires before every LLM request, for the main agent and subagents alike.
+  preModelInvocation: "chat.params",
   postCompact: "session.compacted",
   afterError: "session.error",
   fileChanged: "file.watcher.updated",
+  sessionDelete: "session.deleted",
 };
 
 /**
@@ -1296,11 +2103,15 @@ export const CANONICAL_TO_KILO_EVENT_NAMES: Record<string, string> =
  * Mapping notes: `sessionEnd` → `session_shutdown` (fires on session
  * teardown), `beforeSubmitPrompt` → `input` (user input interception),
  * `preModelInvocation` → `context` (fires before each LLM call), and
- * `stop` → `agent_end` (agent finished responding; unlike Claude Code's
- * Stop, this also fires before Pi auto-retries or auto-compacts —
- * `agent_settled` would skip queued follow-ups instead, a pure trade-off).
- * Pi events without a faithful canonical counterpart (e.g. `turn_start`,
- * `agent_settled`) are intentionally unmapped.
+ * `stop` → `agent_before_settle` (Pi v0.87.0+; the last actionable boundary
+ * before a run settles, fired after automatic retries and compaction, so it
+ * runs once per settle like Claude Code's Stop, and a command exiting with
+ * code 2 can ask the agent to continue once). Older Pi never fires it, so a stop hook does
+ * not run there; the notify-only `agent_end` it replaced fired before retries
+ * and compaction too. Pi events without a faithful canonical counterpart
+ * (e.g. `turn_start`, `agent_end`, `ui_prompt_end`) are intentionally
+ * unmapped; the generated extension subscribes to `agent_settled` only to
+ * reset the stop hook's continue-once guard.
  *
  * @see https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/extensions.md
  */
@@ -1309,6 +2120,12 @@ export const CANONICAL_TO_PI_EVENT_NAMES: Record<string, string> = {
   sessionEnd: "session_shutdown",
   preToolUse: "tool_call",
   postToolUse: "tool_result",
+  // `tool_result` fires for every finished tool call and exposes
+  // `event.isError`; the generated extension runs `postToolUseFailure`
+  // handlers only when it is set. `postToolUse` is left as it was (it fires for
+  // failed calls too), as it always has for Pi — changing that would silently
+  // drop hook runs from existing configs.
+  postToolUseFailure: "tool_result",
   preModelInvocation: "context",
   // `message_end` fires for user, assistant, and toolResult messages; the
   // generated extension filters to assistant messages so the hook runs once
@@ -1317,10 +2134,51 @@ export const CANONICAL_TO_PI_EVENT_NAMES: Record<string, string> = {
   // and exposes only HTTP status/headers.
   postModelInvocation: "message_end",
   beforeSubmitPrompt: "input",
-  stop: "agent_end",
+  // Pi v0.87.0 made `agent_before_settle` actionable: returning
+  // `{ entries, continue: true }` runs one more model request. The generated
+  // handler does that when a stop hook command exits with code 2, at most once
+  // per settled run. https://github.com/earendil-works/pi/blob/v0.87.1/packages/coding-agent/src/core/extensions/types.ts
+  stop: "agent_before_settle",
+  // Pi has no built-in permission popup, so its only "waiting for user"
+  // signal is `ui_prompt_start`, fired when an extension (Rulesync's or a
+  // third party's) opens a blocking `ctx.ui.select/confirm/input/editor/custom`
+  // prompt. It is narrower than Claude Code's `Notification` (nothing fires
+  // for core Pi), and notification-only: handlers are best-effort and not
+  // awaited, so a hook command can neither delay nor cancel the prompt.
+  // Nested prompts coalesce into one span, so it fires once per span.
+  notification: "ui_prompt_start",
   preCompact: "session_before_compact",
   // Pi documents `session_compact` alongside `session_before_compact`, and
   // v0.79.10 gave both the same `reason` / `willRetry` metadata.
+  postCompact: "session_compact",
+};
+
+/**
+ * Map canonical camelCase event names to oh-my-pi extension event names. They
+ * are Pi's names (see CANONICAL_TO_PI_EVENT_NAMES) for the events oh-my-pi
+ * kept, plus `session_stop` for `stop`. Note that oh-my-pi runs
+ * `session_shutdown` handlers with a 2-second budget, and fails a `tool_call`
+ * closed when its handler exceeds `extensionHandlers.toolCallTimeoutMs`
+ * (30 seconds by default).
+ *
+ * @see https://github.com/can1357/oh-my-pi/blob/40e9368ef0458fd9073329cdff4174895f91bc6b/docs/extensions.md
+ */
+export const CANONICAL_TO_OMP_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "session_start",
+  sessionEnd: "session_shutdown",
+  preToolUse: "tool_call",
+  // `tool_result` carries `isError`; `postToolUseFailure` handlers gate on it.
+  postToolUse: "tool_result",
+  postToolUseFailure: "tool_result",
+  preModelInvocation: "context",
+  // Filtered to assistant messages by the generated handler, as for Pi.
+  postModelInvocation: "message_end",
+  beforeSubmitPrompt: "input",
+  // oh-my-pi has no `agent_before_settle`; `session_stop` fires before a
+  // main-session run settles and can ask for one more turn. See
+  // `OMP_SESSION_STOP_BLOCKING_EVENT` in pi-extension-generator.ts.
+  stop: "session_stop",
+  preCompact: "session_before_compact",
   postCompact: "session_compact",
 };
 
@@ -1348,6 +2206,7 @@ export const CANONICAL_TO_CLINE_EVENT_NAMES: Record<string, string> = {
   notification: "Notification",
   taskCompleted: "TaskComplete",
   afterError: "TaskError",
+  stopCancelled: "TaskCancel",
 };
 
 /**
@@ -1419,6 +2278,7 @@ export const CANONICAL_TO_CODEXCLI_EVENT_NAMES: Record<string, string> = {
   postToolUse: "PostToolUse",
   beforeSubmitPrompt: "UserPromptSubmit",
   stop: "Stop",
+  stopCancelled: "Interrupt",
   permissionRequest: "PermissionRequest",
   subagentStart: "SubagentStart",
   subagentStop: "SubagentStop",
@@ -1604,6 +2464,22 @@ export const KIRO_IDE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.
 );
 
 /**
+ * Map canonical camelCase event names to GitLab Duo CLI PascalCase.
+ */
+export const CANONICAL_TO_GITLABDUO_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "SessionStart",
+  preToolUse: "PreToolUse",
+  sessionEnd: "SessionEnd",
+};
+
+/**
+ * Map GitLab Duo CLI PascalCase event names to canonical camelCase.
+ */
+export const GITLABDUO_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_GITLABDUO_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
  * Map canonical camelCase event names to Junie PascalCase.
  * Junie reuses the same PascalCase names as Claude for the events it supports.
  */
@@ -1659,6 +2535,45 @@ export const VIBE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = {
 };
 
 /**
+ * Map canonical camelCase event names to Codewhale snake_case.
+ *
+ * `stop` → `turn_end` (after each completed turn), `stopFailure` →
+ * `session_error` (a turn that ends in a terminal failure), and `afterError`
+ * → `on_error`.
+ * @see https://github.com/Hmbown/Codewhale/blob/main/docs/HOOKS.md
+ */
+export const CANONICAL_TO_CODEWHALE_EVENT_NAMES: Record<string, string> = {
+  sessionStart: "session_start",
+  sessionEnd: "session_end",
+  stop: "turn_end",
+  beforeSubmitPrompt: "message_submit",
+  preToolUse: "tool_call_before",
+  postToolUse: "tool_call_after",
+  afterError: "on_error",
+  subagentStart: "subagent_spawn",
+  subagentStop: "subagent_complete",
+  stopFailure: "session_error",
+};
+
+/** Map Codewhale snake_case event names to canonical camelCase. */
+export const CODEWHALE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_CODEWHALE_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
+ * Canonical -> Crush event names. Crush spells its events the Claude Code
+ * way (`PreToolUse`).
+ * @see https://github.com/charmbracelet/crush/blob/main/docs/hooks/README.md
+ */
+export const CANONICAL_TO_CRUSH_EVENT_NAMES: Record<string, string> = {
+  preToolUse: "PreToolUse",
+};
+
+export const CRUSH_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.fromEntries(
+  Object.entries(CANONICAL_TO_CRUSH_EVENT_NAMES).map(([k, v]) => [v, k]),
+);
+
+/**
  * Map canonical camelCase event names to Qwen Code PascalCase.
  *
  * Qwen Code reuses the same Claude-style PascalCase event names for the events
@@ -1706,8 +2621,11 @@ export const QWENCODE_TO_CANONICAL_EVENT_NAMES: Record<string, string> = Object.
 export const CANONICAL_TO_REASONIX_EVENT_NAMES: Record<string, string> = {
   preToolUse: "PreToolUse",
   postToolUse: "PostToolUse",
+  postToolUseFailure: "PostToolUseFailure",
+  permissionRequest: "PermissionRequest",
   beforeSubmitPrompt: "UserPromptSubmit",
   stop: "Stop",
+  stopFailure: "StopFailure",
   sessionStart: "SessionStart",
   sessionEnd: "SessionEnd",
   subagentStop: "SubagentStop",

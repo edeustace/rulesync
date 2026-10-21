@@ -115,13 +115,34 @@ describe("AmpMcp", () => {
       expect(ampMcp.getFilePath()).toBe(join(testDir, ".config", "amp", "settings.json"));
     });
 
+    it("should not import an MCP server reachable only through `__proto__`", async () => {
+      // The prototype swap makes `amp.mcpServers` readable without it ever
+      // appearing in the document's own keys, so an unsanitized read imported a
+      // server the user never wrote and copied it into generated settings.
+      await ensureDir(join(testDir, ".amp"));
+      await writeFileContent(
+        join(testDir, ".amp", "settings.json"),
+        '{"__proto__":{"amp.mcpServers":{"evil":{"command":"curl","args":["http://x"]}}}}',
+      );
+
+      const ampMcp = await AmpMcp.fromFile({ outputRoot: testDir });
+      const servers = JSON.parse(ampMcp.toRulesyncMcp().getFileContent()).mcpServers;
+
+      expect(ampMcp.getJson()["amp.mcpServers"]).toEqual({});
+      expect(servers).toEqual({});
+      expect(Object.prototype).not.toHaveProperty("amp.mcpServers");
+    });
+
     it("should reject malformed existing settings instead of overwriting them", async () => {
       await ensureDir(join(testDir, ".amp"));
       await writeFileContent(join(testDir, ".amp", "settings.jsonc"), "{ not json");
 
       await expect(AmpMcp.fromFile({ outputRoot: testDir })).rejects.toThrow(
-        "Failed to parse Amp settings",
+        /Failed to parse Amp settings: SyntaxError: Failed to parse JSONC content: .* at offset \d+/,
       );
+      await expect(AmpMcp.fromFile({ outputRoot: testDir })).rejects.toMatchObject({
+        cause: expect.any(SyntaxError),
+      });
     });
   });
 
@@ -321,20 +342,39 @@ describe("AmpMcp", () => {
       expect(result.error).toBeNull();
     });
 
-    it("should reject constructor as server name", () => {
+    it("should drop a server named constructor rather than reading it back", () => {
+      // Removal is silent, as it is for every other tool-side adapter: the
+      // parser strips the key before `validate` sees the document, so there is
+      // nothing left to reject and nothing that can reach generated output.
       const ampMcp = new AmpMcp({
         relativeDirPath: ".amp",
         relativeFilePath: "settings.json",
         fileContent: `{
           "amp.mcpServers": {
-            "constructor": { "type": "stdio", "command": "evil" }
+            "constructor": { "type": "stdio", "command": "evil" },
+            "safe": { "type": "stdio", "command": "npx" }
           }
         }`,
+        validate: true,
       });
 
-      const result = ampMcp.validate();
-      expect(result.success).toBe(false);
-      expect(result.error?.message).toContain("constructor");
+      expect(ampMcp.validate().success).toBe(true);
+      expect(ampMcp.getJson()["amp.mcpServers"]).toEqual({
+        safe: { type: "stdio", command: "npx" },
+      });
+    });
+
+    it("should drop a root `__proto__` rather than reading servers back through it", () => {
+      const ampMcp = new AmpMcp({
+        relativeDirPath: ".amp",
+        relativeFilePath: "settings.json",
+        fileContent: '{"__proto__":{"amp.mcpServers":{"evil":{"command":"curl"}}}}',
+        validate: true,
+      });
+
+      expect(ampMcp.validate().success).toBe(true);
+      expect(ampMcp.getJson()["amp.mcpServers"]).toBeUndefined();
+      expect(Object.prototype).not.toHaveProperty("amp.mcpServers");
     });
 
     it("should reject non-object amp.mcpServers", () => {
@@ -469,5 +509,39 @@ describe("AmpMcp", () => {
       expect(ampMcp.getJson()).toEqual({ "amp.mcpServers": {} });
       expect(ampMcp.getFilePath()).toBe(join(testDir, ".amp", "settings.json"));
     });
+  });
+});
+
+describe("AmpMcp retraction (issue #2562)", () => {
+  let testDir: string;
+  let cleanup: () => Promise<void>;
+
+  beforeEach(async () => {
+    ({ testDir, cleanup } = await setupTestDirectory());
+    vi.spyOn(process, "cwd").mockReturnValue(testDir);
+  });
+
+  afterEach(async () => {
+    await cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("retracts amp.mcpServers when no server is left, keeping unrelated keys", async () => {
+    const paths = AmpMcp.getSettablePaths({ global: false });
+    await writeFileContent(
+      join(testDir, paths.relativeDirPath, paths.relativeFilePath),
+      JSON.stringify({ other: 1, "amp.mcpServers": { old: { command: "old" } } }),
+    );
+    const mcp = await AmpMcp.fromRulesyncMcp({
+      outputRoot: testDir,
+      global: false,
+      rulesyncMcp: new RulesyncMcp({
+        relativeDirPath: ".rulesync",
+        relativeFilePath: "mcp.json",
+        fileContent: JSON.stringify({ mcpServers: {} }),
+      }),
+    });
+
+    expect(JSON.parse(mcp.getFileContent())).toEqual({ other: 1 });
   });
 });

@@ -6,13 +6,21 @@ import { SKILL_FILE_NAME } from "../../constants/general.js";
 import { RULESYNC_SKILLS_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
 import { ValidationResult } from "../../types/ai-dir.js";
 import { formatError } from "../../utils/error.js";
+import type { Logger } from "../../utils/logger.js";
+import { quoteValueForWarning } from "../../utils/quote-value.js";
 import {
   RulesyncSkill,
   RulesyncSkillFrontmatter,
   RulesyncSkillFrontmatterInput,
   SkillFile,
 } from "./rulesync-skill.js";
-import { resolveUserInvocable } from "./skills-utils.js";
+import {
+  resolveCompatibility,
+  resolveDisableModelInvocation,
+  resolveLicense,
+  resolveMetadata,
+  resolveUserInvocable,
+} from "./skills-utils.js";
 import {
   ToolSkill,
   ToolSkillForDeletionParams,
@@ -28,6 +36,9 @@ export const VibeSkillFrontmatterSchema = z.looseObject({
   compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
   metadata: z.optional(z.looseObject({})),
   "user-invocable": z.optional(z.boolean()),
+  // Vibe v2.25.5+: `true` makes the skill explicit-only (slash invocation
+  // still works, the model cannot load it on its own).
+  "disable-model-invocation": z.optional(z.boolean()),
   "allowed-tools": z.optional(z.union([z.string(), z.array(z.string())])),
 });
 
@@ -44,45 +55,38 @@ export type VibeSkillParams = {
   global?: boolean;
 };
 
-/** Resolve the top-level `license` field, if present as a string. */
-function resolveTopLevelLicense(looseTopLevel: Record<string, unknown>): string | undefined {
-  return typeof looseTopLevel.license === "string" ? looseTopLevel.license : undefined;
-}
-
-/** Resolve the top-level `compatibility` field (string or object), if present. */
-function resolveTopLevelCompatibility(
-  looseTopLevel: Record<string, unknown>,
-): string | Record<string, unknown> | undefined {
-  const value = looseTopLevel.compatibility;
-  if (typeof value === "string" || (typeof value === "object" && value !== null)) {
-    return value as string | Record<string, unknown>;
-  }
-  return undefined;
-}
-
-/** Resolve the top-level `metadata` field (object), if present. */
-function resolveTopLevelMetadata(
-  looseTopLevel: Record<string, unknown>,
-): Record<string, unknown> | undefined {
-  const value = looseTopLevel.metadata;
-  return typeof value === "object" && value !== null
-    ? (value as Record<string, unknown>)
-    : undefined;
-}
+/**
+ * Skill names Vibe's built-in skills occupy. `SkillManager` treats them as
+ * reserved: a project or user skill whose frontmatter `name` matches one is
+ * skipped at load time with only a debug log ("Skipping skill '<name>' ...
+ * because builtin skill names are reserved"), so a generated skill by that
+ * name is silently never offered. That is the legacy backend, still the
+ * default; the unified harness constructs the manager with
+ * `include_builtins=False` because its built-ins arrive as skills of the
+ * shipped `vibe` plugin under namespaced names, so it reserves nothing.
+ * @see https://github.com/mistralai/mistral-vibe/blob/v2.25.3/vibe/core/skills/builtins/__init__.py
+ * @see https://github.com/mistralai/mistral-vibe/blob/v2.25.3/vibe/core/skills/manager.py
+ */
+const VIBE_RESERVED_SKILL_NAMES: ReadonlySet<string> = new Set(["vibe", "skill-creator"]);
 
 /**
  * Build the Vibe frontmatter from a rulesync skill frontmatter, preferring the
- * dedicated `vibe` section over any loosely-typed top-level fields.
+ * dedicated `vibe` section over the shared root-level fields.
  */
 function buildVibeFrontmatter(rulesyncFrontmatter: RulesyncSkillFrontmatter): VibeSkillFrontmatter {
   const vibeSection = rulesyncFrontmatter.vibe;
 
-  const looseTopLevel = rulesyncFrontmatter as Record<string, unknown>;
-  const topLevelLicense = resolveTopLevelLicense(looseTopLevel);
-  const topLevelCompatibility = resolveTopLevelCompatibility(looseTopLevel);
-  const topLevelMetadata = resolveTopLevelMetadata(looseTopLevel);
-
+  const license = resolveLicense({ rootFrontmatter: rulesyncFrontmatter, section: vibeSection });
+  const compatibility = resolveCompatibility({
+    rootFrontmatter: rulesyncFrontmatter,
+    section: vibeSection,
+  });
+  const metadata = resolveMetadata({ rootFrontmatter: rulesyncFrontmatter, section: vibeSection });
   const resolvedUserInvocable = resolveUserInvocable({
+    rootFrontmatter: rulesyncFrontmatter,
+    section: vibeSection,
+  });
+  const disableModelInvocation = resolveDisableModelInvocation({
     rootFrontmatter: rulesyncFrontmatter,
     section: vibeSection,
   });
@@ -90,22 +94,41 @@ function buildVibeFrontmatter(rulesyncFrontmatter: RulesyncSkillFrontmatter): Vi
   return {
     name: rulesyncFrontmatter.name,
     description: rulesyncFrontmatter.description,
-    ...(vibeSection?.license !== undefined || topLevelLicense !== undefined
-      ? { license: vibeSection?.license ?? topLevelLicense }
-      : {}),
-    ...(vibeSection?.compatibility !== undefined || topLevelCompatibility !== undefined
-      ? { compatibility: vibeSection?.compatibility ?? topLevelCompatibility }
-      : {}),
-    ...(vibeSection?.metadata !== undefined || topLevelMetadata !== undefined
-      ? { metadata: vibeSection?.metadata ?? topLevelMetadata }
-      : {}),
+    ...(license !== undefined && { license }),
+    ...(compatibility !== undefined && { compatibility }),
+    ...(metadata !== undefined && { metadata }),
     ...(resolvedUserInvocable !== undefined && {
       "user-invocable": resolvedUserInvocable,
+    }),
+    ...(disableModelInvocation !== undefined && {
+      "disable-model-invocation": disableModelInvocation,
     }),
     ...(vibeSection?.["allowed-tools"] !== undefined && {
       "allowed-tools": vibeSection["allowed-tools"],
     }),
   };
+}
+
+/**
+ * The skill is still generated under the reserved name — the name is the
+ * user's to change, and a rename here would make it diverge from the other
+ * targets — but Vibe would drop it without a visible word, so say so now.
+ */
+function warnAboutReservedSkillName({
+  name,
+  logger,
+}: {
+  name: string;
+  logger: Logger | undefined;
+}): void {
+  if (!VIBE_RESERVED_SKILL_NAMES.has(name)) {
+    return;
+  }
+  logger?.warn(
+    `Vibe skills: the skill name ${quoteValueForWarning(name)} is reserved for a Vibe built-in ` +
+      `skill, so Vibe skips a project or user skill by that name when it loads skills. ` +
+      `Rename the skill for it to be available in Vibe.`,
+  );
 }
 
 export class VibeSkill extends ToolSkill {
@@ -153,6 +176,15 @@ export class VibeSkill extends ToolSkill {
     };
   }
 
+  /**
+   * Whether a skill named after a Vibe built-in is shadowed. Loose skills
+   * collide with the built-ins; plugin skills are namespaced as
+   * `<plugin>:<name>` and do not.
+   */
+  protected static reservesBuiltinSkillNames(): boolean {
+    return true;
+  }
+
   getFrontmatter(): VibeSkillFrontmatter {
     return VibeSkillFrontmatterSchema.parse(this.requireMainFileFrontmatter());
   }
@@ -191,6 +223,9 @@ export class VibeSkill extends ToolSkill {
       ...(frontmatter["user-invocable"] !== undefined && {
         "user-invocable": frontmatter["user-invocable"],
       }),
+      ...(frontmatter["disable-model-invocation"] !== undefined && {
+        "disable-model-invocation": frontmatter["disable-model-invocation"],
+      }),
       ...(frontmatter["allowed-tools"] !== undefined && {
         "allowed-tools": frontmatter["allowed-tools"],
       }),
@@ -219,11 +254,15 @@ export class VibeSkill extends ToolSkill {
     rulesyncSkill,
     validate = true,
     global = false,
+    logger,
   }: ToolSkillFromRulesyncSkillParams): VibeSkill {
-    const settablePaths = VibeSkill.getSettablePaths({ global });
+    const settablePaths = this.getSettablePaths({ global });
     const rulesyncFrontmatter = rulesyncSkill.getFrontmatter();
 
     const vibeFrontmatter = buildVibeFrontmatter(rulesyncFrontmatter);
+    if (this.reservesBuiltinSkillNames()) {
+      warnAboutReservedSkillName({ name: vibeFrontmatter.name, logger });
+    }
 
     return new VibeSkill({
       outputRoot,
@@ -245,7 +284,7 @@ export class VibeSkill extends ToolSkill {
   static async fromDir(params: ToolSkillFromDirParams): Promise<VibeSkill> {
     const loaded = await this.loadSkillDirContent({
       ...params,
-      getSettablePaths: VibeSkill.getSettablePaths,
+      getSettablePaths: (options) => this.getSettablePaths(options),
     });
 
     const result = VibeSkillFrontmatterSchema.safeParse(loaded.frontmatter);
@@ -274,7 +313,7 @@ export class VibeSkill extends ToolSkill {
     dirName,
     global = false,
   }: ToolSkillForDeletionParams): VibeSkill {
-    const settablePaths = VibeSkill.getSettablePaths({ global });
+    const settablePaths = this.getSettablePaths({ global });
     return new VibeSkill({
       outputRoot,
       relativeDirPath: relativeDirPath ?? settablePaths.relativeDirPath,

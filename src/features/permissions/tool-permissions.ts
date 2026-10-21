@@ -1,11 +1,7 @@
-import {
-  RULESYNC_PERMISSIONS_FILE_NAME,
-  RULESYNC_RELATIVE_DIR_PATH,
-} from "../../constants/rulesync-paths.js";
 import type { AiFileFromFileParams, AiFileParams, ValidationResult } from "../../types/ai-file.js";
 import { ToolFile } from "../../types/tool-file.js";
 import type { Logger } from "../../utils/logger.js";
-import { RulesyncPermissions, withoutBlankPermissionPatterns } from "./rulesync-permissions.js";
+import { RulesyncPermissions } from "./rulesync-permissions.js";
 
 export type ToolPermissionsFromRulesyncPermissionsParams = Omit<
   AiFileParams,
@@ -26,6 +22,11 @@ export type ToolPermissionsFromFileParams = Pick<
   "outputRoot" | "validate"
 > & {
   global?: boolean;
+  /**
+   * Lets an adapter report what it read, e.g. that a value came out of a
+   * machine-local overrides file the import is about to make committable.
+   */
+  logger?: Logger;
 };
 
 export type ToolPermissionsForDeletionParams = {
@@ -50,18 +51,21 @@ export abstract class ToolPermissions extends ToolFile {
     throw new Error("Please implement this method in the subclass.");
   }
 
-  abstract toRulesyncPermissions(): RulesyncPermissions;
+  /**
+   * `logger` lets a translator report source content it cannot import; most
+   * translators do not need it.
+   */
+  abstract toRulesyncPermissions(params?: { logger?: Logger }): RulesyncPermissions;
 
   protected toRulesyncPermissionsDefault({
     fileContent,
   }: {
     fileContent: string;
   }): RulesyncPermissions {
-    return new RulesyncPermissions({
+    return RulesyncPermissions.fromImportedFileContent({
       outputRoot: this.outputRoot,
-      relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
-      relativeFilePath: RULESYNC_PERMISSIONS_FILE_NAME,
-      fileContent: withoutBlankPermissionPatterns({ fileContent }),
+      fileContent,
+      sourcePath: this.getRelativePathFromCwd(),
     });
   }
 

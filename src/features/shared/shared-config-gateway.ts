@@ -1,12 +1,23 @@
+import { isDeepStrictEqual } from "node:util";
+
 import { uniq } from "es-toolkit";
 import { dump } from "js-yaml";
 import {
+  applyEdits,
+  findNodeAtLocation,
+  type FormattingOptions as JsoncFormattingOptions,
+  getNodeValue,
+  modify,
+  type ModificationOptions as JsoncModificationOptions,
+  type Node as JsoncNode,
   parse as parseJsonc,
   type ParseError as JsoncParseError,
+  parseTree,
   printParseErrorCode,
 } from "jsonc-parser";
 import { parse as parseToml, stringify as stringifyToml } from "smol-toml";
 
+import { CLAUDECODE_SETTINGS_SCHEMA_URL } from "../../constants/claudecode-paths.js";
 import { CODEXCLI_OVERRIDE_KEYS } from "../../constants/codexcli-paths.js";
 import {
   TAKT_WORKFLOW_MCP_SERVERS_KEY,
@@ -14,12 +25,13 @@ import {
 } from "../../constants/takt-paths.js";
 import type { ClaudeSettingsJson } from "../../types/claude-settings.js";
 import type { Feature } from "../../types/features.js";
+import { type BoundedWalk, createBoundedWalk } from "../../utils/bounded-walk.js";
+import { quoteForLog, stripControlCharacters } from "../../utils/control-characters.js";
 import { formatError } from "../../utils/error.js";
-import type { Logger } from "../../utils/logger.js";
-import {
-  omitPrototypePollutionKeys,
-  PROTOTYPE_POLLUTION_KEYS,
-} from "../../utils/prototype-pollution.js";
+import { parseJson5 } from "../../utils/json5.js";
+import { type Logger, warnOnceWithFallback } from "../../utils/logger.js";
+import { isPrototypePollutionKey } from "../../utils/prototype-pollution.js";
+import { quoteValueForWarning } from "../../utils/quote-value.js";
 import { isPlainObject } from "../../utils/type-guards.js";
 import { loadYaml } from "../../utils/yaml.js";
 
@@ -51,7 +63,12 @@ import { loadYaml } from "../../utils/yaml.js";
 // Format codecs
 // ---------------------------------------------------------------------------
 
-export type SharedConfigFormat = "yaml" | "json" | "jsonc" | "toml";
+// `json5` reads JSON5 (unquoted keys, single quotes, comments, ...). A new
+// file is written as JSON, which is valid JSON5; an existing file that is also
+// valid JSONC is edited in place like a `jsonc` one, so its comments survive,
+// and any other existing file is refused (`Json5EditRefusedError`) rather than
+// rewritten whole.
+export type SharedConfigFormat = "yaml" | "json" | "jsonc" | "json5" | "toml";
 
 export type SharedConfigDocument = Record<string, unknown>;
 
@@ -71,17 +88,117 @@ export type SharedConfigInvalidRootPolicy = "coerce-empty" | "error";
  */
 export type SharedConfigJsoncParseErrorsPolicy = "tolerate" | "error";
 
+/**
+ * Upper bound on the number of values a shared config document may expand
+ * to once every YAML alias is written out. Real config files hold a few
+ * hundred values at most; even a large MCP server catalog stays orders of
+ * magnitude below the limit.
+ */
+export const MAX_SHARED_CONFIG_VALUES = 100_000;
+
+/**
+ * Upper bound on the total character count of the string leaves and keys a
+ * shared config document may expand to. The value budget bounds how many
+ * values are visited, but one long string aliased thousands of times fits
+ * that budget while the duplicated output balloons; charging every visited
+ * string's length separately bounds the output regardless of alias count.
+ */
+export const MAX_SHARED_CONFIG_STRING_CHARS = 4_000_000;
+
+/**
+ * Upper bound on how many containers deep a shared config document may nest.
+ * A chain of aliases that each wrap the previous one is deep rather than
+ * wide, so it overflows the call stack long before either budget above
+ * trips; capping depth well below that point keeps the failure a clear error.
+ * The same bounds apply to JSON, JSONC and TOML files, which have no aliases
+ * to amplify them but share the walk.
+ */
+export const MAX_SHARED_CONFIG_DEPTH = 64;
+
+/**
+ * Rebuild a parsed document without its prototype-pollution keys.
+ *
+ * Every object is rebuilt, not just the ones that are already plain: a literal
+ * `"__proto__"` is assigned with `obj[key] = value` by `jsonc-parser`, which
+ * *replaces the containing object's prototype* instead of adding a key. Such
+ * an object is no longer a plain object, and the injected value is reachable
+ * through it by plain property access while `Object.keys` and `JSON.stringify`
+ * show nothing — so leaving it as it came out of the parser would both hide a
+ * server or permission the file does not state and, at the root, cost the
+ * whole document (see {@link parseSharedConfig}). Rebuilding gives every
+ * object `Object.prototype` back and drops the injected value with the key.
+ *
+ * Dates are the one object the YAML and TOML parsers produce that is not a
+ * mapping, so they are passed through rather than flattened into `{}`.
+ *
+ * The rebuild is bounded, because a YAML alias makes one parsed container
+ * reachable from many keys and every alias is copied out independently (the
+ * writers dump with `noRefs: true`, so memoizing here would only move the
+ * blowup into serialization). A small "alias bomb" of nested anchors would
+ * otherwise cost exponential time and memory, and a self-referencing anchor
+ * would recurse until the stack overflowed — both reachable from a config
+ * file committed to a cloned repository. The walk therefore charges every
+ * value against {@link MAX_SHARED_CONFIG_VALUES}, every string and key
+ * against {@link MAX_SHARED_CONFIG_STRING_CHARS}, caps nesting at
+ * {@link MAX_SHARED_CONFIG_DEPTH}, and refuses a reference back to an
+ * ancestor outright, each with a clear error instead of a hang or a crash.
+ */
 function sanitizeSharedConfigValue(value: unknown): unknown {
-  if (Array.isArray(value)) {
-    return value.map(sanitizeSharedConfigValue);
+  return sanitizeSharedConfigValueBounded(
+    value,
+    createBoundedWalk({
+      subject: "Shared config",
+      limits: {
+        maxValues: MAX_SHARED_CONFIG_VALUES,
+        maxStringChars: MAX_SHARED_CONFIG_STRING_CHARS,
+        maxDepth: MAX_SHARED_CONFIG_DEPTH,
+      },
+    }),
+  );
+}
+
+/**
+ * Refuse a container that is already on the descent path. Unlike the
+ * frontmatter cleaner, which drops such a cycle and keeps the rest of the
+ * document, a shared config file is refused outright: silently dropping part
+ * of a user's settings file would let a later write-back persist the loss.
+ */
+function enterSharedConfigContainer(walk: BoundedWalk, container: object): void {
+  if (walk.isAncestor(container)) {
+    throw new Error(
+      "Shared config contains a value that refers back to itself (a circular YAML alias); refusing to process it",
+    );
   }
-  if (!isPlainObject(value)) {
+  walk.enter(container);
+}
+
+function sanitizeSharedConfigValueBounded(value: unknown, walk: BoundedWalk): unknown {
+  if (typeof value === "string") {
+    walk.chargeValue(value.length);
     return value;
   }
-  const result: SharedConfigDocument = {};
-  for (const [key, nested] of Object.entries(omitPrototypePollutionKeys(value))) {
-    result[key] = sanitizeSharedConfigValue(nested);
+  walk.chargeValue();
+  if (Array.isArray(value)) {
+    enterSharedConfigContainer(walk, value);
+    const items = value.map((item) => sanitizeSharedConfigValueBounded(item, walk));
+    walk.leave(value);
+    return items;
   }
+  if (value === null || typeof value !== "object" || value instanceof Date) {
+    return value;
+  }
+  enterSharedConfigContainer(walk, value);
+  const result: SharedConfigDocument = {};
+  for (const [key, nested] of Object.entries(value as Record<string, unknown>)) {
+    // A mapping key can itself be an alias, so it is charged like a string
+    // leaf; the value under a dropped pollution key is still walked so the
+    // key cannot hide an unbudgeted alias chain.
+    walk.chargeChars(key.length);
+    const sanitized = sanitizeSharedConfigValueBounded(nested, walk);
+    if (isPrototypePollutionKey(key)) continue;
+    result[key] = sanitized;
+  }
+  walk.leave(value);
   return result;
 }
 
@@ -117,6 +234,8 @@ export function parseSharedConfig({
       parsed = parseToml(fileContent);
     } else if (format === "json") {
       parsed = JSON.parse(fileContent);
+    } else if (format === "json5") {
+      parsed = parseJson5(fileContent);
     } else if (jsoncParseErrors === "error") {
       const errors: JsoncParseError[] = [];
       parsed = parseJsonc(fileContent, errors, { allowTrailingComma: true });
@@ -136,13 +255,30 @@ export function parseSharedConfig({
   if (parsed === undefined || parsed === null) {
     return {};
   }
-  if (!isPlainObject(parsed)) {
+  // Sanitized before the root is judged, not after: a root-level `__proto__`
+  // leaves the parser holding an object whose prototype is the injected value,
+  // which `isPlainObject` rejects — and coercing that to `{}` would throw away
+  // every setting the file visibly states next to it.
+  let sanitized: unknown;
+  try {
+    sanitized = sanitizeSharedConfigValue(parsed);
+  } catch (error) {
+    // An alias bomb or circular alias is refused by the sanitizer rather than
+    // the parser, but it is still the file that is at fault, so it carries the
+    // same path prefix as a syntax error.
+    throw new Error(`Failed to parse shared config${at}: ${formatError(error)}`, { cause: error });
+  }
+  if (!isPlainObject(sanitized)) {
     if (invalidRootPolicy === "error") {
-      throw new Error(`Failed to parse shared config${at}: expected a mapping at the root`);
+      // Carries the bare reason as `cause` like the syntax-error path above, so
+      // a caller that re-prefixes the message with its own file label can
+      // report the reason alone instead of nesting two prefixes.
+      const reason = new Error("expected a mapping at the root");
+      throw new Error(`Failed to parse shared config${at}: ${reason.message}`, { cause: reason });
     }
     return {};
   }
-  return sanitizeSharedConfigValue(parsed) as SharedConfigDocument;
+  return sanitized;
 }
 
 /**
@@ -165,6 +301,795 @@ export function stringifySharedConfig({
     return stringifyToml(document);
   }
   return JSON.stringify(document, null, 2);
+}
+
+/**
+ * Where the line holding `from` starts and where the line starting at `from`
+ * ends: the nearest `\r` or `\n` in each direction, or the edge of the text.
+ *
+ * Both characters count in both directions, because the JSONC scanner treats
+ * either as a line break. A file written with lone CRs parses without an error
+ * and so reaches these paths, and a comment read only up to the next `\n`
+ * would run past its own line and take the closing brace — or a whole sibling
+ * key — with it.
+ */
+function endOfLineFrom({ text, from }: { text: string; from: number }): number {
+  for (let index = from; index < text.length; index += 1) {
+    const character = text[index];
+    if (character === "\n" || character === "\r") return index;
+  }
+  return text.length;
+}
+
+function startOfLineAt({ text, from }: { text: string; from: number }): number {
+  for (let index = from - 1; index >= 0; index -= 1) {
+    const character = text[index];
+    if (character === "\n" || character === "\r") return index + 1;
+  }
+  return 0;
+}
+
+/**
+ * Read the indentation and line ending a JSONC document already uses, so
+ * inserted properties match the surrounding file instead of imposing the
+ * 2-space `JSON.stringify` shape on a file written with 4 spaces or tabs.
+ *
+ * The root object's first property decides, located through the syntax tree
+ * rather than by scanning for the first indented line: a file opening with a
+ * banner comment indents that comment's continuation lines too (` * ...`
+ * aligns at three columns), and reading the width off one of those would leave
+ * `modify` re-indenting the lines it touches to a width nothing else in the
+ * file uses. A property that does not start its own line — a one-line object,
+ * or an empty one — carries no indent to read, so those fall back to the
+ * 2-space default the whole-document writer emits.
+ */
+function detectJsoncFormattingOptions({
+  text,
+  root,
+}: {
+  text: string;
+  root: JsoncNode;
+}): JsoncFormattingOptions {
+  // A document that states a line break of its own has `modify` read the
+  // ending off the text; this one is the fallback for the document that
+  // states none — which, having no line break at all, cannot be a CRLF file.
+  const eol = "\n";
+  const first = root.children?.[0];
+  const indent =
+    first === undefined
+      ? ""
+      : text.slice(startOfLineAt({ text, from: first.offset }), first.offset);
+  // A width past this is not a style to match but a line to stop reading: an
+  // insert indented to it re-emits the whole run on every line it writes, so a
+  // file opening with a very long indent would be rewritten far larger than
+  // its author wrote it.
+  const widestReadableIndent = 8;
+  if (indent === "" || indent.length > widestReadableIndent || !/^[ \t]+$/.test(indent)) {
+    return { tabSize: 2, insertSpaces: true, eol };
+  }
+  if (indent.includes("\t")) return { tabSize: 2, insertSpaces: false, eol };
+  return { tabSize: indent.length, insertSpaces: true, eol };
+}
+
+/**
+ * The first key in the document that no edit-based write can be trusted with,
+ * or `undefined` when there is none.
+ *
+ * Two kinds, both answered from the syntax tree because the parsed value no
+ * longer knows about either:
+ *
+ * - A key stated twice. That is legal JSON text which every reader resolves
+ *   last-wins, while `modify` edits the *first* occurrence — so an edit-based
+ *   write would land on the dead copy and leave the live one saying whatever
+ *   it said before. For an owned key that is a silent ownership failure: a
+ *   `deny` rulesync just wrote would sit above the `allow` the tool reads.
+ * - `__proto__`, `constructor` or `prototype`. None survives into the parsed
+ *   document — a nested one is dropped, a root-level `__proto__` replaces the
+ *   root's prototype — so an edit-based write would find no difference to
+ *   apply and leave the key in the file.
+ *
+ * The whole-document writer resolves duplicates last-wins and drops pollution
+ * keys, which is what it has always done, so those files go to it.
+ */
+type UneditableKey = { kind: "duplicate" | "prototype-pollution"; key: string };
+
+function uneditableKeyOf(node: JsoncNode): UneditableKey | undefined {
+  if (node.type === "array") {
+    for (const child of node.children ?? []) {
+      const found = uneditableKeyOf(child);
+      if (found !== undefined) return found;
+    }
+    return undefined;
+  }
+  if (node.type !== "object") return undefined;
+  const seen = new Set<string>();
+  for (const property of node.children ?? []) {
+    const key = property.children?.[0]?.value;
+    if (typeof key === "string") {
+      if (isPrototypePollutionKey(key)) return { kind: "prototype-pollution", key };
+      if (seen.has(key)) return { kind: "duplicate", key };
+      seen.add(key);
+    }
+    const value = property.children?.[1];
+    if (value !== undefined) {
+      const found = uneditableKeyOf(value);
+      if (found !== undefined) return found;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The offset just past the whitespace and comments starting at `from`.
+ */
+function skipJsoncTrivia({ text, from }: { text: string; from: number }): number {
+  let index = from;
+  while (index < text.length) {
+    const char = text[index];
+    if (char === " " || char === "\t" || char === "\n" || char === "\r") {
+      index += 1;
+      continue;
+    }
+    if (char === "/" && text[index + 1] === "/") {
+      index = endOfLineFrom({ text, from: index });
+      continue;
+    }
+    if (char === "/" && text[index + 1] === "*") {
+      const commentEnd = text.indexOf("*/", index + 2);
+      index = commentEnd === -1 ? text.length : commentEnd + 2;
+      continue;
+    }
+    break;
+  }
+  return index;
+}
+
+/**
+ * Where the deletion of a property whose text ends at `end` should stop.
+ *
+ * A comment written after the property on its own line is that property's
+ * note — `"stale": {...}, // retired` says something about `stale` and nothing
+ * about the key above it. Leaving it behind would re-attach it to whichever
+ * property now ends that line, so a note about a server rulesync removed would
+ * read as a note about the one before it. A comment with a sibling after it on
+ * the same line is not claimed: it may belong to either.
+ */
+function endOfRemoval({ text, end }: { text: string; end: number }): number {
+  const stop = endOfLineFrom({ text, from: end });
+  const tail = text.slice(end, stop);
+  const lineComment = /^[ \t]*\/\/[^\r\n]*$/;
+  const blockComment = /^[ \t]*\/\*(?:[^*]|\*(?!\/))*\*\/[ \t]*$/;
+  // Whitespace runs to the newline as well, so the line the property had to
+  // itself does not survive as a trailing-space stub on the line above it.
+  const blank = /^[ \t]*$/;
+  return lineComment.test(tail) || blockComment.test(tail) || blank.test(tail) ? stop : end;
+}
+
+/**
+ * Where the deletion of a property ending at `end` should begin.
+ *
+ * A property that has its line to itself is removed with the line: its
+ * indentation and the newline above it would otherwise be left as a blank gap.
+ * A property sharing its line with something else — a sibling, or the object's
+ * own `}` — is removed on its own, because swallowing the newline would splice
+ * whatever follows onto the line above, and a line comment up there would
+ * comment it out: a key rulesync means to write would vanish from the file, or
+ * the closing brace would, leaving the document unparsable.
+ */
+function startOfRemoval({
+  text,
+  propertyOffset,
+  end,
+}: {
+  text: string;
+  propertyOffset: number;
+  end: number;
+}): number {
+  let after = end;
+  while (text[after] === " " || text[after] === "\t") after += 1;
+  const endsTheLine = after >= text.length || text[after] === "\n" || text[after] === "\r";
+  if (!endsTheLine) {
+    return propertyOffset;
+  }
+  let start = propertyOffset;
+  while (start > 0 && (text[start - 1] === " " || text[start - 1] === "\t")) start -= 1;
+  if (start > 0 && text[start - 1] === "\n") {
+    start -= 1;
+  }
+  if (start > 0 && text[start - 1] === "\r") start -= 1;
+  return start;
+}
+
+/**
+ * Delete the property at `path` from `text`, taking its own line and its
+ * separating comma but nothing else.
+ *
+ * `modify(..., undefined)` would do this, but the range it deletes runs from
+ * the end of the *previous* property to the end of this one — or, for the
+ * first property of an object, all the way to where the *next* one starts. So
+ * removing one key takes the comments sitting between it and the keys around
+ * it, including the comment describing the key that survives.
+ * Deleting the property's own text instead leaves the comments around it in
+ * place. Only the note that follows the property on its own line goes with it
+ * (see {@link endOfRemoval}); a comment written on the line *above* is left
+ * behind rather than guessed at, which is the direction this whole path errs
+ * in.
+ */
+function removeJsoncProperty({ text, path }: { text: string; path: readonly string[] }): string {
+  const root = parseTree(text, [], { allowTrailingComma: true });
+  const property = root === undefined ? undefined : findNodeAtLocation(root, [...path])?.parent;
+  const object = property?.parent;
+  if (property?.type !== "property" || object?.type !== "object") {
+    // Already absent — nothing to delete.
+    return text;
+  }
+  const siblings = object.children ?? [];
+  const edits: { offset: number; length: number; content: string }[] = [];
+
+  let end = property.offset + property.length;
+  const afterProperty = skipJsoncTrivia({ text, from: end });
+  if (text[afterProperty] === ",") {
+    end = afterProperty + 1;
+  } else {
+    // No comma follows, so this is the last property: the comma separating it
+    // from the previous one has to go too, or the object is left holding a
+    // trailing comma that strict JSON readers reject.
+    const previous = siblings[siblings.indexOf(property) - 1];
+    if (previous !== undefined) {
+      const comma = skipJsoncTrivia({ text, from: previous.offset + previous.length });
+      if (text[comma] === ",") edits.push({ offset: comma, length: 1, content: "" });
+    }
+  }
+
+  end = endOfRemoval({ text, end });
+  const start = startOfRemoval({ text, propertyOffset: property.offset, end });
+  edits.push({ offset: start, length: end - start, content: "" });
+  return applyEdits(text, edits);
+}
+
+/**
+ * Where the comment written at `from` (past any spaces or tabs) ends, or
+ * `undefined` if what stands there is not a comment.
+ */
+function endOfNoteAt({ text, from }: { text: string; from: number }): number | undefined {
+  let cursor = from;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  if (text.startsWith("//", cursor)) {
+    return endOfLineFrom({ text, from: cursor });
+  }
+  if (text.startsWith("/*", cursor)) {
+    const closing = text.indexOf("*/", cursor + 2);
+    return closing === -1 ? undefined : closing + 2;
+  }
+  return undefined;
+}
+
+/**
+ * Every comment written at `from`, as spans of `text`, each span running from
+ * where the previous one stopped so the whitespace between them is carried
+ * along. A comma is stepped over once (a file may spell one before its note,
+ * or after it) but never collected, because the separator belongs to the
+ * property rather than to its note. So a file that writes a note on each side
+ * of its comma gets both of them back, in order, after the comma: the notes
+ * stay with the key they describe, and the comma keeps the place the file gave
+ * it. The run stops at the first thing that is neither: a newline ends it, so
+ * a comment on the next line is left alone.
+ */
+function notesAt({ text, from }: { text: string; from: number }): { start: number; end: number }[] {
+  const spans: { start: number; end: number }[] = [];
+  let cursor = from;
+  let steppedOverComma = false;
+  for (;;) {
+    const end = endOfNoteAt({ text, from: cursor });
+    if (end !== undefined) {
+      spans.push({ start: cursor, end });
+      cursor = end;
+      continue;
+    }
+    if (steppedOverComma) return spans;
+    let comma = cursor;
+    while (text[comma] === " " || text[comma] === "\t") comma += 1;
+    if (text[comma] !== ",") return spans;
+    steppedOverComma = true;
+    cursor = comma + 1;
+  }
+}
+
+/**
+ * Detach the notes written at the point where the object at `path` will take a
+ * new key: after its last property (and around the comma a trailing-comma file
+ * spells there), or just inside the `{` when it has no properties yet or when
+ * the key is to be written first (`at: "start"`).
+ *
+ * `modify` computes its insert from exactly that point — in front of a note
+ * written there — so applying the edit unchanged re-emits the note *after* the
+ * key that was just inserted: `"stale": {...} // retired` turns into a note
+ * about a server rulesync has only now written, and `{ /* none yet *\/ }`
+ * turns into a note about the first entry rulesync puts in it. Lifting the
+ * notes out before the insert and putting them back afterwards keeps them
+ * where their author wrote them, matching what {@link endOfRemoval} does on
+ * the way out.
+ *
+ * Returns `undefined` when there is no such note, which is the common case.
+ */
+function detachInsertionNote({
+  text,
+  path,
+  at,
+}: {
+  text: string;
+  path: readonly string[];
+  at: "start" | "end";
+}): { text: string; note: string; anchorKey: string | undefined } | undefined {
+  const root = parseTree(text, [], { allowTrailingComma: true });
+  const object = root === undefined ? undefined : findNodeAtLocation(root, [...path]);
+  if (object?.type !== "object") return undefined;
+  const property = at === "end" ? object.children?.at(-1) : undefined;
+  const anchorKey = property?.children?.[0]?.value;
+  if (property !== undefined && typeof anchorKey !== "string") return undefined;
+
+  const from = property === undefined ? object.offset + 1 : property.offset + property.length;
+  const spans = notesAt({ text, from });
+  if (spans.length === 0) return undefined;
+
+  // Only the comments are lifted out; a comma between them stays where the
+  // file spells it, so the file keeps its own trailing-comma style.
+  let stripped = text;
+  for (const span of spans.toReversed()) {
+    stripped = stripped.slice(0, span.start) + stripped.slice(span.end);
+  }
+  return {
+    text: stripped,
+    note: spans.map((span) => text.slice(span.start, span.end)).join(""),
+    anchorKey: typeof anchorKey === "string" ? anchorKey : undefined,
+  };
+}
+
+/**
+ * Put a note detached by {@link detachInsertionNote} back where it was: after
+ * the property it describes (behind the comma the insert gave that property),
+ * or just inside the `{` of the object it was written in when there was no
+ * property to describe. Returns `undefined` if that place can no longer be
+ * located, so the caller can fall back to the plain insert rather than drop
+ * the note.
+ */
+function reattachTrailingNote({
+  text,
+  path,
+  anchorKey,
+  note,
+}: {
+  text: string;
+  path: readonly string[];
+  anchorKey: string | undefined;
+  note: string;
+}): string | undefined {
+  const root = parseTree(text, [], { allowTrailingComma: true });
+  const location = anchorKey === undefined ? [...path] : [...path, anchorKey];
+  const anchor = root === undefined ? undefined : findNodeAtLocation(root, location);
+  if (anchor === undefined) return undefined;
+  if (anchorKey === undefined) {
+    if (anchor.type !== "object") return undefined;
+    const brace = anchor.offset + 1;
+    return text.slice(0, brace) + note + text.slice(brace);
+  }
+  let cursor = anchor.offset + anchor.length;
+  while (text[cursor] === " " || text[cursor] === "\t") cursor += 1;
+  if (text[cursor] === ",") cursor += 1;
+  return text.slice(0, cursor) + note + text.slice(cursor);
+}
+
+/**
+ * Write `value` at `[...path, key]`, keeping the note written at the point of
+ * insertion where its author put it (see {@link detachInsertionNote}): the
+ * trailing note of the property the new key is appended after, or — for a
+ * `leading` key, which `modify` places before every other property — the note
+ * written just inside the `{`. Replacing an existing key needs none of this:
+ * `modify` rewrites the value's own span and leaves every comment where it is.
+ */
+function insertJsoncProperty({
+  text,
+  path,
+  key,
+  value,
+  options,
+  leading = false,
+}: {
+  text: string;
+  path: readonly string[];
+  key: string;
+  value: unknown;
+  options: JsoncModificationOptions;
+  leading?: boolean;
+}): string {
+  const modification: JsoncModificationOptions = leading
+    ? { ...options, getInsertionIndex: () => 0 }
+    : options;
+  const write = (source: string): string =>
+    applyEdits(source, modify(source, [...path, key], value, modification));
+  const detached = detachInsertionNote({ text, path, at: leading ? "start" : "end" });
+  if (detached === undefined) return write(text);
+  const reattached = reattachTrailingNote({
+    text: write(detached.text),
+    path,
+    anchorKey: detached.anchorKey,
+    note: detached.note,
+  });
+  return reattached ?? write(text);
+}
+
+/**
+ * How much work an edit-based write may cost, as the file's length times the
+ * number of keys that differ.
+ *
+ * Each changed key re-parses the whole file, so a file whose keys nearly all
+ * change costs quadratic work: an 823 KB `opencode.json` whose 6,400 servers
+ * are all replaced took 40 seconds to write as edits, and cloning a
+ * repository that ships such a file is enough to reach that. Past this budget
+ * the file is written whole instead — it loses its comments, the same as a
+ * file rulesync cannot parse does, which is the better of the two outcomes
+ * against a `generate` that looks like it has hung. The limit is under a
+ * second of editing for a replacement and a second or two for an insert,
+ * which parses more; a hand-written config file is orders of magnitude below
+ * either.
+ */
+const JSONC_EDIT_BUDGET_BYTES = 50_000_000;
+
+/**
+ * How much text the edits of one write may put into the file, all of them
+ * together.
+ *
+ * The budget above charges by the number of keys that differ, which prices an
+ * insert of a whole subtree as one edit — but `modify` re-indents the text it
+ * writes, and it does that in time quadratic in the length of that text: a
+ * 127 KB value takes half a second to write, a 516 KB one 9 seconds, a 1 MB
+ * one 35. The cost is quadratic in the total as well as in each part, because
+ * every edit re-indents against the text the ones before it left, so a limit
+ * on the widest single value would let a handful of values just under it cost
+ * minutes between them. This is a limit on their sum, which holds the
+ * re-indenting to about a second whether it arrives as one value or twenty.
+ * A hand-written config file changes a few hundred bytes at a time.
+ */
+const JSONC_EDIT_WRITTEN_BYTES = 200_000;
+
+/**
+ * How much text one edit writes: the value as `modify` formats it, plus the
+ * indentation that formatting puts in front of every line of it.
+ *
+ * A value written deep in a document is written far wider than it reads on
+ * its own — a 114 KB server list nested 1,200 deep is 36 MB of text once
+ * every line of it carries 2,400 spaces — so measuring the value alone would
+ * miss the whole of what makes that write expensive.
+ */
+function measureJsoncWrite({ value, depth }: { value: unknown; depth: number }): number {
+  const formatted = JSON.stringify(value, null, 2) ?? "";
+  let lines = 1;
+  for (let at = formatted.indexOf("\n"); at !== -1; at = formatted.indexOf("\n", at + 1)) {
+    lines += 1;
+  }
+  return formatted.length + lines * 2 * depth;
+}
+
+/**
+ * How much {@link applyJsoncObjectEdits} would write, deciding each key
+ * exactly the way it does — the two walk together, so a new case in one needs
+ * the same case here. It reports both how many edits there would be and how
+ * much text they would write between them, because the two are budgeted
+ * separately: one stands for the parse each edit costs, the other for the
+ * re-indenting each edit costs. Counting is a walk of the documents alone: no
+ * text is touched, so the budgets above are spent on the write rather than on
+ * finding out how large the write is.
+ */
+function countJsoncEdits({
+  base,
+  next,
+  depth,
+}: {
+  base: Record<string, unknown>;
+  next: SharedConfigDocument;
+  depth: number;
+}): { edits: number; written: number } {
+  let edits = 0;
+  let written = 0;
+  for (const [key, value] of Object.entries(next)) {
+    if (isPrototypePollutionKey(key)) continue;
+    const present = Object.hasOwn(base, key);
+    const previous = present ? base[key] : undefined;
+    if (value === undefined) {
+      if (present) edits += 1;
+      continue;
+    }
+    if (isPlainObject(previous) && isPlainObject(value)) {
+      const nested = countJsoncEdits({ base: previous, next: value, depth: depth + 1 });
+      edits += nested.edits;
+      written += nested.written;
+      continue;
+    }
+    if (present && isDeepStrictEqual(previous, value)) continue;
+    edits += 1;
+    written += measureJsoncWrite({ value, depth: depth + 1 });
+  }
+  for (const key of Object.keys(base)) {
+    if (!Object.hasOwn(next, key)) edits += 1;
+  }
+  return { edits, written };
+}
+
+/**
+ * Rewrite `text` so the object at `path` matches `next`, touching only the
+ * spans that actually differ from `base`.
+ *
+ * Each difference is applied on its own — `modify` computes an edit against
+ * the current text and `applyEdits` returns the text with that edit applied,
+ * which is then the input for the next difference, because every edit shifts
+ * the offsets the following ones would have been computed from. Nested objects
+ * present on both sides are recursed into rather than replaced wholesale, so a
+ * one-key change deep in the document leaves its siblings — and the comments
+ * attached to them — byte-identical.
+ *
+ * Every difference re-parses the document, so the work is one parse of the
+ * file per *changed* key rather than one parse overall. A regeneration that
+ * changes nothing costs a single parse, and the files this runs on are config
+ * files, so the shape is left simple rather than batched — with the file
+ * large enough and enough of it changing, the product of the two is what
+ * {@link JSONC_EDIT_BUDGET_BYTES} keeps off this path.
+ */
+function applyJsoncObjectEdits({
+  text,
+  base,
+  next,
+  path,
+  options,
+  leadingKeys,
+}: {
+  text: string;
+  base: Record<string, unknown>;
+  next: SharedConfigDocument;
+  path: readonly string[];
+  options: JsoncModificationOptions;
+  /** Root keys written in front of every other property when inserted. */
+  leadingKeys: readonly string[];
+}): string {
+  let result = text;
+  for (const [key, value] of Object.entries(next)) {
+    // Never reachable through the gateway (both the parsed base and every
+    // merge policy drop these), but this walker writes straight into the
+    // user's file, so it does not rely on its callers to have done that.
+    if (isPrototypePollutionKey(key)) continue;
+    const present = Object.hasOwn(base, key);
+    const previous = present ? base[key] : undefined;
+    if (value === undefined) {
+      // A key retracted by the merge policy. `JSON.stringify` drops it by
+      // omission; here it has to be deleted from the text explicitly.
+      if (present) result = removeJsoncProperty({ text: result, path: [...path, key] });
+      continue;
+    }
+    if (isPlainObject(previous) && isPlainObject(value)) {
+      result = applyJsoncObjectEdits({
+        text: result,
+        base: previous,
+        next: value,
+        path: [...path, key],
+        options,
+        leadingKeys: [],
+      });
+      continue;
+    }
+    if (present) {
+      if (isDeepStrictEqual(previous, value)) continue;
+      result = applyEdits(result, modify(result, [...path, key], value, options));
+      continue;
+    }
+    result = insertJsoncProperty({
+      text: result,
+      path,
+      key,
+      value,
+      options,
+      leading: leadingKeys.includes(key),
+    });
+  }
+  for (const key of Object.keys(base)) {
+    if (!Object.hasOwn(next, key)) {
+      result = removeJsoncProperty({ text: result, path: [...path, key] });
+    }
+  }
+  return result;
+}
+
+/**
+ * Serialize a document back over the file it was parsed from.
+ *
+ * For every format but JSONC this is {@link stringifySharedConfig}: those
+ * files carry no comments, so re-serializing loses nothing. A JSONC file does
+ * carry comments — `.vscode/settings.json` and `opencode.json` are hand-edited
+ * far more often than they are generated — and re-serializing would delete
+ * every one of them, along with the author's blank lines and key order. So a
+ * JSONC document is written back as a set of edits against the existing text:
+ * regions the merge did not change stay byte-identical, and a regeneration
+ * that changes nothing leaves the file untouched.
+ *
+ * The whole-document writer is still used when there is nothing to preserve or
+ * nothing to edit against:
+ *
+ * - an empty (or whitespace-only) file, which has no comments to keep;
+ * - a file that does not parse, or whose root is not an object — editing it
+ *   would mean guessing at the author's intent, and the callers that reach
+ *   here have already decided (via `invalidRootPolicy`) that such a file is
+ *   replaced;
+ * - a file stating the same key twice, or using `__proto__`, `constructor` or
+ *   `prototype` as a key (see {@link uneditableKeyOf});
+ * - a file so large, with so much of it changing, that editing it key by key
+ *   would take longer than a user would wait (see
+ *   {@link JSONC_EDIT_BUDGET_BYTES}), or changed keys that write more new text
+ *   between them than re-indenting can afford (see
+ *   {@link JSONC_EDIT_WRITTEN_BYTES});
+ * - a file the editor itself refuses, which it answers with an exception
+ *   rather than a result.
+ *
+ * Every one of those fallbacks except the empty file is reported once per run
+ * through `logger` (or the fallback logger when none is given): the author's
+ * comments are what the edit path exists to keep, and a `generate` that drops
+ * them should say so rather than let the loss show up in the next diff.
+ * `filePath` names the file in that warning; callers that know it should pass
+ * it, since the once-per-run token is the message itself and two nameless
+ * files would share one.
+ *
+ * `leadingKeys` names the root keys that go in front of every other property
+ * when the edit path inserts them (the whole-document writer keeps the order
+ * `document` states, so the caller places them there itself). A key the file
+ * already has stays where the file put it.
+ */
+export function serializeSharedConfig({
+  format,
+  document,
+  existingContent,
+  leadingKeys = [],
+  filePath,
+  logger,
+}: {
+  format: SharedConfigFormat;
+  document: SharedConfigDocument;
+  existingContent: string;
+  leadingKeys?: readonly string[];
+  filePath?: string | undefined;
+  logger?: Logger | undefined;
+}): string {
+  const whole = stringifySharedConfig({ format, document });
+  if ((format !== "jsonc" && format !== "json5") || existingContent.trim() === "") {
+    return whole;
+  }
+
+  const wholeBecause = (reason: string): string => {
+    if (format === "json5") {
+      // A JSON5 file is never rewritten whole: JSON output would drop its
+      // comments and turn JSON5-only values (`Infinity`, `NaN`, hex numbers)
+      // into something else, in a file — OpenClaw's Gateway config — that
+      // also holds credentials and every other setting. Refuse instead.
+      throw new Json5EditRefusedError({ filePath, reason });
+    }
+    warnAboutWholeJsoncRewrite({ filePath, reason, logger });
+    return whole;
+  };
+
+  // Everything the edit path can refuse answers with `whole`, exceptions
+  // included: jsonc-parser has edges of its own — an indentation width landing
+  // exactly on the last slot of its formatting cache throws a `TypeError`, a
+  // document nested deeper than its recursive parser throws a `RangeError` —
+  // and a file rulesync cannot edit is written whole, the same as a file it
+  // cannot parse. The comments are lost, the settings the caller means to
+  // write are not, and `generate` does not stop on a file it was only asked
+  // to update.
+  try {
+    // One parse, as a syntax tree: it answers everything this path asks of
+    // the file — whether it is well-formed, what it says, where its
+    // indentation is, and whether it states a key an edit cannot be trusted
+    // with. Parsing the text again for the value would mean a second parser
+    // and a second sanitizer deciding what the document says, and the two
+    // silently drifting apart would make the diff below miss a change
+    // rulesync means to write.
+    const errors: JsoncParseError[] = [];
+    const root = parseTree(existingContent, errors, { allowTrailingComma: true });
+    if (root === undefined || errors.length > 0) {
+      // A JSON5 file that parsed (the caller read it) but not as JSONC uses
+      // JSON5-only syntax — unquoted keys, single quotes, hex numbers, ...
+      return wholeBecause(
+        format === "json5"
+          ? "it uses JSON5-only syntax (such as unquoted keys, single quotes, hex numbers, Infinity or NaN)"
+          : "it could not be parsed",
+      );
+    }
+    if (root.type !== "object") {
+      return wholeBecause("its root is not an object");
+    }
+    const uneditable = uneditableKeyOf(root);
+    if (uneditable !== undefined) {
+      // Truncated: a key can be as long as the file that states it, and the
+      // warning should not be.
+      const key = quoteValueForWarning(uneditable.key);
+      return wholeBecause(
+        uneditable.kind === "duplicate"
+          ? `it states the key ${key} twice`
+          : `it uses the key ${key}, which rulesync drops from every document it parses`,
+      );
+    }
+
+    const base = sanitizeSharedConfigValue(getNodeValue(root));
+    if (!isPlainObject(base)) {
+      return wholeBecause("its root is not an object");
+    }
+
+    // Measured against whichever of the two documents is larger: an edit costs
+    // a parse of the text *at the time it is applied*, so a small file taking
+    // a large patch grows into the same quadratic cost that a large file
+    // taking a small patch starts in.
+    const span = Math.max(existingContent.length, whole.length);
+    const cost = countJsoncEdits({ base, next: document, depth: 0 });
+    if (cost.written > JSONC_EDIT_WRITTEN_BYTES) {
+      return wholeBecause("its changed keys write more new text than editing in place can afford");
+    }
+    if (cost.edits * span > JSONC_EDIT_BUDGET_BYTES) {
+      return wholeBecause("it is too large, with too much of it changing, to edit key by key");
+    }
+
+    return applyJsoncObjectEdits({
+      text: existingContent,
+      base,
+      next: document,
+      path: [],
+      options: { formattingOptions: detectJsoncFormattingOptions({ text: existingContent, root }) },
+      leadingKeys,
+    });
+  } catch (error) {
+    if (error instanceof Json5EditRefusedError) throw error;
+    return wholeBecause(`the editor refused it (${stripControlCharacters(formatError(error))})`);
+  }
+}
+
+/**
+ * Thrown instead of rewriting a `json5` file whole (see
+ * {@link serializeSharedConfig}); nothing is written.
+ */
+export class Json5EditRefusedError extends Error {
+  constructor({ filePath, reason }: { filePath: string | undefined; reason: string }) {
+    const subject = filePath === undefined ? "a shared JSON5 config file" : quoteForLog(filePath);
+    super(
+      `Refusing to update ${subject}: rulesync cannot edit it in place because ${reason}, ` +
+        "and rewriting it whole would drop its comments and could change its values. " +
+        "Convert it to JSONC-compatible syntax (double-quoted keys and strings, decimal numbers; " +
+        "comments and trailing commas are fine), or add the entries by hand.",
+    );
+    this.name = "Json5EditRefusedError";
+  }
+}
+
+/**
+ * Report, once per run and file, that a JSONC file is being written whole
+ * instead of edited in place. Named by `filePath` when the caller knows it;
+ * a caller serializing text it never read from disk has no name to give.
+ */
+function warnAboutWholeJsoncRewrite({
+  filePath,
+  reason,
+  logger,
+}: {
+  filePath: string | undefined;
+  reason: string;
+  logger: Logger | undefined;
+}): void {
+  const subject = filePath === undefined ? "A shared JSONC config file" : quoteForLog(filePath);
+  // A logger that throws must not turn a fallback into a failed write: the
+  // caller has already settled on the whole document, and a warning is the
+  // one thing here that is allowed to go missing.
+  try {
+    warnOnceWithFallback(
+      logger,
+      `${subject} is rewritten whole rather than edited in place because ${reason}; ` +
+        "comments, blank lines and key order in the existing file are not preserved.",
+    );
+  } catch {
+    // Swallowed on purpose; see above.
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -204,7 +1129,7 @@ export function mergeSharedConfigDeep({
 }): SharedConfigDocument {
   const result: SharedConfigDocument = { ...base };
   for (const [key, patchValue] of Object.entries(patch)) {
-    if (PROTOTYPE_POLLUTION_KEYS.has(key)) continue;
+    if (isPrototypePollutionKey(key)) continue;
     if (patchValue === undefined) {
       // Retraction, spelled the same way `replace-owned-keys` spells it. Leaving
       // the key with an `undefined` value happens to disappear from YAML and
@@ -255,17 +1180,29 @@ export type SharedConfigFileDeclaration = {
   readonly format: SharedConfigFormat;
   readonly invalidRootPolicy?: SharedConfigInvalidRootPolicy;
   readonly jsoncParseErrors?: SharedConfigJsoncParseErrorsPolicy;
+  /**
+   * Top-level keys the gateway itself owns, with the value each is written
+   * with: every write of the file through the gateway — whichever feature
+   * makes it — adds a key the document lacks, placed in front of every other
+   * key, and leaves a key the document already states untouched, whatever its
+   * value. For `$schema`, which is an editor pointer rather than a setting: a
+   * file rulesync generates gets one, and a pinned or mirrored one the user
+   * wrote is theirs to keep.
+   */
+  readonly ensuredKeys?: Readonly<Record<string, unknown>>;
   readonly features: Partial<Record<Feature, SharedConfigConflictPolicy>>;
 };
 
 // `dir/file` tokens matching `deriveSharedFileWriters()` — always POSIX
 // separators, independent of the platform-specific path constants.
 export const CLAUDE_SETTINGS_SHARED_FILE_KEY = ".claude/settings.json";
+export const CLAUDE_SETTINGS_LOCAL_SHARED_FILE_KEY = ".claude/settings.local.json";
 export const HERMES_CONFIG_SHARED_FILE_KEY = ".hermes/config.yaml";
 export const HERMES_WIN32_CONFIG_SHARED_FILE_KEY = "AppData/Local/hermes/config.yaml";
 export const HERMES_HOME_CONFIG_SHARED_FILE_KEY = "config.yaml";
 export const TAKT_CONFIG_SHARED_FILE_KEY = ".takt/config.yaml";
 export const CODEXCLI_CONFIG_SHARED_FILE_KEY = ".codex/config.toml";
+export const CODEWHALE_CONFIG_SHARED_FILE_KEY = ".codewhale/config.toml";
 export const GROKCLI_CONFIG_SHARED_FILE_KEY = ".grok/config.toml";
 export const VIBE_CONFIG_SHARED_FILE_KEY = ".vibe/config.toml";
 export const KIMI_CODE_CONFIG_SHARED_FILE_KEY = ".kimi-code/config.toml";
@@ -273,6 +1210,9 @@ export const KIMI_CODE_HOME_CONFIG_SHARED_FILE_KEY = "config.toml";
 export const REASONIX_PROJECT_CONFIG_SHARED_FILE_KEY = "reasonix.toml";
 export const REASONIX_GLOBAL_CONFIG_SHARED_FILE_KEY = ".reasonix/config.toml";
 export const ROVODEV_CONFIG_SHARED_FILE_KEY = ".rovodev/config.yml";
+export const OPENCLAW_CONFIG_SHARED_FILE_KEY = ".openclaw/openclaw.json";
+export const POOL_PROJECT_SETTINGS_SHARED_FILE_KEY = ".poolside/settings.yaml";
+export const POOL_GLOBAL_SETTINGS_SHARED_FILE_KEY = ".config/poolside/settings.yaml";
 
 /**
  * Build the `SHARED_CONFIG_OWNERSHIP` lookup key from a tool's settable paths.
@@ -353,9 +1293,118 @@ const KIMI_CODE_CONFIG_DECLARATION: SharedConfigFileDeclaration = {
   },
 };
 
+/**
+ * Pool settings (`.poolside/settings.yaml` / `~/.config/poolside/settings.yaml`):
+ * the user's primary Pool settings file, so an unparseable root fails closed
+ * rather than being replaced with generated output. `mcp_servers` is owned as
+ * a whole key because the MCP writer emits the complete server map. The
+ * permissions writer deep-merges: it rewrites the `allow`/`deny` lists of the
+ * `tools.<name>` blocks it manages and the `paths` lists, leaving each tool's
+ * `disabled` flag, unmanaged tools and every other key in place. `hooks` is
+ * owned as a whole key because the hooks writer emits every event list.
+ * `subagents` is owned as a whole key too: its writer recomputes the block
+ * from the existing file (`default` and the built-in `general` agent carried
+ * over, every other agent replaced) before applying the patch.
+ */
+const POOL_SETTINGS_DECLARATION: SharedConfigFileDeclaration = {
+  format: "yaml",
+  invalidRootPolicy: "error",
+  features: {
+    mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp_servers"] },
+    permissions: { kind: "deep-merge" },
+    // The hooks writer recomputes the whole `hooks` block, carrying over its
+    // non-event siblings (`stop_hook_max_continuations`) itself.
+    hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+    subagents: { kind: "replace-owned-keys", ownedKeys: ["subagents"] },
+  },
+};
+
+/**
+ * The Kilo MCP writer's policy at both scopes; see the `kilo.json` entry in
+ * {@link SHARED_CONFIG_OWNERSHIP}.
+ */
+const KILO_MCP_POLICY: SharedConfigConflictPolicy = {
+  kind: "deep-merge",
+  replaceKeys: ["mcp", "tools"],
+};
+
+/**
+ * ZCode's settings file, which also carries model/theme/permission keys
+ * rulesync does not own. Both copies (`<project>/.zcode/config.json` and
+ * `~/.zcode/cli/config.json`) are the user's primary ZCode config, so every
+ * writer refuses to read-modify-write a file it could not parse rather than
+ * replacing it with generated output. `mcp` and `hooks` are owned as whole
+ * keys because their writers recompute each from the existing file (non-owned
+ * siblings carried over) before applying the patch.
+ */
+const ZCODE_CONFIG_DECLARATION: SharedConfigFileDeclaration = {
+  format: "json",
+  invalidRootPolicy: "error",
+  features: {
+    mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp"] },
+    hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+  },
+};
+
+/**
+ * Crush's JSON config, shared by the project (`crush.json` / `.crush.json`)
+ * and global (`~/.config/crush/crush.json`) spellings so a policy edit lands
+ * on both. See the `SHARED_CONFIG_OWNERSHIP` entries for the key rationale.
+ */
+const CRUSH_CONFIG_DECLARATION: SharedConfigFileDeclaration = {
+  format: "json",
+  invalidRootPolicy: "error",
+  features: {
+    mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp"] },
+    hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+    permissions: { kind: "deep-merge" },
+  },
+};
+
+/**
+ * Firebender's `firebender.json`, shared by the project (`<project>/firebender.json`)
+ * and personal (`~/.firebender/firebender.json`) spellings so a policy edit
+ * lands on both. The file also carries `rules`, `commands`, `mcpEnvFile`,
+ * `worktrees` and `useCursorRules` keys rulesync does not own, so every writer
+ * refuses to read-modify-write a file it could not parse. Each feature owns
+ * one whole top-level key: `ignore` (recomputed from `.rulesync/.aiignore`),
+ * `mcpServers` (the complete server map) and `agents` (recomputed from the
+ * existing list, with the entries for rulesync's own agent directory replaced).
+ * https://docs.firebender.com/api-reference/syntax
+ */
+const FIREBENDER_CONFIG_DECLARATION: SharedConfigFileDeclaration = {
+  format: "json",
+  invalidRootPolicy: "error",
+  features: {
+    ignore: { kind: "replace-owned-keys", ownedKeys: ["ignore"] },
+    subagents: { kind: "replace-owned-keys", ownedKeys: ["agents"] },
+    mcp: { kind: "replace-owned-keys", ownedKeys: ["mcpServers"] },
+  },
+};
+
+/**
+ * What the two Claude Code settings files have in common: both are plain JSON,
+ * and both validate against the one published schema, which the gateway
+ * points every file it writes at. `.claude/settings.local.json` is the same
+ * file with fewer writers — the ignore feature's `fileMode: "local"` and the
+ * project-scope `language` setting go there — so the shape is declared once
+ * and the feature sets separately.
+ *
+ * `language` is the rules feature's: the root `language` key of
+ * `rulesync.jsonc` is written natively for Claude Code instead of as a prompt
+ * block in CLAUDE.md. At project scope it lands in the local file (a
+ * per-developer preference, not a team commitment); at global scope it lands
+ * in `~/.claude/settings.json`, because Claude Code reads no
+ * `~/.claude/settings.local.json`.
+ */
+const CLAUDE_SETTINGS_FILE_SHAPE = {
+  format: "json",
+  ensuredKeys: { $schema: CLAUDECODE_SETTINGS_SCHEMA_URL },
+} as const satisfies Omit<SharedConfigFileDeclaration, "features">;
+
 export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDeclaration>> = {
   [CLAUDE_SETTINGS_SHARED_FILE_KEY]: {
-    format: "json",
+    ...CLAUDE_SETTINGS_FILE_SHAPE,
     features: {
       // `Read(...)` deny entries inside `permissions.deny` are owned by ignore;
       // the permissions feature's explicit rules win over them (with a warning).
@@ -363,11 +1412,25 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
       ignore: { kind: "custom", policyFunction: "applyIgnoreReadDenies" },
       hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
       permissions: { kind: "custom", policyFunction: "applyPermissions" },
+      rules: { kind: "replace-owned-keys", ownedKeys: ["language"] },
+    },
+  },
+  [CLAUDE_SETTINGS_LOCAL_SHARED_FILE_KEY]: {
+    ...CLAUDE_SETTINGS_FILE_SHAPE,
+    features: {
+      ignore: { kind: "custom", policyFunction: "applyIgnoreReadDenies" },
+      rules: { kind: "replace-owned-keys", ownedKeys: ["language"] },
     },
   },
   [HERMES_CONFIG_SHARED_FILE_KEY]: HERMES_CONFIG_DECLARATION,
   [HERMES_WIN32_CONFIG_SHARED_FILE_KEY]: HERMES_CONFIG_DECLARATION,
   [HERMES_HOME_CONFIG_SHARED_FILE_KEY]: HERMES_CONFIG_DECLARATION,
+  // Pool settings: the project file (`.poolside/settings.yaml`, committed and
+  // shared with the team) and the user one under `~/.config/poolside/`. Both
+  // carry the user's own Pool settings (`pool`, `tools`, `sandbox`, ...) beside
+  // the `mcp_servers` and `subagents` blocks rulesync owns.
+  [POOL_PROJECT_SETTINGS_SHARED_FILE_KEY]: POOL_SETTINGS_DECLARATION,
+  [POOL_GLOBAL_SETTINGS_SHARED_FILE_KEY]: POOL_SETTINGS_DECLARATION,
   [TAKT_CONFIG_SHARED_FILE_KEY]: {
     format: "yaml",
     // config.yaml is the user's primary Takt config; refusing to parse a
@@ -432,6 +1495,24 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
       permissions: { kind: "replace-owned-keys", ownedKeys: ["agent"] },
     },
   },
+  // oh-my-pi `config.yml` carries every omp setting. The permissions writer
+  // recomputes `tools` and `bash` from the existing file (sibling keys such as
+  // `tools.approvalMode` and `bash.enabled` carried over, `tools.approval` and
+  // `bash.patterns` replaced) before patching, so both whole keys are owned.
+  ".omp/config.yml": {
+    format: "yaml",
+    invalidRootPolicy: "error",
+    features: {
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["tools", "bash"] },
+    },
+  },
+  ".omp/agent/config.yml": {
+    format: "yaml",
+    invalidRootPolicy: "error",
+    features: {
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["tools", "bash"] },
+    },
+  },
   // Pi Coding Agent settings (`.pi/settings.json` project /
   // `~/.pi/agent/settings.json` global): a hand-edited file carrying `theme`,
   // `defaultModel`, `packages`, `sessionDir` and more. Permissions owns the one
@@ -453,36 +1534,48 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
   // Copilot CLI repository settings (`.github/copilot/settings.json`, CLI
   // v1.0.60+): a committed, hand-edited file that also carries `model`,
   // `effortLevel`, `hooks` and other repository-scope keys rulesync does not
-  // own. Only `deniedUrls` is owned — `allowedUrls` is not accepted at
+  // own. Permissions owns only `deniedUrls` — `allowedUrls` is not accepted at
   // repository scope upstream, so a hand-written one here is left alone rather
-  // than retracted.
+  // than retracted. Hooks owns only the `disableAllHooks` switch (hook
+  // definitions go to `.github/hooks/*.json`), and only patches it when the
+  // `copilotcli` override authors it, so a hand-set value otherwise survives.
+  // MCP owns only `disabledMcpServers` (server definitions go to
+  // `.github/mcp.json`), recomputed for the servers it writes while names it
+  // does not manage keep their state.
   ".github/copilot/settings.json": {
     format: "json",
     // The user's committed Copilot CLI config: refuse to read-modify-write a
     // file we could not parse rather than replacing it with generated output.
     invalidRootPolicy: "error",
     features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["disableAllHooks"] },
+      mcp: { kind: "replace-owned-keys", ownedKeys: ["disabledMcpServers"] },
       permissions: { kind: "replace-owned-keys", ownedKeys: ["deniedUrls"] },
     },
   },
   // Copilot CLI user settings (`~/.copilot/settings.json`): the same file the
-  // CLI writes its own preferences into, so only the two URL lists are owned.
+  // CLI writes its own preferences into, so only the two URL lists, the
+  // `disableAllHooks` switch and `disabledMcpServers` are owned.
   ".copilot/settings.json": {
     format: "json",
     invalidRootPolicy: "error",
     features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["disableAllHooks"] },
+      mcp: { kind: "replace-owned-keys", ownedKeys: ["disabledMcpServers"] },
       permissions: { kind: "replace-owned-keys", ownedKeys: ["allowedUrls", "deniedUrls"] },
     },
   },
   // VS Code workspace settings (`.vscode/settings.json`): a general-purpose
-  // user/project settings file. Copilot permissions owns only the three flat
-  // dotted `chat.tools.*.autoApprove` keys (VS Code stores dotted setting keys
+  // user/project settings file. Copilot permissions owns only the flat dotted
+  // keys listed below (the `chat.tools.*.autoApprove` maps, `chat.permissions.default`
+  // and the `chat.agent.sandbox.*` leaves; VS Code stores dotted setting keys
   // flat at the top level); every unrelated editor setting is preserved by the
   // shallow merge. The Copilot MCP feature writes a SEPARATE file
   // (`.vscode/mcp.json`, declared just below).
   //
   // Three targets reach this file through the same `permissions` feature —
-  // `copilot` (the `chat.tools.*` keys), `zoocode` (the `zoo-code.*` command
+  // `copilot` (the `chat.tools.*` keys, `chat.permissions.default` and the
+  // `chat.agent.sandbox.*` keys), `zoocode` (the `zoo-code.*` command
   // lists) and `roo` (the same lists under the archived lineage's `roo-cline.*`
   // spelling) — so `ownedKeys` is their union. They stay independent because a
   // patch only ever names the keys its own adapter builds: generating for one
@@ -491,7 +1584,7 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
   ".vscode/settings.json": {
     format: "jsonc",
     // A general-purpose user file we promise to preserve untouched apart from
-    // the one managed key. Refuse to read-modify-write a file we could not
+    // the managed keys. Refuse to read-modify-write a file we could not
     // fully parse (fail-closed), so a partial JSONC parse can never silently
     // drop unrelated user settings on the write-back — mirroring `.amp/`.
     invalidRootPolicy: "error",
@@ -503,6 +1596,17 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
           "chat.tools.terminal.autoApprove",
           "chat.tools.edits.autoApprove",
           "chat.tools.urls.autoApprove",
+          "chat.permissions.default",
+          "chat.agent.sandbox.enabled",
+          "chat.agent.sandbox.network.allowNetwork",
+          "chat.agent.sandbox.network.allowLocalNetwork",
+          "chat.agent.sandbox.allowUnsandboxedCommands",
+          "chat.agent.sandbox.mcpServers",
+          "chat.agent.sandbox.lspServers",
+          "chat.agent.sandbox.credentials.authenticategit",
+          "chat.agent.sandbox.credentials.authenticategh",
+          "chat.agent.sandbox.fileSystem.allowDevToolAccess",
+          "chat.agent.sandbox.fileSystem.userConfiguredPaths",
           "zoo-code.allowedCommands",
           "zoo-code.deniedCommands",
           "roo-cline.allowedCommands",
@@ -531,31 +1635,57 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
       mcp: { kind: "replace-owned-keys", ownedKeys: ["servers"] },
     },
   },
+  // Xum MCP config (`.xum/mcp.jsonc` in a repo, `~/.xum/mcp.jsonc` for the
+  // user): a JSONC document whose `servers` map rulesync owns. Xum's own
+  // Settings → MCP screen writes `enabledPluginServers` (Agent Plugin consent)
+  // into the user file, so every other top-level key is preserved and a file
+  // that does not fully parse is refused rather than rewritten.
+  // https://xum.cdr.dev/config/mcp-servers
+  ".xum/mcp.jsonc": {
+    format: "jsonc",
+    invalidRootPolicy: "error",
+    jsoncParseErrors: "error",
+    features: {
+      mcp: { kind: "replace-owned-keys", ownedKeys: ["servers"] },
+    },
+  },
   // Qwen Code settings: `permissions` is recomputed from the existing file
   // (unmanaged-tool entries preserved, managed ones replaced) before being
-  // applied, and so are the `tools`/`security` override groups. Keys like
+  // applied, and so are the `tools`/`security`/`skills`/`general` override groups and the MCP
+  // feature's `mcp` object (server allow/deny lists). Keys like
   // `disableAllHooks` are only present in the patch when authored, so an
   // existing user value survives an unrelated regeneration.
   ".qwen/settings.json": {
     format: "json",
     features: {
-      mcp: { kind: "replace-owned-keys", ownedKeys: ["mcpServers"] },
+      mcp: { kind: "replace-owned-keys", ownedKeys: ["mcpServers", "mcp"] },
       hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks", "disableAllHooks"] },
       permissions: {
         kind: "replace-owned-keys",
-        ownedKeys: ["permissions", "tools", "security"],
+        ownedKeys: ["permissions", "tools", "security", "skills", "general"],
       },
     },
   },
   // AugmentCode settings: `toolPermissions` is recomputed from the existing
   // file (special entries and fail-closed denies preserved) before being
-  // applied.
+  // applied. Auggie documents the file as JSON with Comments
+  // (https://docs.augmentcode.com/cli/config), so it is edited in place the
+  // way `.vscode/settings.json` is, with the same fail-closed policies: a
+  // file that only partially parses is refused rather than rewritten from a
+  // fragment.
   ".augment/settings.json": {
-    format: "json",
+    format: "jsonc",
+    invalidRootPolicy: "error",
+    jsoncParseErrors: "error",
     features: {
       mcp: { kind: "replace-owned-keys", ownedKeys: ["mcpServers"] },
       hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
-      permissions: { kind: "replace-owned-keys", ownedKeys: ["toolPermissions"] },
+      // `recommendedMarketplaces` / `enabledPlugins` are patched only when the
+      // `augmentcode` override authors them, so a hand-set value survives.
+      permissions: {
+        kind: "replace-owned-keys",
+        ownedKeys: ["toolPermissions", "recommendedMarketplaces", "enabledPlugins"],
+      },
     },
   },
   // Devin config: `permissions` is recomputed from the existing file
@@ -565,14 +1695,21 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
   ".devin/config.json": {
     format: "json",
     features: {
-      permissions: { kind: "replace-owned-keys", ownedKeys: ["permissions"] },
+      // The repo-level plugin governance lists are patched only when the
+      // `devin` override authors them, so a hand-set value survives.
+      permissions: {
+        kind: "replace-owned-keys",
+        ownedKeys: ["permissions", "requiredPlugins", "optionalPlugins", "forbiddenPlugins"],
+      },
     },
   },
   ".config/devin/config.json": {
     format: "json",
     features: {
       hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
-      permissions: { kind: "replace-owned-keys", ownedKeys: ["permissions"] },
+      // `sandbox` is a User Config Only key upstream, so the permissions feature
+      // owns it here and nowhere else; the project file above must not list it.
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["permissions", "sandbox"] },
     },
   },
   // Muse Code user settings (`~/.config/muse/settings.json`): mcp is its only
@@ -589,7 +1726,206 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
     // we could not parse rather than replacing it with generated output.
     invalidRootPolicy: "error",
     features: {
-      mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp_servers", "schema_version"] },
+      // `mcpServers` is the alias Muse Code accepts since 0.2.1; the writer
+      // patches whichever one spelling the file already uses, never both.
+      mcp: {
+        kind: "replace-owned-keys",
+        ownedKeys: ["mcp_servers", "mcpServers", "schema_version"],
+      },
+    },
+  },
+  ".zcode/config.json": ZCODE_CONFIG_DECLARATION,
+  ".zcode/cli/config.json": ZCODE_CONFIG_DECLARATION,
+  // Crush's JSON config: `<project>/crush.json` (or its `.crush.json` twin,
+  // which the writers resolve to this same declaration) and
+  // `~/.config/crush/crush.json`. Both carry the user's providers, models and
+  // options beside the rulesync-owned sections, so they are edited in place
+  // and an unparseable root is refused rather than replaced. `mcp` and `hooks`
+  // are owned outright. Permissions author `permissions.allowed_tools` and
+  // `options.disabled_tools` next to the user's other `permissions.*` /
+  // `options.*` keys, so that patch deep-merges; both lists are rebuilt in
+  // full by the writer and retracted with an explicit `undefined`.
+  "crush.json": CRUSH_CONFIG_DECLARATION,
+  ".config/crush/crush.json": CRUSH_CONFIG_DECLARATION,
+  "firebender.json": FIREBENDER_CONFIG_DECLARATION,
+  ".firebender/firebender.json": FIREBENDER_CONFIG_DECLARATION,
+  // IBM Bob settings: the hooks feature owns `hooks` in both the project file
+  // (`.bob/settings.json`) and the user file (`~/.bob/settings/settings.json`);
+  // the permissions feature owns `approval` and `autoApprove` in the user file
+  // only, and the adapter re-spreads the parts of them rulesync does not
+  // author. Both files
+  // carry unrelated Bob settings, so they are edited in place and an
+  // unparseable root is refused rather than replaced with generated output.
+  ".bob/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+    },
+  },
+  ".bob/settings/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["approval", "autoApprove"] },
+    },
+  },
+  // Continue CLI settings: `hooks` is the only rulesync-owned key of
+  // `.continue/settings.json` (project) and `~/.continue/settings.json`
+  // (user). Both files carry the user's other Continue settings, so they are
+  // edited in place and an unparseable root is refused rather than replaced
+  // with generated output.
+  ".continue/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+    },
+  },
+  // CodeBuddy Code settings: the project file (`.codebuddy/settings.json`) and
+  // the user file (`~/.codebuddy/settings.json`) share one layout and carry
+  // unrelated CodeBuddy settings (`model`, `env`, ...), so both are edited in
+  // place and an unparseable root is refused rather than replaced. Hooks own
+  // the `hooks` key; permissions own the `permissions` key, and the adapter
+  // re-spreads the sibling keys of that object (`defaultMode`,
+  // `additionalDirectories`, ...).
+  ".codebuddy/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["permissions"] },
+    },
+  },
+  // Command Code settings: the project file (`.commandcode/settings.json`) and
+  // the user file (`~/.commandcode/settings.json`) share one layout and carry
+  // unrelated Command Code settings (`model`, `env`, ...), so both are edited
+  // in place and an unparseable root is refused rather than replaced. Hooks
+  // own the `hooks` key outright; permissions own the `permissions` key, and
+  // the adapter itself re-spreads the user's `defaultMode` and the other
+  // sibling keys of that object into the regenerated value.
+  ".commandcode/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["permissions"] },
+    },
+  },
+  // Codewhale config: global hooks live in the `[hooks]` table of the user
+  // config beside every other Codewhale setting. The hooks writer owns that
+  // table, carrying its own settings (`enabled`, `default_timeout_secs`,
+  // `working_dir`) over from the existing file. Project permissions own the
+  // top-level `allow_shell` key of the per-project overlay, which they only
+  // ever set to `false`. An unparseable root is refused rather than replaced.
+  [CODEWHALE_CONFIG_SHARED_FILE_KEY]: {
+    format: "toml",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["allow_shell"] },
+    },
+  },
+  // Letta Code settings: the project file (`.letta/settings.json`) and the
+  // user file (`~/.letta/settings.json`) share one layout and carry unrelated
+  // Letta Code settings (model, UI preferences, ...), so both are edited in
+  // place and an unparseable root is refused rather than replaced. Hooks own
+  // the `hooks` key (the adapter carries its `disabled` switch over);
+  // permissions own the `permissions` key, and the adapter re-spreads the
+  // sibling keys of that object (`mode`, `additionalDirectories`, ...).
+  ".letta/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["permissions"] },
+    },
+  },
+  // Snowflake Cortex Code hooks: `hooks` is the only rulesync-owned key. The
+  // project file (`.cortex/settings.json`) carries unrelated Cortex settings,
+  // and the user file (`~/.snowflake/cortex/hooks.json`) lives in the
+  // CLI-owned config tree, so both are edited in place and an unparseable root
+  // is refused rather than replaced with generated output.
+  ".cortex/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+    },
+  },
+  ".snowflake/cortex/hooks.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+    },
+  },
+  // Qoder settings: the project file (`.qoder/settings.json`) and the user file
+  // (`~/.qoder/settings.json`) share one layout and carry every other Qoder
+  // setting (model, theme, trust, ...), so both are edited in place and an
+  // unparseable root is refused rather than replaced with generated output.
+  // MCP owns `mcpServers` (user scope only; project servers go to `.mcp.json`),
+  // hooks own `hooks`, and permissions own `permissions` (the adapter
+  // re-spreads the sibling keys of that object: `additionalDirectories`,
+  // `trustDirectories`, ...) plus the top-level keys the `qoder` override
+  // authors (`outputStyle`, `autoMode`, `agentsMdExcludes`, and the `general`,
+  // `tools`, `mcp` and `agents` groups, re-spread by the adapter so their other
+  // keys are kept). Each is only in the patch when authored, so a value the
+  // user set by hand survives an unrelated regeneration.
+  ".qoder/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      mcp: { kind: "replace-owned-keys", ownedKeys: ["mcpServers"] },
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+      permissions: {
+        kind: "replace-owned-keys",
+        ownedKeys: [
+          "permissions",
+          "outputStyle",
+          "general",
+          "tools",
+          "mcp",
+          "agents",
+          "autoMode",
+          "agentsMdExcludes",
+        ],
+      },
+    },
+  },
+  // TRAE's global permission file (`~/.trae/permission/global.json`) also holds
+  // the user's custom permission mode (`shellSandbox`, `approval.reviewer`,
+  // `sceneRules`, ...) and `resourceAuthorization.filesystem`, so it is edited
+  // in place and an unparseable root is refused. The permissions adapter
+  // re-spreads both owned objects and only rewrites `approval.commandRules`,
+  // `approval.mcpRules` and `resourceAuthorization.network.allow` / `deny`.
+  ".trae/permission/global.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      permissions: {
+        kind: "replace-owned-keys",
+        ownedKeys: ["customProfiles", "resourceAuthorization"],
+      },
+    },
+  },
+  // Tabnine CLI settings: the project file (`.tabnine/agent/settings.json`)
+  // and the user file (`~/.tabnine/agent/settings.json`) share one layout and
+  // carry unrelated Tabnine settings (`general`, `context`, `ui`, ...), so they
+  // are edited in place and an unparseable root is refused rather than
+  // replaced. `mcpServers` and `hooks` are owned outright. Permissions author
+  // `tools.allowed`/`tools.exclude` next to the user's other `tools.*` keys
+  // (and the `general` group through the `tabnine` override), so that patch
+  // deep-merges; the two lists are rebuilt in full by the writer and retracted
+  // with an explicit `undefined`, so nothing needs a wholesale replace.
+  ".tabnine/agent/settings.json": {
+    format: "json",
+    invalidRootPolicy: "error",
+    features: {
+      mcp: { kind: "replace-owned-keys", ownedKeys: ["mcpServers"] },
+      hooks: { kind: "replace-owned-keys", ownedKeys: ["hooks"] },
+      permissions: { kind: "deep-merge" },
     },
   },
   // Kiro agent config: `allowedTools`/`toolsSettings` are recomputed from the
@@ -668,23 +2004,43 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
       rules: { kind: "replace-owned-keys", ownedKeys: ["instructions"] },
     },
   },
-  // Kilo config (`kilo.json` / preferred `kilo.jsonc` twin) — same shape as
-  // OpenCode: `tools` is retracted when empty, `instructions` is recomputed
-  // from the existing list before being applied.
-  "kilo.json": {
+  // MiMo Code config (an OpenCode fork; `.mimocode/mimocode.json` or the
+  // preferred `mimocode.jsonc` twin) — same ownership as OpenCode at both scopes.
+  ".mimocode/mimocode.json": {
     format: "jsonc",
     features: {
       mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp", "tools"] },
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["permission"] },
       rules: { kind: "replace-owned-keys", ownedKeys: ["instructions"] },
     },
   },
-  // Global Kilo config: mcp is its only writer (rules registers instructions in
-  // project scope only), so this is not cross-feature shared — it is declared
-  // anyway so the write goes through the same codec and ownership enforcement.
-  ".config/kilo/kilo.json": {
+  ".config/mimocode/mimocode.json": {
     format: "jsonc",
     features: {
       mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp", "tools"] },
+      permissions: { kind: "replace-owned-keys", ownedKeys: ["permission"] },
+      rules: { kind: "replace-owned-keys", ownedKeys: ["instructions"] },
+    },
+  },
+  // Kilo config (`kilo.json` / preferred `kilo.jsonc` twin): `instructions` is
+  // recomputed from the existing list before being applied. MCP replaces `mcp`
+  // and the legacy `tools` map wholesale, but deep-merges its `{server}_{tool}`
+  // tool filters into `permission`, the block the permissions feature writes
+  // too — each key it retracts is spelled out as `undefined`.
+  "kilo.json": {
+    format: "jsonc",
+    features: {
+      mcp: KILO_MCP_POLICY,
+      rules: { kind: "replace-owned-keys", ownedKeys: ["instructions"] },
+    },
+  },
+  // Global Kilo config: mcp is its only gateway writer (rules registers
+  // instructions in project scope only) — it is declared anyway so the write
+  // goes through the same codec and ownership enforcement.
+  ".config/kilo/kilo.json": {
+    format: "jsonc",
+    features: {
+      mcp: KILO_MCP_POLICY,
     },
   },
   // Goose user config (`~/.config/goose/config.yaml`): the file holds the
@@ -722,14 +2078,17 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
       },
     },
   },
-  // Grok Build CLI config: mcp owns `mcp_servers`; permissions owns the
+  // Grok Build CLI config: mcp owns `mcp_servers` and the global-only
+  // `disabled_mcp_tools`; permissions owns the
   // fine-grained `permission` allow/ask/deny arrays and the coarse `ui`
   // fallback. Both are recomputed from the existing file (unmanaged entries
   // preserved) before being applied.
   [GROKCLI_CONFIG_SHARED_FILE_KEY]: {
     format: "toml",
     features: {
-      mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp_servers"] },
+      // `disabled_mcp_tools` is recomputed per server: entries for servers
+      // Rulesync does not declare (e.g. written by Grok's `/mcps` UI) survive.
+      mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp_servers", "disabled_mcp_tools"] },
       permissions: { kind: "replace-owned-keys", ownedKeys: ["permission", "ui"] },
     },
   },
@@ -789,12 +2148,124 @@ export const SHARED_CONFIG_OWNERSHIP: Readonly<Record<string, SharedConfigFileDe
       permissions: { kind: "replace-owned-keys", ownedKeys: ["toolPermissions"] },
     },
   },
+  // OpenClaw's Gateway config (`~/.openclaw/openclaw.json`, JSON5): it also
+  // holds credentials, channels, agents and every other Gateway setting, and
+  // the Gateway refuses to start on a config it cannot validate, so a file
+  // rulesync cannot parse is refused instead of being replaced. The `mcp`
+  // block is recomputed from the existing file before being applied — servers
+  // rulesync does not own and siblings such as `mcp.sessionIdleTtlMs` are
+  // carried over — so the whole key is owned here.
+  [OPENCLAW_CONFIG_SHARED_FILE_KEY]: {
+    format: "json5",
+    invalidRootPolicy: "error",
+    features: {
+      mcp: { kind: "replace-owned-keys", ownedKeys: ["mcp"] },
+    },
+  },
 };
+
+/**
+ * The keys a declaration ensures, added to `document` when it lacks them and
+ * placed in front of every key it has. A document that states all of them —
+ * with whatever value — comes back as it is, and no key of the document
+ * moves: the whole-document writer emits keys in this order, and the JSONC
+ * edit path is told which keys lead (see {@link serializeSharedConfig}).
+ */
+function withEnsuredKeys({
+  document,
+  ensuredKeys,
+}: {
+  document: SharedConfigDocument;
+  ensuredKeys: Readonly<Record<string, unknown>>;
+}): SharedConfigDocument {
+  const missing = Object.entries(ensuredKeys).filter(
+    ([key]) => !isPrototypePollutionKey(key) && !Object.hasOwn(document, key),
+  );
+  if (missing.length === 0) return document;
+  return { ...Object.fromEntries(missing), ...document };
+}
+
+function serializeDeclaredSharedConfig({
+  declaration,
+  document,
+  existingContent,
+  filePath,
+  logger,
+}: {
+  declaration: SharedConfigFileDeclaration;
+  document: SharedConfigDocument;
+  existingContent: string;
+  filePath: string;
+  logger: Logger | undefined;
+}): string {
+  const ensuredKeys = declaration.ensuredKeys ?? {};
+  return serializeSharedConfig({
+    format: declaration.format,
+    document: withEnsuredKeys({ document, ensuredKeys }),
+    existingContent,
+    leadingKeys: Object.keys(ensuredKeys),
+    filePath,
+    logger,
+  });
+}
+
+/**
+ * Serialize a merged document back over a gateway-managed shared file, under
+ * that file's declaration: its format, and the keys the gateway ensures on it
+ * (see {@link SharedConfigFileDeclaration.ensuredKeys}). This is the one
+ * write path of the gateway — {@link applySharedConfigPatch} ends in it, and a
+ * feature whose policy is `custom` serializes its own merge through it — so a
+ * key the gateway ensures is emitted whichever feature writes the file.
+ * Throws when the file is undeclared. A JSONC file that had to be written
+ * whole is warned about through `logger`, named by `filePath` when given and
+ * by `fileKey` otherwise (see {@link serializeSharedConfig}).
+ */
+export function serializeSharedConfigFile({
+  fileKey,
+  document,
+  existingContent,
+  filePath,
+  logger,
+}: {
+  fileKey: string;
+  document: SharedConfigDocument;
+  existingContent: string;
+  filePath?: string | undefined;
+  logger?: Logger | undefined;
+}): string {
+  const declaration = SHARED_CONFIG_OWNERSHIP[fileKey];
+  if (!declaration) {
+    throw new Error(
+      `Shared config file '${fileKey}' has no SHARED_CONFIG_OWNERSHIP declaration; ` +
+        `declare its writers and policies before writing it through the gateway.`,
+    );
+  }
+  return serializeDeclaredSharedConfig({
+    declaration,
+    document,
+    existingContent,
+    filePath: filePath ?? fileKey,
+    logger,
+  });
+}
+
+/**
+ * A patch value for an owned key that holds a map of managed entries: the map
+ * itself, or `undefined` when it is empty, which retracts the key instead of
+ * leaving an empty object behind (`applySharedConfigPatch` deletes a key whose patch value is `undefined`).
+ */
+export function undefinedWhenEmpty<T extends Record<string, unknown>>(entries: T): T | undefined {
+  return Object.keys(entries).length > 0 ? entries : undefined;
+}
 
 /**
  * Execute a feature's declared write to a gateway-managed shared file: parse
  * the existing content, merge the patch under the feature's declared policy,
- * and serialize. Throws when the file or feature is undeclared, when a
+ * and serialize it back over the existing content (see
+ * {@link serializeSharedConfigFile}, which adds the keys the file's declaration
+ * ensures and keeps a JSONC file's comments and formatting outside the spans
+ * the merge actually changed). Throws when the
+ * file or feature is undeclared, when a
  * `replace-owned-keys` patch strays outside its owned keys, or when the
  * feature's policy is `custom` (those calls go to the named policy function
  * instead).
@@ -805,12 +2276,14 @@ export function applySharedConfigPatch({
   existingContent,
   patch,
   filePath,
+  logger,
 }: {
   fileKey: string;
   feature: Feature;
   existingContent: string;
   patch: SharedConfigDocument;
   filePath?: string | undefined;
+  logger?: Logger | undefined;
 }): string {
   const declaration = SHARED_CONFIG_OWNERSHIP[fileKey];
   if (!declaration) {
@@ -862,7 +2335,13 @@ export function applySharedConfigPatch({
         delete document[key];
       }
     }
-    return stringifySharedConfig({ format: declaration.format, document });
+    return serializeDeclaredSharedConfig({
+      declaration,
+      document,
+      existingContent,
+      filePath: filePath ?? fileKey,
+      logger,
+    });
   }
 
   const merged = mergeSharedConfigDeep({ base, patch });
@@ -871,7 +2350,87 @@ export function applySharedConfigPatch({
       merged[key] = sanitizeSharedConfigValue(patch[key]);
     }
   }
-  return stringifySharedConfig({ format: declaration.format, document: merged });
+  return serializeDeclaredSharedConfig({
+    declaration,
+    document: merged,
+    existingContent,
+    filePath: filePath ?? fileKey,
+    logger,
+  });
+}
+
+export type SharedConfigKeyOperation = {
+  action: "write" | "delete";
+  key: string;
+};
+
+/**
+ * The top-level keys a feature owns outright in a declared shared file: every
+ * `replace-owned-keys` key and every `deep-merge` `replaceKeys` entry. A
+ * `deep-merge` or `custom` policy otherwise shares its keys with the user at
+ * entry depth, so those keys are not listed.
+ */
+function whollyOwnedKeys(declaration: SharedConfigFileDeclaration): string[] {
+  return uniq(
+    Object.values(declaration.features).flatMap((policy) => {
+      if (policy.kind === "replace-owned-keys") return policy.ownedKeys;
+      if (policy.kind === "deep-merge") return policy.replaceKeys ?? [];
+      return [];
+    }),
+  );
+}
+
+/**
+ * What a write of a gateway-managed shared file does to the top-level keys
+ * Rulesync owns outright there (see {@link whollyOwnedKeys}), sorted by key:
+ * `write` for a key the new content adds or changes, `delete` for one it
+ * removes. Returns an empty list for an undeclared file, and for content
+ * either side of which cannot be read as a document — the file-level write
+ * still describes that case.
+ */
+export function diffSharedConfigOwnedKeys({
+  fileKey,
+  existingContent,
+  newContent,
+}: {
+  fileKey: string;
+  existingContent: string;
+  newContent: string;
+}): SharedConfigKeyOperation[] {
+  const declaration = SHARED_CONFIG_OWNERSHIP[fileKey];
+  if (!declaration) return [];
+
+  const parse = (fileContent: string): SharedConfigDocument =>
+    parseSharedConfig({
+      format: declaration.format,
+      fileContent,
+      ...(declaration.invalidRootPolicy !== undefined && {
+        invalidRootPolicy: declaration.invalidRootPolicy,
+      }),
+      ...(declaration.jsoncParseErrors !== undefined && {
+        jsoncParseErrors: declaration.jsoncParseErrors,
+      }),
+    });
+  let before: SharedConfigDocument;
+  let after: SharedConfigDocument;
+  try {
+    before = parse(existingContent);
+    after = parse(newContent);
+  } catch {
+    return [];
+  }
+
+  const operations: SharedConfigKeyOperation[] = [];
+  for (const key of whollyOwnedKeys(declaration).toSorted()) {
+    const inBefore = Object.hasOwn(before, key);
+    const inAfter = Object.hasOwn(after, key);
+    if (inAfter && (!inBefore || !isDeepStrictEqual(before[key], after[key]))) {
+      operations.push({ action: "write", key });
+    } else if (inBefore && !inAfter) {
+      operations.push({ action: "delete", key });
+    }
+  }
+  return operations;
 }
 
 // ---------------------------------------------------------------------------
@@ -886,10 +2445,15 @@ export function applySharedConfigPatch({
 
 const READ_TOOL_NAME = "Read";
 
-export const isReadDenyEntry = (entry: string): boolean =>
-  entry.startsWith(`${READ_TOOL_NAME}(`) && entry.endsWith(")");
+// `readToolName` lets a target whose rule vocabulary names the read tool
+// differently (Reasonix: `read_file`) reuse the same entry format and merge.
+export const isReadDenyEntry = (entry: string, readToolName: string = READ_TOOL_NAME): boolean =>
+  entry.startsWith(`${readToolName}(`) && entry.endsWith(")");
 
-export const buildReadDenyEntry = (pattern: string): string => `${READ_TOOL_NAME}(${pattern})`;
+export const buildReadDenyEntry = (
+  pattern: string,
+  readToolName: string = READ_TOOL_NAME,
+): string => `${readToolName}(${pattern})`;
 
 const parsePermissionsBlock = (
   settings: ClaudeSettingsJson,
@@ -927,11 +2491,12 @@ const withPermissions = (
 export const applyIgnoreReadDenies = (params: {
   settings: ClaudeSettingsJson;
   readDenies: string[];
+  readToolName?: string;
 }): ClaudeSettingsJson => {
-  const { settings, readDenies } = params;
+  const { settings, readDenies, readToolName = READ_TOOL_NAME } = params;
   const current = parsePermissionsBlock(settings);
   const preservedDeny = current.deny.filter(
-    (entry) => !isReadDenyEntry(entry) || readDenies.includes(entry),
+    (entry) => !isReadDenyEntry(entry, readToolName) || readDenies.includes(entry),
   );
   return withPermissions(settings, {
     allow: current.allow,

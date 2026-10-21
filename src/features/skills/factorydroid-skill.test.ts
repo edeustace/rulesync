@@ -331,6 +331,64 @@ This is a test factorydroid skill content.`;
       const factorydroidSkill = FactorydroidSkill.fromRulesyncSkill({ rulesyncSkill });
       expect(factorydroidSkill.getFrontmatter()["user-invocable"]).toBe(false);
     });
+
+    it("should fall back to the root-level license/compatibility/metadata when the factorydroid section omits them", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "root-fields",
+        frontmatter: {
+          name: "root-fields",
+          description: "Root-level standard fields",
+          license: "MIT",
+          compatibility: "Requires git",
+          metadata: { author: "root" },
+        },
+        body: "Body",
+      });
+
+      const frontmatter = FactorydroidSkill.fromRulesyncSkill({ rulesyncSkill }).getFrontmatter();
+      expect(frontmatter).toEqual({
+        name: "root-fields",
+        description: "Root-level standard fields",
+        license: "MIT",
+        compatibility: "Requires git",
+        metadata: { author: "root" },
+      });
+    });
+
+    it("should let the factorydroid section override the root-level license/compatibility/metadata", () => {
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "section-wins",
+        frontmatter: {
+          name: "section-wins",
+          description: "Section overrides the root-level fields",
+          license: "MIT",
+          compatibility: "Requires git",
+          metadata: { author: "root" },
+          factorydroid: {
+            license: "Apache-2.0",
+            compatibility: ["droid"],
+            metadata: { author: "section" },
+            version: "1.0.0",
+          },
+        },
+        body: "Body",
+      });
+
+      const frontmatter = FactorydroidSkill.fromRulesyncSkill({ rulesyncSkill }).getFrontmatter();
+      // The untyped section shapes Droid accepts survive the override.
+      expect(frontmatter).toEqual({
+        name: "section-wins",
+        description: "Section overrides the root-level fields",
+        license: "Apache-2.0",
+        compatibility: ["droid"],
+        metadata: { author: "section" },
+        version: "1.0.0",
+      });
+    });
   });
 
   describe("toRulesyncSkill", () => {
@@ -638,6 +696,103 @@ Global body content`;
       const result = FactorydroidSkillFrontmatterSchema.safeParse({ name: 123, description: true });
 
       expect(result.success).toBe(false);
+    });
+  });
+
+  describe("isDirOwned", () => {
+    const skillsDir = join(".factory", "skills");
+
+    const writeSkillFile = async (dirName: string, content: string): Promise<void> => {
+      await ensureDir(join(testDir, skillsDir, dirName));
+      await writeFileContent(join(testDir, skillsDir, dirName, SKILL_FILE_NAME), content);
+    };
+
+    const isDirOwned = (dirName: string, global = false): Promise<boolean> =>
+      FactorydroidSkill.isDirOwned({
+        outputRoot: testDir,
+        relativeDirPath: skillsDir,
+        dirName,
+        inputRoots: ["."],
+        global,
+      });
+
+    it("should own every directory other than review-guidelines", async () => {
+      await writeSkillFile("other", "<!-- rulesync:check:security -->\n\n## security\n");
+
+      expect(await isDirOwned("other")).toBe(true);
+    });
+
+    it("should disown a review-guidelines directory holding generated check sections", async () => {
+      // The checks feature owns this path, so the skills feature must neither
+      // delete it as an orphan nor import it as a skill.
+      await writeSkillFile(
+        "review-guidelines",
+        "<!-- rulesync:check:security -->\n\n## security\n",
+      );
+
+      expect(await isDirOwned("review-guidelines")).toBe(false);
+    });
+
+    it("should disown a hand-authored review-guidelines directory too", async () => {
+      // Factory's documented example has no frontmatter, so shape cannot tell a
+      // hand-authored file from a generated one. The path decides instead, and
+      // `import --features checks` is what reads this one.
+      await writeSkillFile(
+        "review-guidelines",
+        "---\nname: review-guidelines\ndescription: Ours\n---\n\nOur guidelines.\n",
+      );
+
+      expect(await isDirOwned("review-guidelines")).toBe(false);
+    });
+
+    it("should disown a review-guidelines directory with no SKILL.md", async () => {
+      await ensureDir(join(testDir, skillsDir, "review-guidelines"));
+
+      expect(await isDirOwned("review-guidelines")).toBe(false);
+    });
+
+    it("should disown a spelling that differs only in case", async () => {
+      // Case-insensitive filesystems resolve both spellings to one directory.
+      await writeSkillFile("Review-Guidelines", "Ours.\n");
+
+      expect(await isDirOwned("Review-Guidelines")).toBe(false);
+    });
+
+    it("should own review-guidelines in global mode", async () => {
+      // Checks is project-only, so nothing else claims the user-level path.
+      await writeSkillFile("review-guidelines", "---\nname: rg\ndescription: Ours\n---\n\nOurs.\n");
+
+      expect(await isDirOwned("review-guidelines", true)).toBe(true);
+    });
+  });
+
+  describe("getDirWriteBlockReason", () => {
+    const reasonFor = (dirName: string, global = false): Promise<string | null> =>
+      FactorydroidSkill.getDirWriteBlockReason({
+        outputRoot: testDir,
+        relativeDirPath: join(".factory", "skills"),
+        dirName,
+        inputRoots: ["."],
+        global,
+      });
+
+    it("should refuse to generate a project-scoped review-guidelines skill", async () => {
+      // The checks feature owns that directory, and `isDirOwned` keeps the
+      // skills feature from deleting it again.
+      expect(await reasonFor("review-guidelines")).toContain("checks");
+    });
+
+    it("should refuse a spelling that differs only in case", async () => {
+      // On macOS and Windows it is the very same file as the checks output.
+      expect(await reasonFor("Review-Guidelines")).toContain("checks");
+    });
+
+    it("should generate review-guidelines in global mode", async () => {
+      expect(await reasonFor("review-guidelines", true)).toBeNull();
+    });
+
+    it("should generate every other name", async () => {
+      expect(await reasonFor("other")).toBeNull();
     });
   });
 

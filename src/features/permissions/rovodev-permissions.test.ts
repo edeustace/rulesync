@@ -112,6 +112,43 @@ describe("RovodevPermissions", () => {
       ]);
     });
 
+    it("carries an all-tools deny into bash.commands, withholding the allow it covers", async () => {
+      const perms = await RovodevPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: rulesyncPermissions({
+          "*": { "rm *": "deny" },
+          bash: { "rm *": "allow", "git *": "allow" },
+        }),
+        global: true,
+      });
+
+      const tp = toolPermissionsOf(perms.getFileContent());
+      const bash = isRecord(tp.bash) ? tp.bash : {};
+      expect(bash.commands).toEqual([
+        { command: "git *", permission: "allow" },
+        { command: "rm *", permission: "deny" },
+      ]);
+    });
+
+    it("carries an all-tools ask into bash.commands when bash says nothing about that pattern", async () => {
+      // Regression: this pattern used to vanish from bash entirely (neither
+      // allowed, asked, nor denied) because only `*` denies were folded in.
+      const perms = await RovodevPermissions.fromRulesyncPermissions({
+        outputRoot: testDir,
+        rulesyncPermissions: rulesyncPermissions({
+          "*": { "rm *": "ask" },
+          bash: { "git *": "allow" },
+        }),
+        global: true,
+      });
+
+      const tp = toolPermissionsOf(perms.getFileContent());
+      const bash = isRecord(tp.bash) ? tp.bash : {};
+      expect(bash.commands).toEqual(
+        expect.arrayContaining([{ command: "rm *", permission: "ask" }]),
+      );
+    });
+
     it("maps read/edit catch-alls to the matching per-tool keys", async () => {
       const perms = await RovodevPermissions.fromRulesyncPermissions({
         outputRoot: testDir,
@@ -832,8 +869,9 @@ describe("RovodevPermissions", () => {
         toolPermissions: { default?: string; bash?: { default?: string } };
       };
       expect(parsed.toolPermissions.default).toBe("deny");
-      // The two defaults are derived the same way and stay independent.
-      expect(parsed.toolPermissions.bash?.default).toBe("ask");
+      // The all-tools deny covers shell commands too, so it overrides the
+      // bash ask (deny > ask > allow).
+      expect(parsed.toolPermissions.bash?.default).toBe("deny");
     });
 
     it("warns and skips a pattern rule in the all-tools category", async () => {

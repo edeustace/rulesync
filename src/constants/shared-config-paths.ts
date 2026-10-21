@@ -5,7 +5,8 @@ import { toPosixPath } from "../utils/file.js";
  * settings files), as paths relative to the output root. Most come straight from
  * a tool's default `getSettablePaths`; the rest are twins a generator only
  * chooses at write time or under non-default options: `.amp/settings.jsonc`
- * (runtime probe twin of `.amp/settings.json`), `opencode.jsonc` / `kilo.jsonc`
+ * (runtime probe twin of `.amp/settings.json`), `opencode.jsonc` / `kilo.jsonc` /
+ * `.mimocode/mimocode.jsonc`
  * (preferred over the `.json` twin when neither file exists yet), and
  * `.claude/settings.local.json` (claudecode ignore `fileMode: "local"`).
  *
@@ -25,28 +26,103 @@ export const SHARED_USER_MANAGED_CONFIG_PATHS: readonly string[] = [
   ".amp/settings.json",
   ".amp/settings.jsonc",
   ".antigravity/settings.json",
+  // IBM Bob settings: the project file and the user one under `~/.bob/settings/`.
+  // Both carry the user's own Bob settings beside the `hooks` block.
+  ".bob/settings.json",
+  ".bob/settings/settings.json",
   ".claude/settings.json",
   ".claude/settings.local.json",
+  // CodeBuddy Code settings: the project file and the user one share the same
+  // `.codebuddy/settings.json` layout and carry the user's own settings
+  // (`model`, `env`, ...) beside the `hooks` and `permissions` blocks.
+  ".codebuddy/settings.json",
   ".codex/config.toml",
+  // Codewhale's user config carries every Codewhale setting beside the
+  // `[hooks]` table rulesync writes.
+  ".codewhale/config.toml",
+  // Codewhale's repo constitution carries repo authority policy and
+  // hand-written invariants beside the write holds rulesync writes.
+  ".codewhale/constitution.json",
+  // Command Code settings: the project file and the user one share the same
+  // `.commandcode/settings.json` layout and carry the user's own settings
+  // (`defaultMode`, `model`, ...) beside the `hooks` and `permissions` blocks.
+  ".commandcode/settings.json",
+  // Continue CLI settings: the project file and the user one share the same
+  // `.continue/settings.json` layout and carry the user's own settings beside
+  // the `hooks` block.
+  ".continue/settings.json",
   // Copilot CLI settings: `.github/copilot/settings.json` is upstream's
   // repository-scope surface (a trusted repo pins `model`/`effortLevel` and
   // extends the deny lists there for everyone), and `~/.copilot/settings.json`
   // is the user's own preference file the CLI writes into.
   ".copilot/settings.json",
   ".github/copilot/settings.json",
+  // Snowflake Cortex Code: the project settings file carries the user's own
+  // Cortex settings beside the `hooks` block; the user hooks file lives in the
+  // CLI-owned `~/.snowflake/cortex/` tree.
+  ".cortex/settings.json",
+  ".snowflake/cortex/hooks.json",
   ".devin/config.json",
+  // DeepSeek Harness home-level Cordis patch layer (`~/.dsh/cordis.patch.yml`):
+  // the user's own patches sit beside the MCP rows rulesync writes.
+  ".dsh/cordis.patch.yml",
   ".factory/settings.json",
+  // Firebender config: the project-root file (documented as version-controlled
+  // and shared with the team) and the personal one under `~/.firebender/`. Both
+  // carry the user's own settings (`rules`, `commands`, `worktrees`, ...)
+  // beside the `ignore`, `mcpServers` and `agents` keys rulesync writes.
+  "firebender.json",
+  ".firebender/firebender.json",
   ".grok/config.toml",
+  // Grok sandbox profiles: rulesync owns only `[profiles.rulesync]`; the
+  // user's own custom profiles sit beside it in both scopes.
+  ".grok/sandbox.toml",
+  // Letta Code settings: the project file and the user one share the same
+  // `.letta/settings.json` layout and carry the user's own settings beside the
+  // `hooks` and `permissions` blocks.
+  ".letta/settings.json",
+  // Qoder settings: the project file and the user one share the same
+  // `.qoder/settings.json` layout and carry the user's own Qoder settings
+  // beside the `mcpServers` (user only), `hooks` and `permissions` blocks.
+  ".qoder/settings.json",
+  // oh-my-pi config: the project file and the user one under `~/.omp/agent/`
+  // carry every omp setting beside the `tools.approval` and `bash.patterns`
+  // permissions keys.
+  ".omp/config.yml",
+  ".omp/agent/config.yml",
   // Both Rovo Dev project files are documented as repo-committed surfaces
   // (Bitbucket Cloud Agentic Pipelines), so neither is gitignored.
   ".rovodev/config.yml",
   ".rovodev/mcp.json",
+  // Pool settings: the project file is documented as the shared, committed
+  // team settings (`settings.local.yaml` is the untracked twin Pool leaves to
+  // each developer), and the user one lives under `~/.config/poolside/`. Both
+  // carry the user's own Pool settings beside the `mcp_servers` block.
+  ".poolside/settings.yaml",
+  ".config/poolside/settings.yaml",
+  // Tabnine CLI settings: the project file and the user one share the same
+  // `.tabnine/agent/` layout and carry the user's own settings beside the
+  // `mcpServers`, `hooks` and `tools` blocks.
+  ".tabnine/agent/settings.json",
   ".vibe/config.toml",
+  // ZCode config: the workspace file and the user one under `~/.zcode/cli/`.
+  // Both carry the user's own ZCode settings beside the `mcp` block.
+  ".zcode/config.json",
+  ".zcode/cli/config.json",
   "reasonix.toml",
   ".vscode/settings.json",
   ".zed/settings.json",
+  // Crush config: `crush.json`, its `.crush.json` twin (preferred when it
+  // already exists; Crush merges the pair) and the user one under
+  // `~/.config/crush/`. All carry the user's providers/models beside the
+  // `mcp`, `hooks`, `permissions` and `options` blocks.
+  "crush.json",
+  ".crush.json",
+  ".config/crush/crush.json",
   "kilo.json",
   "kilo.jsonc",
+  ".mimocode/mimocode.json",
+  ".mimocode/mimocode.jsonc",
   "opencode.json",
   "opencode.jsonc",
 ];

@@ -13,7 +13,7 @@ import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { CLIError, ErrorCodes } from "../../types/json-output.js";
 import { directoryExists, fileExists } from "../../utils/file.js";
 import type { GenerateOptions } from "./generate.js";
-import { assertWatchModeCompatible, generateCommand } from "./generate.js";
+import { assertWatchModeCompatible, buildGeneratePlan, generateCommand } from "./generate.js";
 
 // Mock all dependencies
 vi.mock("../../config/config-resolver.js");
@@ -27,7 +27,7 @@ vi.mock("../../lib/watch.js", async () => {
   const actual = await vi.importActual<typeof import("../../lib/watch.js")>("../../lib/watch.js");
   return {
     ...actual,
-    watchTargets: vi.fn().mockReturnValue({ close: vi.fn() }),
+    watchTargets: vi.fn().mockReturnValue({ close: vi.fn(), ready: Promise.resolve() }),
   };
 });
 vi.mock("es-toolkit", () => ({
@@ -56,13 +56,20 @@ describe("generateCommand", () => {
       getOutputRoots: vi.fn().mockReturnValue(["."]),
       getTargets: vi.fn().mockReturnValue(["claudecode"]),
       getConfigFileTargets: vi.fn().mockReturnValue(["claudecode"]),
+      getConfigFileFeatures: vi
+        .fn()
+        .mockReturnValue(["rules", "ignore", "mcp", "commands", "subagents"]),
       getFeatures: vi.fn().mockReturnValue(["rules", "ignore", "mcp", "commands", "subagents"]),
       getFeatureOptions: vi.fn().mockReturnValue(undefined),
+      getConfigFileFeatureOptions: vi.fn().mockReturnValue(undefined),
       getDelete: vi.fn().mockReturnValue(false),
+      getRetireTargets: vi.fn().mockReturnValue([]),
       getGlobal: vi.fn().mockReturnValue(false),
       getSimulateCommands: vi.fn().mockReturnValue(false),
       getSimulateSubagents: vi.fn().mockReturnValue(false),
       getSimulateSkills: vi.fn().mockReturnValue(false),
+      getLanguage: vi.fn().mockReturnValue(undefined),
+      getDeriveSubprojectPathFromGlobs: vi.fn().mockReturnValue(false),
       getFlattenedCommandNaming: vi.fn().mockReturnValue("basename"),
       getDryRun: vi.fn().mockReturnValue(false),
       getCheck: vi.fn().mockReturnValue(false),
@@ -85,9 +92,13 @@ describe("generateCommand", () => {
       removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
       ...mockProcessorBase(),
       loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-      convertRulesyncFilesToToolFiles: vi
-        .fn()
-        .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+      convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+        {
+          tool: "converted",
+          getFilePath: () => "/path/to/converted",
+          getClaimedDirPaths: () => [],
+        },
+      ]),
       writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
     };
 
@@ -107,9 +118,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       } as any;
     });
@@ -119,9 +134,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       } as any;
     });
@@ -131,9 +150,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       } as any;
     });
@@ -143,9 +166,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       } as any;
     });
@@ -155,9 +182,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       } as any;
     });
@@ -275,9 +306,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       };
       vi.mocked(RulesProcessor).mockImplementation(function () {
@@ -378,9 +413,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       };
       vi.mocked(McpProcessor).mockImplementation(function () {
@@ -639,9 +678,13 @@ describe("generateCommand", () => {
           removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
           ...mockProcessorBase(),
           loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-          convertRulesyncFilesToToolFiles: vi
-            .fn()
-            .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
         } as any;
       });
@@ -662,9 +705,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 2, paths: [] }),
       };
       const mcpMock = {
@@ -672,9 +719,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 3, paths: [] }),
       };
       const commandsMock = {
@@ -682,9 +733,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       };
 
@@ -740,9 +795,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 3, paths: [] }),
       };
       vi.mocked(RulesProcessor).mockImplementation(function () {
@@ -780,6 +839,7 @@ describe("generateCommand", () => {
         convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
           {
             getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
           },
         ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
@@ -812,6 +872,7 @@ describe("generateCommand", () => {
         convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
           {
             getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
           },
         ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
@@ -921,9 +982,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
       };
       vi.mocked(RulesProcessor).mockImplementation(function () {
@@ -1069,9 +1134,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 5, paths: [] }),
       };
       vi.mocked(RulesProcessor).mockImplementation(function () {
@@ -1107,9 +1176,13 @@ describe("generateCommand", () => {
           removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
           ...mockProcessorBase(),
           loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-          convertRulesyncFilesToToolFiles: vi
-            .fn()
-            .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 3, paths: [] }),
         } as any;
       });
@@ -1119,9 +1192,13 @@ describe("generateCommand", () => {
           removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
           ...mockProcessorBase(),
           loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-          convertRulesyncFilesToToolFiles: vi
-            .fn()
-            .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 3, paths: [] }),
         } as any;
       });
@@ -1131,9 +1208,13 @@ describe("generateCommand", () => {
           removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
           ...mockProcessorBase(),
           loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-          convertRulesyncFilesToToolFiles: vi
-            .fn()
-            .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 3, paths: [] }),
         } as any;
       });
@@ -1143,9 +1224,13 @@ describe("generateCommand", () => {
           removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
           ...mockProcessorBase(),
           loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-          convertRulesyncFilesToToolFiles: vi
-            .fn()
-            .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 3, paths: [] }),
         } as any;
       });
@@ -1303,9 +1388,13 @@ describe("generateCommand", () => {
         removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
         ...mockProcessorBase(),
         loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-        convertRulesyncFilesToToolFiles: vi
-          .fn()
-          .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+        convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+          {
+            tool: "converted",
+            getFilePath: () => "/path/to/converted",
+            getClaimedDirPaths: () => [],
+          },
+        ]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 2, paths: [] }),
       };
       vi.mocked(RulesProcessor).mockImplementation(function () {
@@ -1349,9 +1438,13 @@ describe("generateCommand", () => {
           removeOrphanAiFiles: removeOrphanMock,
           ...mockProcessorBase(),
           loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-          convertRulesyncFilesToToolFiles: vi
-            .fn()
-            .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
         } as any;
       });
@@ -1369,6 +1462,48 @@ describe("generateCommand", () => {
       expect(removeOrphanMock).toHaveBeenCalled();
     });
 
+    it("should carry the orphan deletion in the check-mode error details", async () => {
+      // A failing command's JSON document has no `data`, so the plan has to
+      // ride on `error.details` for `--check --json` consumers to see it.
+      mockConfig.getFeatures.mockReturnValue(["rules"]);
+      mockConfig.getCheck.mockReturnValue(true);
+      mockConfig.getDelete.mockReturnValue(true);
+      mockLogger = { ...mockLogger, jsonMode: true };
+
+      vi.mocked(RulesProcessor).mockImplementation(function () {
+        return {
+          ...mockProcessorBase(),
+          loadToolFiles: vi.fn().mockResolvedValue([]),
+          removeOrphanAiFiles: vi.fn().mockResolvedValue(1),
+          getRemovedPaths: vi
+            .fn()
+            .mockReturnValue([{ path: ".claude/rules/orphan.md", kind: "file" }]),
+          loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
+          writeAiFiles: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
+        } as any;
+      });
+
+      const expectedPlan = {
+        version: 2,
+        operations: [
+          { action: "delete", kind: "file", feature: "rules", path: ".claude/rules/orphan.md" },
+        ],
+      };
+
+      await expect(generateCommand(mockLogger, {})).rejects.toMatchObject({
+        code: ErrorCodes.GENERATION_FAILED,
+        details: { plan: expectedPlan },
+      });
+      expect(mockLogger.captureData).toHaveBeenCalledWith("plan", expectedPlan);
+    });
+
     it("should fail when a rulesync source could not be loaded", async () => {
       // Regression test for #2789: a source that fails to load writes nothing,
       // which every counter reports exactly like "there was nothing to write".
@@ -1376,6 +1511,7 @@ describe("generateCommand", () => {
       mockConfig.getFeatures.mockReturnValue(["mcp"]);
       vi.mocked(McpProcessor).mockImplementation(function () {
         return {
+          ...mockProcessorBase(),
           hasRulesyncSourceLoadFailure: vi.fn().mockReturnValue(true),
           loadToolFiles: vi.fn().mockResolvedValue([]),
           removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
@@ -1392,7 +1528,7 @@ describe("generateCommand", () => {
         // Naming the feature is what makes the exit code actionable without
         // re-reading the whole log.
         message: expect.stringContaining("mcp"),
-        details: { sourceLoadFailedFeatures: ["mcp"] },
+        details: { sourceLoadFailedFeatures: ["mcp"], plan: { version: 2, operations: [] } },
       });
       expect(mockLogger.success).not.toHaveBeenCalled();
     });
@@ -1406,6 +1542,7 @@ describe("generateCommand", () => {
       const removeOrphanMock = vi.fn().mockResolvedValue(1);
       vi.mocked(McpProcessor).mockImplementation(function () {
         return {
+          ...mockProcessorBase(),
           hasRulesyncSourceLoadFailure: vi.fn().mockReturnValue(true),
           loadToolFiles: vi
             .fn()
@@ -1431,6 +1568,7 @@ describe("generateCommand", () => {
       mockConfig.getConfigFilePath = vi.fn().mockReturnValue("/test/project/rulesync.jsonc");
       vi.mocked(McpProcessor).mockImplementation(function () {
         return {
+          ...mockProcessorBase(),
           hasRulesyncSourceLoadFailure: vi.fn().mockReturnValue(true),
           loadToolFiles: vi.fn().mockResolvedValue([]),
           removeOrphanAiFiles: vi.fn().mockResolvedValue(undefined),
@@ -1444,7 +1582,7 @@ describe("generateCommand", () => {
       // is up — reaching that point at all is what this test is asserting.
       vi.mocked(watchTargets).mockImplementation(() => {
         setTimeout(() => process.emit("SIGINT"), 0);
-        return { close: vi.fn() } as any;
+        return { close: vi.fn(), ready: Promise.resolve() } as any;
       });
 
       await expect(generateCommand(mockLogger, { watch: true })).resolves.toBeUndefined();
@@ -1465,9 +1603,13 @@ describe("generateCommand", () => {
           removeOrphanAiFiles: removeOrphanMock,
           ...mockProcessorBase(),
           loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-          convertRulesyncFilesToToolFiles: vi
-            .fn()
-            .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
         } as any;
       });
@@ -1493,9 +1635,13 @@ describe("generateCommand", () => {
           removeOrphanAiFiles: removeOrphanMock,
           ...mockProcessorBase(),
           loadRulesyncFiles: vi.fn().mockResolvedValue([{ file: "test" }]),
-          convertRulesyncFilesToToolFiles: vi
-            .fn()
-            .mockResolvedValue([{ tool: "converted", getFilePath: () => "/path/to/converted" }]),
+          convertRulesyncFilesToToolFiles: vi.fn().mockResolvedValue([
+            {
+              tool: "converted",
+              getFilePath: () => "/path/to/converted",
+              getClaimedDirPaths: () => [],
+            },
+          ]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 0, paths: [] }),
         } as any;
       });
@@ -1543,6 +1689,10 @@ describe("assertWatchModeCompatible", () => {
     { params: { isCheck: true, isDryRun: false, isJsonMode: false }, expected: "--check" },
     { params: { isCheck: false, isDryRun: true, isJsonMode: false }, expected: "--dry-run" },
     { params: { isCheck: false, isDryRun: false, isJsonMode: true }, expected: "--json" },
+    {
+      params: { isCheck: false, isDryRun: false, isJsonMode: false, isRetiring: true },
+      expected: "--retire-targets",
+    },
   ])("rejects $expected", ({ params, expected }) => {
     try {
       assertWatchModeCompatible(params);
@@ -1558,5 +1708,76 @@ describe("assertWatchModeCompatible", () => {
     expect(() =>
       assertWatchModeCompatible({ isCheck: true, isDryRun: true, isJsonMode: true }),
     ).toThrow("--watch cannot be combined with --check, --dry-run, --json.");
+  });
+});
+
+describe("buildGeneratePlan", () => {
+  it("should list writes before deletes per feature, sorted, in feature order", () => {
+    const plan = buildGeneratePlan({
+      featureResults: {
+        mcp: { paths: [".mcp.json"] },
+        rules: { paths: ["CLAUDE.md", ".claude/rules/b.md", ".claude/rules/a.md"] },
+        skills: { paths: [] },
+      },
+      deletedPathsByFeature: {
+        rules: [{ path: ".claude/rules/old.md", kind: "file" }],
+        skills: [{ path: ".claude/skills/retired", kind: "directory" }],
+      },
+      keyOperationsByFeature: {},
+    });
+
+    expect(plan).toEqual({
+      version: 2,
+      operations: [
+        { action: "write", kind: "file", feature: "mcp", path: ".mcp.json" },
+        { action: "write", kind: "file", feature: "rules", path: ".claude/rules/a.md" },
+        { action: "write", kind: "file", feature: "rules", path: ".claude/rules/b.md" },
+        { action: "write", kind: "file", feature: "rules", path: "CLAUDE.md" },
+        { action: "delete", kind: "file", feature: "rules", path: ".claude/rules/old.md" },
+        {
+          action: "delete",
+          kind: "directory",
+          feature: "skills",
+          path: ".claude/skills/retired",
+        },
+      ],
+    });
+  });
+
+  it("should list a feature's key operations between its file writes and its deletes", () => {
+    const plan = buildGeneratePlan({
+      featureResults: { mcp: { paths: [".codex/config.toml"] } },
+      deletedPathsByFeature: { mcp: [{ path: ".cursor/mcp.json", kind: "file" }] },
+      keyOperationsByFeature: {
+        mcp: [{ action: "delete", path: ".codex/config.toml", key: "mcp_servers" }],
+      },
+    });
+
+    expect(plan).toEqual({
+      version: 2,
+      operations: [
+        { action: "write", kind: "file", feature: "mcp", path: ".codex/config.toml" },
+        {
+          action: "delete",
+          kind: "key",
+          feature: "mcp",
+          path: ".codex/config.toml",
+          key: "mcp_servers",
+        },
+        { action: "delete", kind: "file", feature: "mcp", path: ".cursor/mcp.json" },
+      ],
+    });
+  });
+
+  it("should list a path written by several targets once", () => {
+    const plan = buildGeneratePlan({
+      featureResults: { rules: { paths: ["AGENTS.md", "AGENTS.md"] } },
+      deletedPathsByFeature: {},
+      keyOperationsByFeature: {},
+    });
+
+    expect(plan.operations).toEqual([
+      { action: "write", kind: "file", feature: "rules", path: "AGENTS.md" },
+    ]);
   });
 });

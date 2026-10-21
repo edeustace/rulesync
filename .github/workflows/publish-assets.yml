@@ -41,11 +41,16 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
 
+      - name: Start cicd-sensor
+        uses: ./.github/actions/cicd-sensor
+        with:
+          bot-id: ${{ vars.SHISHO_BOT_ID }}
+
       - name: Configure git
         uses: ./.github/actions/git-config
 
       - name: Setup mise
-        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        uses: jdx/mise-action@9b200bcecbfd6303e69a4a261b2e09e3757440a7 # v5.2.0
         with:
           experimental: true
 
@@ -55,12 +60,15 @@ jobs:
         run: bun install
 
       - name: Build binaries
+        # --bytecode precompiles the bundle so the binaries start faster. It is
+        # left off the Windows target: that binary segfaults at startup when built
+        # with --bytecode (Bun 1.3.14).
         run: |
           mkdir -p dist-bun
-          bun build --compile --minify --sourcemap --target=bun-linux-x64 --outfile=dist-bun/rulesync-linux-x64 ./src/cli/index.ts
-          bun build --compile --minify --sourcemap --target=bun-linux-arm64 --outfile=dist-bun/rulesync-linux-arm64 ./src/cli/index.ts
-          bun build --compile --minify --sourcemap --target=bun-darwin-arm64 --outfile=dist-bun/rulesync-darwin-arm64 ./src/cli/index.ts
-          bun build --compile --minify --sourcemap --target=bun-darwin-x64 --outfile=dist-bun/rulesync-darwin-x64 ./src/cli/index.ts
+          bun build --compile --minify --sourcemap --bytecode --target=bun-linux-x64 --outfile=dist-bun/rulesync-linux-x64 ./src/cli/index.ts
+          bun build --compile --minify --sourcemap --bytecode --target=bun-linux-arm64 --outfile=dist-bun/rulesync-linux-arm64 ./src/cli/index.ts
+          bun build --compile --minify --sourcemap --bytecode --target=bun-darwin-arm64 --outfile=dist-bun/rulesync-darwin-arm64 ./src/cli/index.ts
+          bun build --compile --minify --sourcemap --bytecode --target=bun-darwin-x64 --outfile=dist-bun/rulesync-darwin-x64 ./src/cli/index.ts
           bun build --compile --minify --sourcemap --target=bun-windows-x64 --outfile=dist-bun/rulesync-windows-x64.exe ./src/cli/index.ts
 
       - name: Generate checksums
@@ -78,7 +86,11 @@ jobs:
         run: pnpm generate:schema
 
       - name: Generate repomix XML variants
-        run: bun scripts/generate-repomix-xml.ts
+        # Deliberately Node (tsx) and not Bun: repomix skips Tinypool#destroy()
+        # when it detects Bun, so each runCli() call leaks its worker pools and
+        # they race their idle timeout into a "Terminating worker thread" crash.
+        # See scripts/generate-repomix-xml.ts and #2922.
+        run: pnpm exec tsx scripts/generate-repomix-xml.ts
 
       - name: Bundle XML files into zip
         run: zip repomix-xml.zip repomix-output-*.xml
@@ -146,7 +158,7 @@ jobs:
           TAG: ${{ steps.tag.outputs.tag }}
 
       - name: Upload assets to release
-        uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
           draft: true

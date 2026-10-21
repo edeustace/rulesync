@@ -39,7 +39,7 @@ describe("ReasonixHooks", () => {
   });
 
   describe("fromRulesyncHooks", () => {
-    it("should map the ten supported Reasonix events and drop unsupported ones", async () => {
+    it("should map the thirteen supported Reasonix events and drop unsupported ones", async () => {
       await ensureDir(join(testDir, ".reasonix"));
       await writeFileContent(join(testDir, ".reasonix", "settings.json"), JSON.stringify({}));
 
@@ -48,8 +48,11 @@ describe("ReasonixHooks", () => {
         hooks: {
           preToolUse: [{ command: ".rulesync/hooks/pre-tool.sh" }],
           postToolUse: [{ command: ".rulesync/hooks/post-tool.sh" }],
+          postToolUseFailure: [{ command: ".rulesync/hooks/post-tool-failure.sh" }],
+          permissionRequest: [{ command: ".rulesync/hooks/permission-request.sh" }],
           beforeSubmitPrompt: [{ command: ".rulesync/hooks/prompt.sh" }],
           stop: [{ command: ".rulesync/hooks/audit.sh" }],
+          stopFailure: [{ command: ".rulesync/hooks/stop-failure.sh" }],
           sessionStart: [{ command: ".rulesync/hooks/session-start.sh" }],
           sessionEnd: [{ command: ".rulesync/hooks/session-end.sh" }],
           subagentStop: [{ command: ".rulesync/hooks/subagent-stop.sh" }],
@@ -77,8 +80,11 @@ describe("ReasonixHooks", () => {
       const parsed = JSON.parse(reasonixHooks.getFileContent());
       expect(parsed.hooks.PreToolUse).toBeDefined();
       expect(parsed.hooks.PostToolUse).toBeDefined();
+      expect(parsed.hooks.PostToolUseFailure).toBeDefined();
+      expect(parsed.hooks.PermissionRequest).toBeDefined();
       expect(parsed.hooks.UserPromptSubmit).toBeDefined();
       expect(parsed.hooks.Stop).toBeDefined();
+      expect(parsed.hooks.StopFailure).toBeDefined();
       // postModelInvocation ← PostLLMCall, plus the session/subagent lifecycle.
       expect(parsed.hooks.SessionStart).toBeDefined();
       expect(parsed.hooks.SessionEnd).toBeDefined();
@@ -121,6 +127,52 @@ describe("ReasonixHooks", () => {
       // And they map back to the canonical camelCase events.
       const parsed = JSON.parse(reasonixHooks.toRulesyncHooks().getFileContent());
       expect(parsed.hooks).toEqual(config.hooks);
+    });
+
+    it("should round-trip PostToolUseFailure/PermissionRequest/StopFailure and honor match on the tool-scoped ones", async () => {
+      const config = {
+        version: 1,
+        hooks: {
+          postToolUseFailure: [
+            { type: "command", command: ".rulesync/hooks/on-failure.sh", matcher: "bash" },
+          ],
+          permissionRequest: [
+            { type: "command", command: ".rulesync/hooks/on-permission.sh", matcher: "write_file" },
+          ],
+          stopFailure: [{ type: "command", command: ".rulesync/hooks/on-stop-failure.sh" }],
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const reasonixHooks = await ReasonixHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+
+      const generated = JSON.parse(reasonixHooks.getFileContent());
+      // Upstream `UsesToolMatcher` evaluates `match` on PostToolUseFailure and
+      // PermissionRequest as well as Pre/PostToolUse.
+      expect(generated.hooks.PostToolUseFailure).toEqual([
+        { match: "bash", command: ".rulesync/hooks/on-failure.sh" },
+      ]);
+      expect(generated.hooks.PermissionRequest).toEqual([
+        { match: "write_file", command: ".rulesync/hooks/on-permission.sh" },
+      ]);
+      expect(generated.hooks.StopFailure).toEqual([
+        { command: ".rulesync/hooks/on-stop-failure.sh" },
+      ]);
+
+      const parsed = JSON.parse(reasonixHooks.toRulesyncHooks().getFileContent());
+      expect(parsed.hooks.postToolUseFailure?.[0]?.matcher).toBe("bash");
+      expect(parsed.hooks.permissionRequest?.[0]?.matcher).toBe("write_file");
+      expect(parsed.hooks.stopFailure?.[0]?.command).toBe(".rulesync/hooks/on-stop-failure.sh");
     });
 
     it("should emit a flat array of hook objects per event (no matcher-group wrapper)", async () => {
@@ -185,6 +237,45 @@ describe("ReasonixHooks", () => {
 
       const parsed = JSON.parse(reasonixHooks.getFileContent());
       expect(parsed.hooks.Stop[0].timeout).toBe(3000);
+    });
+
+    it("should emit cwd and env on each hook entry", async () => {
+      const config = {
+        version: 1,
+        hooks: {
+          preToolUse: [
+            {
+              matcher: "bash",
+              command: "./guard.sh",
+              cwd: "scripts",
+              env: { MODE: "strict", "PATH=/tmp/evil": "x", "": "y" },
+            },
+          ],
+          stop: [{ command: "echo done", cwd: "", env: { "A=B": "c" } }],
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const reasonixHooks = await ReasonixHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+
+      const parsed = JSON.parse(reasonixHooks.getFileContent());
+      expect(parsed.hooks.PreToolUse[0]).toEqual({
+        match: "bash",
+        command: "./guard.sh",
+        cwd: "scripts",
+        env: { MODE: "strict" },
+      });
+      expect(parsed.hooks.Stop[0]).toEqual({ command: "echo done" });
     });
 
     it("should drop the matcher on non-tool events with a warning", async () => {
@@ -380,6 +471,66 @@ describe("ReasonixHooks", () => {
       expect(json.hooks.preToolUse?.[0]?.timeout).toBe(5);
       expect(json.hooks.stop).toHaveLength(1);
       expect(json.hooks.stop?.[0]?.command).toBe("audit.sh");
+    });
+
+    it("should lift cwd and env back into the canonical definition", () => {
+      const reasonixHooks = new ReasonixHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".reasonix",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          hooks: {
+            Stop: [
+              { command: "audit.sh", cwd: "tools", env: { LEVEL: "1" } },
+              { command: "bad.sh", cwd: 42, env: { LEVEL: 1 } },
+              { command: "nl.sh", env: { LEVEL: "a\nb", "PATH=/tmp/evil": "x", KEEP: "ok" } },
+            ],
+          },
+        }),
+        validate: false,
+      });
+
+      const json = reasonixHooks.toRulesyncHooks().getJson();
+      expect(json.hooks.stop?.[0]).toEqual({
+        type: "command",
+        command: "audit.sh",
+        cwd: "tools",
+        env: { LEVEL: "1" },
+      });
+      expect(json.hooks.stop?.[1]).toEqual({ type: "command", command: "bad.sh" });
+      expect(json.hooks.stop?.[2]).toEqual({
+        type: "command",
+        command: "nl.sh",
+        env: { KEEP: "ok" },
+      });
+    });
+
+    it("should carry an event named toString through as a plain string key (#2757)", () => {
+      const reasonixHooks = new ReasonixHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".reasonix",
+        relativeFilePath: "settings.json",
+        // JSON.parse yields an own enumerable `toString` key, unlike an object
+        // literal whose `toString` the lookup map would inherit from
+        // Object.prototype.
+        fileContent: JSON.stringify({
+          hooks: {
+            Stop: [{ command: "audit.sh" }],
+            toString: [{ command: "crafted.sh" }],
+          },
+        }),
+        validate: false,
+      });
+
+      const json = reasonixHooks.toRulesyncHooks().getJson();
+      expect(json.hooks.stop?.[0]?.command).toBe("audit.sh");
+      expect(Object.keys(json.hooks)).toEqual(["stop"]);
+      // The unmapped name must fall through verbatim rather than resolving to
+      // Object.prototype.toString and landing under its stringified source.
+      const overrideHooks = (json as { reasonix?: { hooks?: Record<string, unknown[]> } }).reasonix
+        ?.hooks;
+      expect(Object.keys(overrideHooks ?? {})).toEqual(["toString"]);
+      expect(overrideHooks?.["toString"]?.[0]).toMatchObject({ command: "crafted.sh" });
     });
 
     it("should handle an empty or missing hooks key", () => {

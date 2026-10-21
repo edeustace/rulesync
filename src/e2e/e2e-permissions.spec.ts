@@ -4,6 +4,7 @@ import { load } from "js-yaml";
 import * as smolToml from "smol-toml";
 import { describe, expect, it } from "vitest";
 
+import { CLAUDECODE_SETTINGS_SCHEMA_URL } from "../constants/claudecode-paths.js";
 import {
   RULESYNC_HOOKS_RELATIVE_FILE_PATH,
   RULESYNC_PERMISSIONS_LEGACY_RELATIVE_FILE_PATH,
@@ -11,6 +12,7 @@ import {
   RULESYNC_PERMISSIONS_SCHEMA_URL,
   RULESYNC_RELATIVE_DIR_PATH,
 } from "../constants/rulesync-paths.js";
+import { warpcliConfigDir } from "../constants/warp-paths.js";
 import { getZedGlobalDir } from "../constants/zed-paths.js";
 import { PermissionsProcessor } from "../features/permissions/permissions-processor.js";
 import { fileExists, readFileContent, writeFileContent } from "../utils/file.js";
@@ -32,23 +34,32 @@ import {
 // green. Keep this list in sync with the actual `it`s by hand.
 const permissionsGenerateTargets = [
   "opencode",
+  "mimocode",
+  "omp",
   "pi",
-  "zed",
   "amp",
   "devin",
+  "codebuddy",
+  "codewhale",
   "codexcli",
+  "commandcode",
   "cursor",
   "copilot",
   "copilotcli",
+  "crush",
+  "pool",
   "kiro",
   "kiro-cli",
   "kiro-ide",
   "kilo",
+  "lettacode",
+  "qoder",
   "antigravity-ide",
   "augmentcode",
   "cline",
   "factorydroid",
   "qwencode",
+  "tabnine",
   "vibe",
   "reasonix",
   "grokcli",
@@ -62,16 +73,28 @@ const permissionsGenerateTargets = [
 // Permissions targets exercised by the global-scope generate `it`s below.
 const permissionsGlobalTargets = [
   "claudecode",
+  "omp",
   "pi",
   "opencode",
+  "mimocode",
+  "codebuddy",
+  "codewhale",
   "codexcli",
+  "commandcode",
   "copilotcli",
+  "crush",
+  "pool",
   "cursor",
   "kilo",
   "augmentcode",
+  "bob",
   "qwencode",
+  "tabnine",
+  "continue",
   "antigravity-cli",
   "warp",
+  "warpcli",
+  "deepagents",
   "zed",
   "amp",
   "vibe",
@@ -85,6 +108,11 @@ const permissionsGlobalTargets = [
   "devin",
   "factorydroid",
   "junie",
+  "lettacode",
+  "qoder",
+  "trae",
+  "kiro-cli",
+  "kiro-ide",
 ] as const;
 
 describe("E2E: permissions", () => {
@@ -108,9 +136,22 @@ describe("E2E: permissions", () => {
     // `.github/copilot/settings.json` is upstream's committed repository
     // settings file, so an empty payload must not leave a bare `{}` behind.
     { target: "copilotcli", relativePaths: [[".github", "copilot", "settings.json"]] },
+    { target: "codebuddy", relativePaths: [[".codebuddy", "settings.json"]] },
+    // The Codewhale repo constitution carries repo policy rulesync does not own.
+    { target: "codewhale", relativePaths: [[".codewhale", "constitution.json"]] },
+    { target: "commandcode", relativePaths: [[".commandcode", "settings.json"]] },
+    { target: "lettacode", relativePaths: [[".letta", "settings.json"]] },
+    { target: "qoder", relativePaths: [[".qoder", "settings.json"]] },
     // opencode writes the `.jsonc` twin when neither file exists yet, so both
     // spellings must stay absent.
     { target: "opencode", relativePaths: [["opencode.json"], ["opencode.jsonc"]] },
+    {
+      target: "mimocode",
+      relativePaths: [
+        [".mimocode", "mimocode.json"],
+        [".mimocode", "mimocode.jsonc"],
+      ],
+    },
   ])(
     "should not create the shared $target config file when the permissions payload is empty",
     async ({ target, relativePaths }) => {
@@ -171,6 +212,96 @@ describe("E2E: permissions", () => {
     expect(content).toContain("default: ask");
   });
 
+  it("should generate and import codewhale permissions in .codewhale/constitution.json", async () => {
+    const testDir = getTestDir();
+    const constitutionPath = join(testDir, ".codewhale", "constitution.json");
+
+    // Repo policy and hand-written invariants survive the regenerate.
+    await writeFileContent(
+      constitutionPath,
+      JSON.stringify({
+        authority: ["current user request", "AGENTS.md"],
+        protected_invariants: [
+          "Keep the wire format stable.",
+          { text: "Release notes need human review.", paths: ["CHANGELOG.md"] },
+        ],
+      }),
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            write: { "crates/protocol/**": "deny", "src/**": "allow" },
+            edit: { "CHANGELOG.md": "ask" },
+            bash: { "rm *": "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "codewhale", features: "permissions" });
+
+    expect(JSON.parse(await readFileContent(constitutionPath))).toEqual({
+      authority: ["current user request", "AGENTS.md"],
+      protected_invariants: [
+        "Keep the wire format stable.",
+        { text: "Release notes need human review.", paths: ["CHANGELOG.md"] },
+        {
+          text: "rulesync permissions: writes to crates/protocol/** are denied",
+          paths: ["crates/protocol/**"],
+          action: "block",
+          managed_by: "rulesync",
+        },
+      ],
+    });
+
+    await runImport({ target: "codewhale", features: "permissions" });
+
+    const imported = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    // The import merges into the existing canonical file, so `bash` is kept.
+    const expected = { "CHANGELOG.md": "ask", "crates/protocol/**": "deny" };
+    expect(imported.permission).toEqual({
+      write: expected,
+      edit: expected,
+      bash: { "rm *": "deny" },
+    });
+  });
+
+  it("should disable shell in the codewhale project config overlay when every shell command is denied", async () => {
+    const testDir = getTestDir();
+    const configPath = join(testDir, ".codewhale", "config.toml");
+
+    // The user's other overlay keys survive the regenerate.
+    await writeFileContent(configPath, 'model = "deepseek-v4-pro"\n');
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify({ permission: { bash: { "*": "deny" } } }, null, 2),
+    );
+
+    await runGenerate({ target: "codewhale", features: "permissions" });
+
+    expect(smolToml.parse(await readFileContent(configPath))).toEqual({
+      model: "deepseek-v4-pro",
+      allow_shell: false,
+    });
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify({ permission: {} }, null, 2),
+    );
+    await runImport({ target: "codewhale", features: "permissions" });
+
+    const imported = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(imported.permission).toEqual({ bash: { "*": "deny" } });
+  });
+
   it("should generate claudecode permissions into .claude/settings.json", async () => {
     const testDir = getTestDir();
 
@@ -194,6 +325,9 @@ describe("E2E: permissions", () => {
     expect(content.permissions.allow).toContain("Bash(git status *)");
     expect(content.permissions.deny).toContain("Bash(rm *)");
     expect(content.permissions.deny).toContain("Read(.env)");
+    // The gateway points every settings file it writes at the published schema.
+    expect(Object.keys(content)[0]).toBe("$schema");
+    expect(content.$schema).toBe(CLAUDECODE_SETTINGS_SCHEMA_URL);
   });
 
   it.each([{ target: "kiro-cli" }, { target: "kiro-ide" }])(
@@ -252,6 +386,32 @@ describe("E2E: permissions", () => {
     expect(content.permission.read[".env"]).toBe("deny");
   });
 
+  it("should generate mimocode permissions from .rulesync/permissions.jsonc", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "*": "ask", "git *": "allow" },
+            read: { ".env": "deny" },
+          },
+          mimocode: { permission: { doom_loop: "deny" } },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "mimocode", features: "permissions" });
+
+    const content = JSON.parse(await readFileContent(join(testDir, ".mimocode", "mimocode.jsonc")));
+    expect(content.permission.bash["git *"]).toBe("allow");
+    expect(content.permission.read[".env"]).toBe("deny");
+    expect(content.permission.doom_loop).toBe("deny");
+  });
+
   it("should apply a tool-scoped {toolname}.permission block only to that tool", async () => {
     const testDir = getTestDir();
 
@@ -274,7 +434,7 @@ describe("E2E: permissions", () => {
     );
 
     await runGenerate({ target: "claudecode", features: "permissions" });
-    await runGenerate({ target: "zed", features: "permissions" });
+    await runGenerate({ target: "opencode", features: "permissions" });
 
     // Claude Code sees the tool-scoped bash category (replaced wholesale)
     // plus the untouched shared read category.
@@ -283,11 +443,9 @@ describe("E2E: permissions", () => {
     expect(claude.permissions.deny).toContain("Read(.env)");
     expect(claude.permissions.allow ?? []).not.toContain("Bash(git *)");
 
-    // Zed still sees the shared bash category.
-    const zed = JSON.parse(await readFileContent(join(testDir, ".zed", "settings.json")));
-    expect(zed.agent.tool_permissions.tools.terminal.always_allow).toEqual([
-      { pattern: "git *", case_sensitive: false },
-    ]);
+    // OpenCode still sees the shared bash category.
+    const opencode = JSON.parse(await readFileContent(join(testDir, "opencode.jsonc")));
+    expect(opencode.permission.bash["git *"]).toBe("allow");
   });
 
   it("should generate permissions from permissions.jsonc (preferred over permissions.json)", async () => {
@@ -315,65 +473,19 @@ describe("E2E: permissions", () => {
     expect(content.permissions.allow).not.toContain("Bash(npm *)");
   });
 
-  it("should generate zed permissions into .zed/settings.json", async () => {
+  it("should not write zed permissions into the project .zed/settings.json", async () => {
     const testDir = getTestDir();
 
     await writeFileContent(
       join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
-      JSON.stringify(
-        {
-          permission: {
-            bash: { "*": "ask", "git *": "allow", "rm *": "deny" },
-            read: { ".env": "deny" },
-          },
-        },
-        null,
-        2,
-      ),
+      JSON.stringify({ permission: { bash: { "rm *": "deny" } } }, null, 2),
     );
 
     await runGenerate({ target: "zed", features: "permissions" });
 
-    const content = JSON.parse(await readFileContent(join(testDir, ".zed", "settings.json")));
-    const tools = content.agent.tool_permissions.tools;
-    // `bash` → `terminal`, `*` → per-tool default, `ask` → `confirm`.
-    expect(tools.terminal.default).toBe("confirm");
-    expect(tools.terminal.always_allow).toEqual([{ pattern: "git *", case_sensitive: false }]);
-    expect(tools.terminal.always_deny).toEqual([{ pattern: "rm *", case_sensitive: false }]);
-    // `read` maps to a tool Zed does not gate, so no inert entry is written.
-    expect(tools.read_file).toBeUndefined();
-  });
-
-  it("should generate the zed sandbox_permissions and profiles override into .zed/settings.json", async () => {
-    const testDir = getTestDir();
-
-    await writeFileContent(
-      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
-      JSON.stringify(
-        {
-          permission: { bash: { "rm *": "deny" } },
-          zed: {
-            sandbox_permissions: { network_hosts: ["*.github.com"], write_paths: ["/tmp/build"] },
-            profiles: { review: { name: "Review", tools: { terminal: false } } },
-          },
-        },
-        null,
-        2,
-      ),
-    );
-
-    await runGenerate({ target: "zed", features: "permissions" });
-
-    const agent = JSON.parse(await readFileContent(join(testDir, ".zed", "settings.json"))).agent;
-    expect(agent.sandbox_permissions).toEqual({
-      network_hosts: ["*.github.com"],
-      write_paths: ["/tmp/build"],
-    });
-    expect(agent.profiles).toEqual({ review: { name: "Review", tools: { terminal: false } } });
-    // The canonical block still owns tool_permissions.
-    expect(agent.tool_permissions.tools.terminal.always_deny).toEqual([
-      { pattern: "rm *", case_sensitive: false },
-    ]);
+    // Zed reads no `agent` key from project settings, so permissions are
+    // global-only and nothing is written to the project file.
+    expect(await fileExists(join(testDir, ".zed", "settings.json"))).toBe(false);
   });
 
   it("should generate amp permissions into .amp/settings.json", async () => {
@@ -414,6 +526,7 @@ describe("E2E: permissions", () => {
             write: { "*.lock": "deny" },
             bash: { git: "allow", "rm *": "deny", "*": "ask" },
             webfetch: { "https://api.github.com/*": "allow" },
+            websearch: { "*": "deny" },
           },
         },
         null,
@@ -430,6 +543,8 @@ describe("E2E: permissions", () => {
     expect(content.permissions.allow).toContain("Fetch(https://api.github.com/*)");
     expect(content.permissions.deny).toContain("Write(*.lock)");
     expect(content.permissions.deny).toContain("Exec(rm *)");
+    // `websearch` maps to Devin's bare `web_search` tool name, which has no matcher.
+    expect(content.permissions.deny).toContain("web_search");
     expect(content.permissions.ask).toContain("Exec");
   });
 
@@ -593,6 +708,218 @@ web_search_request = true
     expect(generated.model).toBe("claude-sonnet-4.5");
   });
 
+  it("should generate codebuddy permissions into .codebuddy/settings.json", async () => {
+    const testDir = getTestDir();
+
+    // Pre-existing settings owned by the user (and by the hooks feature) must
+    // survive the merge, including the siblings of the rule lists.
+    await writeFileContent(
+      join(testDir, ".codebuddy", "settings.json"),
+      JSON.stringify(
+        {
+          model: "gpt-5",
+          hooks: { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] },
+          permissions: { defaultMode: "acceptEdits", allow: ["Bash(stale)", "WebSearch"] },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git:*": "allow", "rm -rf *": "deny", "npm publish *": "ask" },
+            read: { "*": "allow" },
+            write: { ".env*": "deny" },
+            webfetch: { "domain:docs.example.com": "allow" },
+            mcp: { "*": "deny" },
+            mcp__github: { "*": "allow" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "codebuddy", features: "permissions" });
+
+    const generated = JSON.parse(
+      await readFileContent(join(testDir, ".codebuddy", "settings.json")),
+    );
+    expect(generated.model).toBe("gpt-5");
+    expect(generated.hooks.Stop).toHaveLength(1);
+    expect(generated.permissions).toEqual({
+      defaultMode: "acceptEdits",
+      allow: [
+        "WebSearch",
+        "Bash(git:*)",
+        "Read",
+        "WebFetch(domain:docs.example.com)",
+        "mcp__github",
+      ],
+      ask: ["Bash(npm publish *)"],
+      deny: ["Bash(rm -rf *)", "Write(.env*)", "mcp__*"],
+    });
+  });
+
+  it("should generate commandcode permissions into .commandcode/settings.json", async () => {
+    const testDir = getTestDir();
+
+    // Pre-existing settings owned by the user (and by the hooks feature) must
+    // survive the merge, including the siblings of `permissions` itself.
+    await writeFileContent(
+      join(testDir, ".commandcode", "settings.json"),
+      JSON.stringify(
+        {
+          model: "gpt-5",
+          hooks: { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] },
+          permissions: { defaultMode: "acceptEdits", allow: ["Shell(stale *)", "edit_file"] },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow", "rm -rf *": "deny", "npm publish *": "ask" },
+            read: { "*": "allow" },
+            write: { ".env*": "deny" },
+            webfetch: { "https://docs.example.com/*": "allow" },
+            mcp__github__get_issue: { "*": "allow" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "commandcode", features: "permissions" });
+
+    const generated = JSON.parse(
+      await readFileContent(join(testDir, ".commandcode", "settings.json")),
+    );
+    expect(generated.model).toBe("gpt-5");
+    expect(generated.hooks.Stop).toHaveLength(1);
+    expect(generated.permissions).toEqual({
+      defaultMode: "acceptEdits",
+      allow: [
+        "Read",
+        "Shell(git *)",
+        "WebFetch(https://docs.example.com/*)",
+        "edit_file",
+        "mcp__github__get_issue",
+      ],
+      ask: ["Shell(npm publish *)"],
+      deny: ["Shell(rm -rf *)", "Write(.env*)"],
+    });
+  });
+
+  it("should generate lettacode permissions into .letta/settings.json", async () => {
+    const testDir = getTestDir();
+
+    // Pre-existing settings owned by the user (and by the hooks feature) must
+    // survive the merge, including the siblings of the rule lists.
+    await writeFileContent(
+      join(testDir, ".letta", "settings.json"),
+      JSON.stringify(
+        {
+          model: "auto",
+          hooks: { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] },
+          permissions: { mode: "acceptEdits", allow: ["Bash(stale:*)", "Task"] },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow", "rm -rf *": "deny", "npm publish": "ask" },
+            read: { "*": "allow" },
+            write: { ".env*": "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "lettacode", features: "permissions" });
+
+    const generated = JSON.parse(await readFileContent(join(testDir, ".letta", "settings.json")));
+    expect(generated.model).toBe("auto");
+    expect(generated.hooks.Stop).toHaveLength(1);
+    // Canonical `ask` lands in `alwaysAsk`, which Letta Code checks before `allow`.
+    expect(generated.permissions).toEqual({
+      mode: "acceptEdits",
+      allow: ["Task", "Bash(git:*)", "Read"],
+      alwaysAsk: ["Bash(npm publish)"],
+      deny: ["Bash(rm -rf:*)", "Write(.env*)"],
+    });
+  });
+
+  it("should generate qoder permissions into .qoder/settings.json", async () => {
+    const testDir = getTestDir();
+
+    // Pre-existing settings owned by the user (and by the hooks feature) must
+    // survive the merge, including the siblings of the rule lists.
+    await writeFileContent(
+      join(testDir, ".qoder", "settings.json"),
+      JSON.stringify(
+        {
+          model: "auto",
+          hooks: { Stop: [{ hooks: [{ type: "command", command: "echo done" }] }] },
+          permissions: {
+            additionalDirectories: ["../shared"],
+            allow: ["Bash(stale:*)", "NotebookEdit"],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow", "rm -rf *": "deny", "npm publish": "ask" },
+            read: { "*": "allow" },
+            write: { ".env*": "deny" },
+            mcp__github__create_issue: { "*": "ask" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "qoder", features: "permissions" });
+
+    const generated = JSON.parse(await readFileContent(join(testDir, ".qoder", "settings.json")));
+    expect(generated.model).toBe("auto");
+    expect(generated.hooks.Stop).toHaveLength(1);
+    // A path-scoped `write` rule is written as `Edit(path)`, the form Qoder's
+    // file-write checks match.
+    expect(generated.permissions).toEqual({
+      additionalDirectories: ["../shared"],
+      allow: ["NotebookEdit", "Bash(git *)", "Read"],
+      ask: ["Bash(npm publish)", "mcp__github__create_issue"],
+      deny: ["Bash(rm -rf *)", "Edit(.env*)"],
+    });
+  });
+
   it("should generate copilot permissions into .vscode/settings.json", async () => {
     const testDir = getTestDir();
 
@@ -611,6 +938,7 @@ web_search_request = true
             // Non-terminal categories have no autoApprove representation.
             read: { "src/**": "allow" },
           },
+          copilot: { defaultPermissionMode: "autoApprove" },
         },
         null,
         2,
@@ -624,6 +952,7 @@ web_search_request = true
       "git *": true,
       "rm -rf *": false,
     });
+    expect(generated["chat.permissions.default"]).toBe("autoApprove");
     expect(generated["editor.tabSize"]).toBe(2);
   });
 
@@ -796,9 +1125,9 @@ web_search_request = true
       await readFileContent(join(testDir, ".antigravity", "settings.json")),
     );
     expect(content.permissions.allow).toEqual(
-      expect.arrayContaining(["command(git *)", "read_file(src/**)", "write_file(src/**)"]),
+      expect.arrayContaining(["command(git)", "read_file(src)", "write_file(src)"]),
     );
-    expect(content.permissions.deny).toContain("command(rm *)");
+    expect(content.permissions.deny).toContain("command(rm)");
   });
 
   it("should import antigravity-ide permissions into .rulesync/permissions.jsonc", async () => {
@@ -809,8 +1138,8 @@ web_search_request = true
       JSON.stringify(
         {
           permissions: {
-            allow: ["command(git *)", "read_file(src/**)"],
-            deny: ["command(rm *)"],
+            allow: ["command(git)", "read_file(src)"],
+            deny: ["command(rm)"],
           },
         },
         null,
@@ -825,7 +1154,7 @@ web_search_request = true
     );
     expect(config.permission.bash["git *"]).toBe("allow");
     expect(config.permission.bash["rm *"]).toBe("deny");
-    expect(config.permission.read["src/**"]).toBe("allow");
+    expect(config.permission.read["src"]).toBe("allow");
   });
 
   it("should generate augmentcode permissions into .augment/settings.json", async () => {
@@ -944,6 +1273,102 @@ web_search_request = true
     expect(content.permissions.deny).toContain("Read(.env)");
   });
 
+  it("should generate crush permissions into crush.json tool lists", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "*": "allow" },
+            read: { "*": "allow" },
+            webfetch: { "*": "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    // Unrelated top-level keys of the shared config file must survive.
+    await writeFileContent(
+      join(testDir, "crush.json"),
+      JSON.stringify({ options: { debug: true } }, null, 2),
+    );
+
+    await runGenerate({ target: "crush", features: "permissions" });
+
+    // Crush has tool-wide lists only: catch-all allows become
+    // `permissions.allowed_tools`, catch-all denies `options.disabled_tools`.
+    const content = JSON.parse(await readFileContent(join(testDir, "crush.json")));
+    expect(content.permissions.allowed_tools).toEqual(["bash", "view"]);
+    expect(content.options.disabled_tools).toEqual(["fetch"]);
+    expect(content.options.debug).toBe(true);
+  });
+
+  it("should generate pool permissions into .poolside/settings.yaml", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow", "rm -rf *": "deny" },
+            read: { "src/**": "allow", ".env": "deny" },
+            edit: { "src/**": "allow" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    // Unrelated top-level keys of the shared settings file must survive.
+    await writeFileContent(join(testDir, ".poolside", "settings.yaml"), "pool:\n  model: gpt\n");
+
+    await runGenerate({ target: "pool", features: "permissions" });
+
+    // Tool rules become `tools.<name>` allow/deny lists; file rules become
+    // `paths` entries (read-only unless `write: true`).
+    const content = load(await readFileContent(join(testDir, ".poolside", "settings.yaml")));
+    expect(content).toEqual({
+      pool: { model: "gpt" },
+      tools: { shell: { allow: ["git *"], deny: ["rm -rf *"] } },
+      paths: { allow: [{ path: "src/**", write: true }], deny: [{ path: ".env" }] },
+    });
+  });
+
+  it("should generate tabnine permissions into .tabnine/agent/settings.json", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow", "rm -rf *": "deny" },
+            read: { "*": "allow" },
+            webfetch: { "*": "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "tabnine", features: "permissions" });
+
+    // Tabnine CLI only has tool-level allow/exclude lists; shell rules become
+    // `run_shell_command(<prefix>)` entries and other categories map to tool names.
+    const content = JSON.parse(
+      await readFileContent(join(testDir, ".tabnine", "agent", "settings.json")),
+    );
+    expect(content.tools.allowed).toContain("run_shell_command(git)");
+    expect(content.tools.allowed).toContain("read_file");
+    expect(content.tools.exclude).toContain("run_shell_command(rm -rf)");
+    expect(content.tools.exclude).toContain("web_fetch");
+  });
+
   it("should generate vibe permissions into .vibe/config.toml and preserve MCP config", async () => {
     const testDir = getTestDir();
 
@@ -1024,6 +1449,55 @@ web_search_request = true
     // The MCP [[plugins]] table (written by the MCP adapter) must survive.
     expect(toTableArray(parsed.plugins)).toMatchObject([{ name: "filesystem", command: "npx" }]);
     expect(parsed.default_model).toBe("deepseek");
+  });
+
+  it("should generate omp permissions into .omp/config.yml and import them back", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".omp", "config.yml"),
+      ["theme:", "  dark: titanium", "tools:", "  approvalMode: write", ""].join("\n"),
+    );
+    await writeFileContent(
+      join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow", "rm -rf *": "deny" },
+            read: { "*": "allow" },
+            agent: { "*": "ask" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({ target: "omp", features: "permissions" });
+
+    const parsed = load(await readFileContent(join(testDir, ".omp", "config.yml")));
+    expect(parsed).toEqual({
+      theme: { dark: "titanium" },
+      tools: { approvalMode: "write", approval: { read: "allow", task: "prompt" } },
+      bash: {
+        patterns: [
+          { match: "rm -rf *", approval: "deny" },
+          { match: "git *", approval: "allow" },
+        ],
+      },
+    });
+
+    await runImport({ target: "omp", features: "permissions" });
+
+    const imported = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(imported.permission).toEqual({
+      bash: { "rm -rf *": "deny", "git *": "allow" },
+      read: { "*": "allow" },
+      agent: { "*": "ask" },
+    });
+    expect(imported.omp).toEqual({ approvalMode: "write" });
   });
 
   it("should generate pi permissions into .pi/settings.json and preserve unrelated keys", async () => {
@@ -1268,43 +1742,6 @@ describe("E2E: permissions (import)", () => {
     expect(content.permission.read[".env"]).toBe("deny");
   });
 
-  it("should import zed permissions into .rulesync/permissions.jsonc", async () => {
-    const testDir = getTestDir();
-
-    await writeFileContent(
-      join(testDir, ".zed", "settings.json"),
-      JSON.stringify(
-        {
-          agent: {
-            tool_permissions: {
-              tools: {
-                terminal: {
-                  default: "confirm",
-                  always_allow: [{ pattern: "npm *", case_sensitive: false }],
-                },
-                read_file: {
-                  always_deny: [{ pattern: ".env", case_sensitive: false }],
-                },
-              },
-            },
-          },
-        },
-        null,
-        2,
-      ),
-    );
-
-    await runImport({ target: "zed", features: "permissions" });
-
-    const content = JSON.parse(
-      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
-    );
-    // `terminal` → `bash`, `confirm` → `ask`.
-    expect(content.permission.bash["*"]).toBe("ask");
-    expect(content.permission.bash["npm *"]).toBe("allow");
-    expect(content.permission.read[".env"]).toBe("deny");
-  });
-
   it("should import amp permissions into .rulesync/permissions.jsonc", async () => {
     const testDir = getTestDir();
 
@@ -1508,6 +1945,96 @@ enabled = true
     expect(content.permission.read["src/**"]).toBe("allow");
   });
 
+  it("should import crush permissions into .rulesync/permissions.jsonc", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, "crush.json"),
+      JSON.stringify(
+        {
+          permissions: { allowed_tools: ["bash", "view", "edit:write"] },
+          options: { disabled_tools: ["fetch"] },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runImport({ target: "crush", features: "permissions" });
+
+    const content = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(content.permission.bash["*"]).toBe("allow");
+    expect(content.permission.read["*"]).toBe("allow");
+    expect(content.permission.webfetch["*"]).toBe("deny");
+    // `tool:action` entries are narrower than a tool-wide rule and are not imported.
+    expect(content.permission.edit).toBeUndefined();
+  });
+
+  it("should import pool permissions into .rulesync/permissions.jsonc", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".poolside", "settings.yaml"),
+      [
+        "tools:",
+        "  shell:",
+        "    allow: ['git *']",
+        "    deny: ['rm -rf *']",
+        "  web_fetch:",
+        "    disabled: true",
+        "paths:",
+        "  allow:",
+        "    - path: src/**",
+        "      write: true",
+        "  deny:",
+        "    - path: .env",
+        "",
+      ].join("\n"),
+    );
+
+    await runImport({ target: "pool", features: "permissions" });
+
+    const content = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(content.permission.bash).toEqual({ "git *": "allow", "rm -rf *": "deny" });
+    // A disabled tool never runs, so it reads as a catch-all deny.
+    expect(content.permission.webfetch).toEqual({ "*": "deny" });
+    expect(content.permission.read).toEqual({ "src/**": "allow", ".env": "deny" });
+    expect(content.permission.edit).toEqual({ "src/**": "allow", ".env": "deny" });
+    expect(content.permission.write).toEqual({ "src/**": "allow", ".env": "deny" });
+  });
+
+  it("should import tabnine permissions into .rulesync/permissions.jsonc", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".tabnine", "agent", "settings.json"),
+      JSON.stringify(
+        {
+          tools: {
+            allowed: ["run_shell_command(git)", "read_file"],
+            exclude: ["run_shell_command(rm -rf)", "web_fetch"],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runImport({ target: "tabnine", features: "permissions" });
+
+    const content = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(content.permission.bash["git *"]).toBe("allow");
+    expect(content.permission.bash["rm -rf *"]).toBe("deny");
+    expect(content.permission.read["*"]).toBe("allow");
+    expect(content.permission.webfetch["*"]).toBe("deny");
+  });
+
   it("should import kiro permissions into .rulesync/permissions.jsonc", async () => {
     const testDir = getTestDir();
 
@@ -1598,6 +2125,129 @@ enabled = true
     expect(content.permission.webfetch["https://evil.example.com/*"]).toBe("deny");
   });
 
+  it("should import codebuddy permissions into .rulesync/permissions.jsonc", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".codebuddy", "settings.json"),
+      JSON.stringify(
+        {
+          model: "gpt-5",
+          permissions: {
+            defaultMode: "acceptEdits",
+            allow: ["Bash(git:*)", "Read", "mcp__github"],
+            ask: ["Bash(npm publish *)"],
+            deny: ["Write(.env*)", "mcp__*"],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runImport({ target: "codebuddy", features: "permissions" });
+
+    const content = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(content.permission.bash).toEqual({ "git:*": "allow", "npm publish *": "ask" });
+    expect(content.permission.read).toEqual({ "*": "allow" });
+    expect(content.permission.write).toEqual({ ".env*": "deny" });
+    expect(content.permission.mcp).toEqual({ "*": "deny" });
+    expect(content.permission.mcp__github).toEqual({ "*": "allow" });
+  });
+
+  it("should import commandcode permissions into .rulesync/permissions.jsonc", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".commandcode", "settings.json"),
+      JSON.stringify(
+        {
+          model: "gpt-5",
+          permissions: {
+            defaultMode: "acceptEdits",
+            allow: ["Shell(git *)", "Read", "mcp__github__get_issue"],
+            ask: ["Bash(npm publish *)"],
+            deny: ["Write(.env*)", "edit_*"],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runImport({ target: "commandcode", features: "permissions" });
+
+    const content = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(content.permission.bash).toEqual({ "git *": "allow", "npm publish *": "ask" });
+    expect(content.permission.read).toEqual({ "*": "allow" });
+    expect(content.permission.write).toEqual({ ".env*": "deny" });
+    expect(content.permission.mcp__github__get_issue).toEqual({ "*": "allow" });
+  });
+
+  it("should import lettacode permissions into .rulesync/permissions.jsonc", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".letta", "settings.json"),
+      JSON.stringify(
+        {
+          permissions: {
+            mode: "default",
+            allow: ["Bash(git:*)", "Read", "Task"],
+            alwaysAsk: ["Bash(npm publish)"],
+            deny: ["Write(.env*)"],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runImport({ target: "lettacode", features: "permissions" });
+
+    const content = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(content.permission.bash).toEqual({ "git *": "allow", "npm publish": "ask" });
+    expect(content.permission.read).toEqual({ "*": "allow" });
+    expect(content.permission.write).toEqual({ ".env*": "deny" });
+  });
+
+  it("should import qoder permissions into .rulesync/permissions.jsonc", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".qoder", "settings.json"),
+      JSON.stringify(
+        {
+          permissions: {
+            trustDirectories: ["~/work"],
+            allow: ["Bash(git log:*)", "Read", "mcp__context7__*"],
+            ask: ["WebFetch"],
+            deny: ["Edit(/.git/**)"],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runImport({ target: "qoder", features: "permissions" });
+
+    const content = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(content.permission.bash).toEqual({ "git log:*": "allow" });
+    expect(content.permission.read).toEqual({ "*": "allow" });
+    expect(content.permission.webfetch).toEqual({ "*": "ask" });
+    expect(content.permission.edit).toEqual({ "/.git/**": "deny" });
+    expect(content.permission["mcp__context7__*"]).toEqual({ "*": "allow" });
+  });
+
   it("should import copilot permissions into .rulesync/permissions.jsonc", async () => {
     const testDir = getTestDir();
 
@@ -1675,6 +2325,40 @@ enabled = true
     expect(content.permission.bash["rm -rf"]).toBe("deny");
     expect(content.permission.bash["curl "]).toBeUndefined();
   });
+
+  it("should merge successive imports from different tools per category", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".claude", "settings.json"),
+      JSON.stringify(
+        {
+          permissions: {
+            allow: ["Bash(git *)", "Edit(src/**)"],
+            deny: ["Read(.env)"],
+          },
+        },
+        null,
+        2,
+      ),
+    );
+    await writeFileContent(
+      join(testDir, ".vscode", "settings.json"),
+      JSON.stringify({ "roo-cline.allowedCommands": ["npm "] }, null, 2),
+    );
+
+    await runImport({ target: "claudecode", features: "permissions" });
+    await runImport({ target: "roo", features: "permissions" });
+
+    const content = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    // Roo Code maps only shell commands, so it replaces the `bash` category and
+    // leaves the categories the Claude Code import produced in place.
+    expect(content.permission.bash).toEqual({ "npm ": "allow" });
+    expect(content.permission.edit).toEqual({ "src/**": "allow" });
+    expect(content.permission.read).toEqual({ ".env": "deny" });
+  });
 });
 
 describe("E2E: permissions (global mode)", () => {
@@ -1727,6 +2411,293 @@ describe("E2E: permissions (global mode)", () => {
     },
   );
 
+  it("should generate and import bob permissions in ~/.bob/settings/settings.json (global-only)", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+    const settingsPath = join(homeDir, ".bob", "settings", "settings.json");
+
+    // Bob keeps its other settings (and the hooks feature's `hooks` key) in
+    // the same file, and the `approval` block carries group switches rulesync
+    // does not author.
+    await writeFileContent(
+      settingsPath,
+      JSON.stringify({
+        locale: "en",
+        approval: { allowed_permissions: ["read", "execute"] },
+      }),
+    );
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git status": "allow", "git push": "ask", rm: "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "bob",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    expect(JSON.parse(await readFileContent(settingsPath))).toEqual({
+      locale: "en",
+      approval: {
+        allowed_permissions: ["read", "execute"],
+        allowedExecutors: [
+          { toolId: "execute_command", approvedCommands: ["git status"], deniedCommands: ["rm"] },
+        ],
+      },
+    });
+
+    await runImport({
+      target: "bob",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    // A global import writes the user-level canonical file. Bob has no ask
+    // tier, so the `ask` rule was never written and does not come back.
+    const imported = JSON.parse(
+      await readFileContent(join(homeDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(imported.permission).toEqual({
+      bash: { "git status": "allow", rm: "deny" },
+    });
+    // The whole-group switches round-trip through the `bob` override block.
+    expect(imported.bob).toEqual({ approval: { allowed_permissions: ["read", "execute"] } });
+  });
+
+  it("should write bob group switches from the bob override block", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {},
+          bob: {
+            approval: { allowed_permissions: ["read", "todo"] },
+            autoApprove: { skills: true },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "bob",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    expect(
+      JSON.parse(await readFileContent(join(homeDir, ".bob", "settings", "settings.json"))),
+    ).toEqual({
+      approval: { allowed_permissions: ["read", "todo"] },
+      autoApprove: { skills: true },
+    });
+  });
+
+  it("should not create ~/.bob/settings/settings.json when no bash category is stated", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify({ permission: { read: { "*": "allow" } } }, null, 2),
+    );
+
+    await runGenerate({
+      target: "bob",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    expect(await fileExists(join(homeDir, ".bob", "settings", "settings.json"))).toBe(false);
+  });
+
+  it.each([{ target: "kiro-cli" }, { target: "kiro-ide" }])(
+    "should generate and import $target permissions in ~/.kiro/settings/permissions.yaml with --global",
+    async ({ target }) => {
+      const projectDir = getProjectDir();
+      const homeDir = getHomeDir();
+      const permissionsPath = join(homeDir, ".kiro", "settings", "permissions.yaml");
+
+      // A rule Kiro (or the user) wrote for a capability rulesync does not map
+      // must survive generation.
+      await writeFileContent(
+        permissionsPath,
+        'rules:\n  - capability: mcp\n    match: ["github/*"]\n    effect: allow\n',
+      );
+      await writeFileContent(
+        join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+        JSON.stringify(
+          {
+            permission: {
+              bash: { "git status *": "allow", "git push *": "ask", "rm *": "deny" },
+              read: { "*": "allow" },
+            },
+          },
+          null,
+          2,
+        ),
+      );
+
+      await runGenerate({
+        target,
+        features: "permissions",
+        global: true,
+        env: { HOME_DIR: homeDir },
+      });
+
+      expect(load(await readFileContent(permissionsPath))).toEqual({
+        rules: [
+          { capability: "mcp", match: ["github/*"], effect: "allow" },
+          { capability: "shell", match: ["git status *"], effect: "allow" },
+          { capability: "shell", match: ["git push *"], effect: "ask" },
+          { capability: "shell", match: ["rm *"], effect: "deny" },
+          { capability: "fs_read", effect: "allow" },
+        ],
+      });
+
+      await runImport({
+        target,
+        features: "permissions",
+        global: true,
+        env: { HOME_DIR: homeDir },
+      });
+
+      const imported = JSON.parse(
+        await readFileContent(join(homeDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+      );
+      expect(imported.permission).toEqual({
+        bash: { "git status *": "allow", "git push *": "ask", "rm *": "deny" },
+        read: { "*": "allow" },
+      });
+    },
+  );
+
+  it("should generate and import codewhale permissions in ~/.codewhale/permissions.toml (global-only)", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+    const permissionsPath = join(homeDir, ".codewhale", "permissions.toml");
+
+    // A grant Codewhale's approval card remembered for one repository survives
+    // the regenerate; the plain rule is replaced by the canonical block.
+    await writeFileContent(
+      permissionsPath,
+      smolToml.stringify({
+        rules: [
+          { tool: "exec_shell", command: "make", action: "ask" },
+          {
+            tool: "exec_shell",
+            command: "cargo test",
+            command_exact: true,
+            workspace: "/home/me/project",
+            action: "allow",
+          },
+        ],
+      }),
+    );
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git status": "allow", "git push *": "ask", "rm *": "deny" },
+            read: { ".env": "deny" },
+            edit: { "*": "ask" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "codewhale",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    expect(smolToml.parse(await readFileContent(permissionsPath))).toEqual({
+      rules: [
+        { tool: "exec_shell", command: "rm", action: "deny" },
+        { tool: "read_file", path: ".env", action: "deny" },
+        { tool: "apply_patch", action: "ask" },
+        { tool: "edit_file", action: "ask" },
+        { tool: "exec_shell", command: "git push", action: "ask" },
+        { tool: "exec_shell", command: "git status", command_exact: true, action: "allow" },
+        {
+          tool: "exec_shell",
+          command: "cargo test",
+          command_exact: true,
+          workspace: "/home/me/project",
+          action: "allow",
+        },
+      ],
+    });
+
+    await runImport({
+      target: "codewhale",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const imported = JSON.parse(
+      await readFileContent(join(homeDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(imported.permission).toEqual({
+      bash: { "git status": "allow", "git push *": "ask", "rm *": "deny" },
+      read: { ".env": "deny" },
+      edit: { "*": "ask" },
+    });
+    expect(imported.codewhale).toEqual({
+      rules: [
+        {
+          tool: "exec_shell",
+          command: "cargo test",
+          command_exact: true,
+          workspace: "/home/me/project",
+          action: "allow",
+        },
+      ],
+    });
+  });
+
+  it("should not create ~/.codewhale/permissions.toml when no category maps to Codewhale", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify({ permission: { webfetch: { "*": "allow" } } }, null, 2),
+    );
+
+    await runGenerate({
+      target: "codewhale",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    expect(await fileExists(join(homeDir, ".codewhale", "permissions.toml"))).toBe(false);
+  });
+
   it("should generate copilotcli permissions in home directory with --global", async () => {
     const projectDir = getProjectDir();
     const homeDir = getHomeDir();
@@ -1759,6 +2730,161 @@ describe("E2E: permissions (global mode)", () => {
     // User scope is the only scope that accepts an allow list.
     expect(generated.allowedUrls).toEqual(["https://docs.example.com/*"]);
     expect(generated.deniedUrls).toEqual(["https://evil.example.com/*"]);
+  });
+
+  it("should generate codebuddy permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: { bash: { "git:*": "allow", "rm -rf *": "deny" }, websearch: { "*": "ask" } },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "codebuddy",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = JSON.parse(
+      await readFileContent(join(homeDir, ".codebuddy", "settings.json")),
+    );
+    expect(generated.permissions).toEqual({
+      allow: ["Bash(git:*)"],
+      ask: ["WebSearch"],
+      deny: ["Bash(rm -rf *)"],
+    });
+  });
+
+  it("should generate commandcode permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: { bash: { "git *": "allow", "rm -rf *": "deny" }, websearch: { "*": "ask" } },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "commandcode",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = JSON.parse(
+      await readFileContent(join(homeDir, ".commandcode", "settings.json")),
+    );
+    expect(generated.permissions).toEqual({
+      allow: ["Shell(git *)"],
+      ask: ["WebSearch"],
+      deny: ["Shell(rm -rf *)"],
+    });
+  });
+
+  it("should generate lettacode permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify({ permission: { bash: { "git *": "allow", "rm -rf *": "deny" } } }, null, 2),
+    );
+
+    await runGenerate({
+      target: "lettacode",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = JSON.parse(await readFileContent(join(homeDir, ".letta", "settings.json")));
+    expect(generated.permissions).toEqual({
+      allow: ["Bash(git:*)"],
+      deny: ["Bash(rm -rf:*)"],
+    });
+  });
+
+  it("should generate qoder permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify({ permission: { bash: { "git *": "allow", "rm -rf *": "deny" } } }, null, 2),
+    );
+
+    await runGenerate({
+      target: "qoder",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = JSON.parse(await readFileContent(join(homeDir, ".qoder", "settings.json")));
+    expect(generated.permissions).toEqual({
+      allow: ["Bash(git *)"],
+      deny: ["Bash(rm -rf *)"],
+    });
+  });
+
+  it("should generate trae permissions into ~/.trae/permission/global.json (global-only)", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow", "rm -rf *": "deny" },
+            "mcp__github__*": { "*": "ask" },
+            webfetch: { "github.com": "allow" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "trae",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = JSON.parse(
+      await readFileContent(join(homeDir, ".trae", "permission", "global.json")),
+    );
+    expect(generated).toEqual({
+      customProfiles: {
+        defaultCustomProfile: {
+          approval: {
+            commandRules: {
+              "git *": { approval: "allow" },
+              "rm -rf *": { approval: "deny" },
+            },
+            mcpRules: { "github__*": { approval: "ask" } },
+          },
+        },
+      },
+      resourceAuthorization: { network: { allow: ["github.com"] } },
+    });
   });
 
   it("should generate junie permissions as AllowListRuleSet objects (global-only)", async () => {
@@ -1842,6 +2968,60 @@ describe("E2E: permissions (global mode)", () => {
         { decision: "allow", pattern: "Read", scope: "user" },
       ],
     });
+  });
+
+  it("should generate and import continue permissions in ~/.continue/permissions.yaml (global-only)", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git status *": "allow", "git push *": "ask", "rm -rf *": "deny" },
+            read: { ".env": "deny" },
+            webfetch: { "*": "allow" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "continue",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    // Continue CLI policies are `Tool(pattern)` strings in three lists; the
+    // canonical `deny` action is Continue's `exclude`.
+    const generated = toTable(
+      load(await readFileContent(join(homeDir, ".continue", "permissions.yaml"))),
+    );
+    expect(generated.allow).toEqual(["Bash(git status *)", "Fetch"]);
+    expect(generated.ask).toEqual(["Bash(git push *)"]);
+    expect(generated.exclude).toEqual(["Bash(rm -rf *)", "Read(.env)"]);
+
+    await runImport({
+      target: "continue",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const imported = JSON.parse(
+      await readFileContent(join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    expect(imported.permission.bash).toEqual({
+      "git status *": "allow",
+      "git push *": "ask",
+      "rm -rf *": "deny",
+    });
+    expect(imported.permission.read).toEqual({ ".env": "deny" });
+    expect(imported.permission.webfetch).toEqual({ "*": "allow" });
   });
 
   it("should generate and import the Kimi Code global tool switch", async () => {
@@ -2137,6 +3317,8 @@ describe("E2E: permissions (global mode)", () => {
     });
 
     const generated = JSON.parse(await readFileContent(join(homeDir, ".claude", "settings.json")));
+    expect(Object.keys(generated)[0]).toBe("$schema");
+    expect(generated.$schema).toBe(CLAUDECODE_SETTINGS_SCHEMA_URL);
     expect(generated.permissions.allow).toContain("Bash(git status *)");
     expect(generated.permissions.deny).toContain("Read(.env)");
     expect(generated.hooks).toEqual({
@@ -2171,6 +3353,37 @@ describe("E2E: permissions (global mode)", () => {
 
     const generated = JSON.parse(
       await readFileContent(join(homeDir, ".config", "opencode", "opencode.jsonc")),
+    );
+    expect(generated.permission.bash["git status *"]).toBe("allow");
+  });
+
+  it("should generate mimocode permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          root: true,
+          permission: {
+            bash: { "*": "ask", "git status *": "allow" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "mimocode",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = JSON.parse(
+      await readFileContent(join(homeDir, ".config", "mimocode", "mimocode.jsonc")),
     );
     expect(generated.permission.bash["git status *"]).toBe("allow");
   });
@@ -2381,6 +3594,104 @@ describe("E2E: permissions (global mode)", () => {
     expect(generated.permissions.deny).toContain("Read(.env)");
   });
 
+  it("should generate crush permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            read: { "*": "allow" },
+            webfetch: { "*": "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "crush",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = JSON.parse(
+      await readFileContent(join(homeDir, ".config", "crush", "crush.json")),
+    );
+    expect(generated.permissions.allowed_tools).toEqual(["view"]);
+    expect(generated.options.disabled_tools).toEqual(["fetch"]);
+  });
+
+  it("should generate pool permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow" },
+            read: { "~/.ssh/**": "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "pool",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = load(
+      await readFileContent(join(homeDir, ".config", "poolside", "settings.yaml")),
+    );
+    expect(generated).toEqual({
+      tools: { shell: { allow: ["git *"] } },
+      paths: { deny: [{ path: "~/.ssh/**" }] },
+    });
+  });
+
+  it("should generate tabnine permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git status *": "allow" },
+            webfetch: { "*": "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "tabnine",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const generated = JSON.parse(
+      await readFileContent(join(homeDir, ".tabnine", "agent", "settings.json")),
+    );
+    expect(generated.tools.allowed).toContain("run_shell_command(git status)");
+    expect(generated.tools.exclude).toContain("web_fetch");
+  });
+
   it("should generate antigravity-cli permissions in home directory with --global", async () => {
     const projectDir = getProjectDir();
     const homeDir = getHomeDir();
@@ -2390,7 +3701,12 @@ describe("E2E: permissions (global mode)", () => {
       JSON.stringify(
         {
           permission: {
-            bash: { "git status *": "allow", "rm -rf *": "deny" },
+            bash: {
+              "git status *": "allow",
+              "npm run test:*": "allow",
+              "rm -rf *": "deny",
+              "git push * --force": "deny",
+            },
             read: { "src/**": "allow" },
             webfetch: { "https://example.com/*": "allow" },
           },
@@ -2414,10 +3730,14 @@ describe("E2E: permissions (global mode)", () => {
     const generated = JSON.parse(
       await readFileContent(join(homeDir, ".gemini", "antigravity-cli", "settings.json")),
     );
-    expect(generated.permissions.allow).toContain("command(git status *)");
-    expect(generated.permissions.deny).toContain("command(rm -rf *)");
-    expect(generated.permissions.allow).toContain("read_file(src/**)");
-    expect(generated.permissions.allow).toContain("read_url(https://example.com/*)");
+    expect(generated.permissions.allow).toContain("command(git status)");
+    // agy matches word by word, so a glob inside a word is a per-word regex
+    // and a `*` that spans words has no spelling. Such a deny is widened to
+    // its leading literal words, so it still blocks what it was meant to.
+    expect(generated.permissions.allow).toContain("command(regex:^npm$ ^run$ ^test:.*$)");
+    expect(generated.permissions.deny).toEqual(["command(git push)", "command(rm -rf)"]);
+    expect(generated.permissions.allow).toContain("read_file(src)");
+    expect(generated.permissions.allow).toContain("read_url(example.com)");
   });
 
   it("should generate warp permissions in home directory with --global", async () => {
@@ -2457,6 +3777,87 @@ describe("E2E: permissions (global mode)", () => {
     expect(generated).toContain("agent_mode_command_execution_allowlist");
     expect(generated).toContain("git status .*");
     expect(generated).toContain("rm -rf .*");
+  });
+
+  it("should generate warpcli permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git status .*": "allow", "rm -rf .*": "deny" },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "warpcli",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    // The Warp Agent CLI keeps its own platform-specific settings.toml and
+    // always runs the `default` execution profile, so the command lists land
+    // there directly — no legacy [agents.profiles] keys.
+    const generated = smolToml.parse(
+      await readFileContent(join(homeDir, warpcliConfigDir(), "settings.toml")),
+    );
+    expect(generated).toEqual({
+      agents: {
+        execution_profiles: {
+          default: { command_allowlist: ["git status .*"], command_denylist: ["rm -rf .*"] },
+        },
+      },
+    });
+  });
+
+  it("should generate deepagents permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: {
+            bash: { "git *": "allow", ls: "allow", "rm -rf *": "deny" },
+          },
+          deepagents: {
+            startup: { mode: "auto" },
+            mcp: { disabled_project_servers: ["filesystem"] },
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "deepagents",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    // dcode auto-approves a command whose executable name is in
+    // `[shell].allow_list` of the user config and asks about everything else,
+    // so allow rules are reduced to their executable and deny rules have no
+    // counterpart. Permissions are global-scope only: dcode reads no
+    // project-level config file.
+    const generated = smolToml.parse(
+      await readFileContent(join(homeDir, ".deepagents", "config.toml")),
+    );
+    const shell = generated.shell as Record<string, unknown>;
+    expect(shell.allow_list).toEqual(["git", "ls"]);
+    expect(generated.startup).toEqual({ mode: "auto" });
+    expect(generated.mcp).toEqual({ disabled_project_servers: ["filesystem"] });
   });
 
   it("should generate zed permissions in home directory with --global", async () => {
@@ -2513,6 +3914,65 @@ describe("E2E: permissions (global mode)", () => {
     // Unrelated user settings preserved by the non-destructive merge.
     expect(generated.theme).toBe("One Dark");
     expect(generated.context_servers.my_server.command).toBe("x");
+  });
+
+  it("should generate and import the zed override and tool_permissions with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify(
+        {
+          permission: { bash: { "*": "ask", "npm *": "allow", "rm *": "deny" } },
+          zed: {
+            sandbox_permissions: { network_hosts: ["*.github.com"], write_paths: ["/tmp/build"] },
+            profiles: { review: { name: "Review", tools: { terminal: false } } },
+            default_profile: "review",
+          },
+        },
+        null,
+        2,
+      ),
+    );
+
+    await runGenerate({
+      target: "zed",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const agent = JSON.parse(
+      await readFileContent(join(homeDir, getZedGlobalDir(), "settings.json")),
+    ).agent;
+    expect(agent.sandbox_permissions).toEqual({
+      network_hosts: ["*.github.com"],
+      write_paths: ["/tmp/build"],
+    });
+    expect(agent.profiles).toEqual({ review: { name: "Review", tools: { terminal: false } } });
+    expect(agent.default_profile).toBe("review");
+    // The canonical block still owns tool_permissions.
+    expect(agent.tool_permissions.tools.terminal.always_deny).toEqual([
+      { pattern: "rm *", case_sensitive: false },
+    ]);
+
+    await runImport({
+      target: "zed",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const imported = JSON.parse(
+      await readFileContent(join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH)),
+    );
+    // `terminal` → `bash`, `confirm` → `ask`.
+    expect(imported.permission.bash).toEqual({ "*": "ask", "npm *": "allow", "rm *": "deny" });
+    expect(imported.zed.default_profile).toBe("review");
+    expect(imported.zed.profiles).toEqual({
+      review: { name: "Review", tools: { terminal: false } },
+    });
   });
 
   it("should generate amp permissions in home directory with --global", async () => {
@@ -2676,7 +4136,7 @@ describe("E2E: permissions (global mode)", () => {
       [
         "smart_approve:",
         "  always_allow:",
-        "    - developer__shell",
+        "    - shell",
         "  ask_before: []",
         "  never_allow: []",
       ].join("\n"),
@@ -2698,12 +4158,12 @@ describe("E2E: permissions (global mode)", () => {
     );
     const root = toTable(parsed);
     const user = toTable(root.user);
-    expect(user.always_allow).toEqual(["developer__shell"]);
-    expect(user.ask_before).toEqual(["developer__text_editor"]);
+    expect(user.always_allow).toEqual(["shell"]);
+    expect(user.ask_before).toEqual(["edit"]);
     expect(user.never_allow).toEqual(["webfetch"]);
     // The smart_approve LLM cache is preserved by the non-destructive merge.
     const smartApprove = toTable(root.smart_approve);
-    expect(smartApprove.always_allow).toEqual(["developer__shell"]);
+    expect(smartApprove.always_allow).toEqual(["shell"]);
   });
 
   it("should generate grokcli permissions in home directory with --global", async () => {
@@ -2890,6 +4350,30 @@ describe("E2E: permissions (global mode)", () => {
     expect(imported.model).toBeUndefined();
   });
 
+  it("should generate omp permissions in home directory with --global", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_PERMISSIONS_RELATIVE_FILE_PATH),
+      JSON.stringify({ permission: { bash: { "*": "allow" } } }, null, 2),
+    );
+    await writeFileContent(
+      join(homeDir, ".omp", "agent", "config.yml"),
+      ["tools:", "  approval:", "    eval: prompt", ""].join("\n"),
+    );
+
+    await runGenerate({
+      target: "omp",
+      features: "permissions",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const parsed = load(await readFileContent(join(homeDir, ".omp", "agent", "config.yml")));
+    expect(parsed).toEqual({ tools: { approval: { eval: "prompt", bash: "allow" } } });
+  });
+
   it("should generate pi permissions in home directory with --global", async () => {
     const projectDir = getProjectDir();
     const homeDir = getHomeDir();
@@ -2955,7 +4439,7 @@ describe("E2E: permissions (global mode)", () => {
     );
     const permissions = toTable(parsed.permissions);
     expect(permissions.allow).toContain("Bash(git status *)");
-    expect(permissions.deny).toContain("Read(.env)");
+    expect(permissions.deny).toContain("read_file(.env)");
     expect(toTableArray(parsed.plugins)).toMatchObject([{ name: "existing", command: "node" }]);
   });
 });

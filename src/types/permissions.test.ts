@@ -87,6 +87,23 @@ describe("RulesyncPermissionsFileSchema tool-scoped override enums", () => {
       );
       expect(result.success).toBe(false);
     });
+
+    it.each(["warp", "warpcli"])(
+      "should accept a boolean auto_approve_bypasses_command_denylist for %s",
+      (target) => {
+        const result = RulesyncPermissionsFileSchema.safeParse(
+          withOverride({ [target]: { auto_approve_bypasses_command_denylist: false } }),
+        );
+        expect(result.success).toBe(true);
+      },
+    );
+
+    it("should reject a non-boolean auto_approve_bypasses_command_denylist", () => {
+      const result = RulesyncPermissionsFileSchema.safeParse(
+        withOverride({ warpcli: { auto_approve_bypasses_command_denylist: "no" } }),
+      );
+      expect(result.success).toBe(false);
+    });
   });
 
   describe("antigravity-cli.toolPermission", () => {
@@ -103,6 +120,67 @@ describe("RulesyncPermissionsFileSchema tool-scoped override enums", () => {
     it("should reject an unknown value", () => {
       const result = RulesyncPermissionsFileSchema.safeParse(
         withOverride({ "antigravity-cli": { toolPermission: "lenient" } }),
+      );
+      expect(result.success).toBe(false);
+    });
+  });
+
+  describe("factorydroid.permissionRules", () => {
+    const rule = (overrides: Record<string, unknown> = {}) => ({
+      id: "allow-git-status",
+      decision: "allow",
+      match: { prefix: ["git", "status"] },
+      tests: { match: ["git status"], noMatch: ["git push"] },
+      ...overrides,
+    });
+
+    it.each(["allow", "ask", "block"])("should accept decision %s", (decision) => {
+      const result = RulesyncPermissionsFileSchema.safeParse(
+        withOverride({
+          factorydroid: { permissionRules: { version: 1, rules: [rule({ decision })] } },
+        }),
+      );
+      expect(result.success).toBe(true);
+    });
+
+    it("should reject an unknown decision", () => {
+      const result = RulesyncPermissionsFileSchema.safeParse(
+        withOverride({
+          factorydroid: { permissionRules: { version: 1, rules: [rule({ decision: "deny" })] } },
+        }),
+      );
+      expect(result.success).toBe(false);
+    });
+
+    it("should accept a nested list of alternative tokens at one prefix position", () => {
+      const result = RulesyncPermissionsFileSchema.safeParse(
+        withOverride({
+          factorydroid: {
+            permissionRules: {
+              version: 1,
+              rules: [rule({ match: { prefix: ["git", ["status", "diff", "log"]] } })],
+            },
+          },
+        }),
+      );
+      expect(result.success).toBe(true);
+    });
+
+    it.each([
+      ["an empty alternatives list", ["git", []]],
+      ["an empty prefix", []],
+    ])("should reject %s", (_label, prefix) => {
+      const result = RulesyncPermissionsFileSchema.safeParse(
+        withOverride({
+          factorydroid: { permissionRules: { version: 1, rules: [rule({ match: { prefix } })] } },
+        }),
+      );
+      expect(result.success).toBe(false);
+    });
+
+    it("should reject a container without a rules array", () => {
+      const result = RulesyncPermissionsFileSchema.safeParse(
+        withOverride({ factorydroid: { permissionRules: { version: 1 } } }),
       );
       expect(result.success).toBe(false);
     });
@@ -244,6 +322,21 @@ describe("RulesyncPermissionsFileSchema tool-scoped override enums", () => {
     it("cursor.sandbox accepts arbitrary values (bounds are undocumented)", () => {
       const result = RulesyncPermissionsFileSchema.safeParse(
         withOverride({ cursor: { sandbox: { mode: "anything", networkAccess: "custom" } } }),
+      );
+      expect(result.success).toBe(true);
+    });
+
+    it("devin.sandbox accepts arbitrary values (Devin keeps adding sandbox keys)", () => {
+      const result = RulesyncPermissionsFileSchema.safeParse(
+        withOverride({
+          devin: {
+            sandbox: {
+              network_mode: "anything",
+              excluded: "not-an-object",
+              some_future_key: { nested: 1 },
+            },
+          },
+        }),
       );
       expect(result.success).toBe(true);
     });

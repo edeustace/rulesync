@@ -59,10 +59,14 @@ const mockGenerateResult: GenerateResult = {
   checksPaths: [],
   activationCount: 0,
   activationPaths: [],
+  pluginManifestCount: 0,
+  pluginManifestPaths: [],
   skills: [],
   hasDiff: false,
   sourceLoadFailed: false,
   sourceLoadFailedFeatures: [],
+  deletedPathsByFeature: {},
+  keyOperationsByFeature: {},
 };
 
 const mockImportResult: ImportResult = {

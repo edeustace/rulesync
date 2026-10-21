@@ -49,6 +49,32 @@ describe("AugmentcodeMcp", () => {
   });
 
   describe("fromRulesyncMcp", () => {
+    it("should retract mcpServers when no server is left, keeping unrelated keys", async () => {
+      await writeFileContent(
+        settingsPath(),
+        JSON.stringify({
+          toolPermissions: [{ "tool-name": "shell", permission: "allow" }],
+          mcpServers: { old: { command: "old" } },
+        }),
+      );
+      const rulesyncMcp = new RulesyncMcp({
+        outputRoot: testDir,
+        relativeDirPath: ".rulesync",
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({ mcpServers: {} }),
+      });
+
+      const mcp = await AugmentcodeMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp,
+        global: false,
+      });
+
+      expect(mcp.getJson()).toEqual({
+        toolPermissions: [{ "tool-name": "shell", permission: "allow" }],
+      });
+    });
+
     it("should merge mcpServers into the workspace settings.json at project scope", async () => {
       await writeFileContent(
         settingsPath(),
@@ -115,6 +141,38 @@ describe("AugmentcodeMcp", () => {
       });
     });
 
+    it("should accept a JSONC settings.json and edit it in place, preserving comments", async () => {
+      // https://docs.augmentcode.com/cli/config: settings files support JSON
+      // with Comments (comments and trailing commas).
+      await writeFileContent(
+        settingsPath(),
+        `{
+  // Hooks stay untouched by the mcp feature.
+  "hooks": { "SessionStart": [{ "command": "echo hi" }], },
+  "mcpServers": { "old": { "command": "old" } },
+}
+`,
+      );
+
+      const rulesyncMcp = new RulesyncMcp({
+        outputRoot: testDir,
+        relativeDirPath: ".rulesync",
+        relativeFilePath: ".mcp.json",
+        fileContent: JSON.stringify({ mcpServers: { fs: { command: "fs" } } }),
+      });
+
+      const mcp = await AugmentcodeMcp.fromRulesyncMcp({
+        outputRoot: testDir,
+        rulesyncMcp,
+        global: true,
+      });
+
+      const content = mcp.getFileContent();
+      expect(content).toContain("// Hooks stay untouched by the mcp feature.");
+      expect(mcp.getJson().hooks).toEqual({ SessionStart: [{ command: "echo hi" }] });
+      expect(mcp.getJson().mcpServers).toEqual({ fs: { command: "fs" } });
+    });
+
     it("should initialize settings when the file does not exist", async () => {
       const rulesyncMcp = new RulesyncMcp({
         outputRoot: testDir,
@@ -138,6 +196,19 @@ describe("AugmentcodeMcp", () => {
       await writeFileContent(
         settingsPath(),
         JSON.stringify({ hooks: {}, mcpServers: { fs: { command: "fs" } } }),
+      );
+
+      const mcp = await AugmentcodeMcp.fromFile({ outputRoot: testDir, global: true });
+      expect(mcp.getJson().mcpServers).toEqual({ fs: { command: "fs" } });
+    });
+
+    it("should read a JSONC settings.json on import", async () => {
+      await writeFileContent(
+        settingsPath(),
+        `{
+  /* shared servers */
+  "mcpServers": { "fs": { "command": "fs", }, },
+}`,
       );
 
       const mcp = await AugmentcodeMcp.fromFile({ outputRoot: testDir, global: true });

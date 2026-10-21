@@ -24,7 +24,7 @@ Google Antigravity has a known limitation where it won't load rules, workflows, 
 
 > **Note:** Antigravity 2.0 uses the plural `.agents/` directory by default (the `antigravity-ide` and `antigravity-cli` targets).
 
-**Workaround:** Instead of adding these directories to `.gitignore`, add them to `.git/info/exclude`:
+**Workaround:** Instead of adding these directories to `.gitignore`, add them to `.git/info/exclude`. `rulesync gitignore` can do this for you when `gitignoreDestination` is set to `"gitexclude"` (for example in `rulesync.local.jsonc`, or only for the Antigravity targets — see [Configuration](./guide/configuration.md#per-feature-options)). Run it from the repository root. Because `.gitignore` takes precedence over the exclude file, also route every other target that writes the same paths (for example Codex CLI's `**/.agents/skills/`) to `"gitexclude"` — the root-level setting does this — or leave them out of `targets`; otherwise the shared entry is still written to `.gitignore`. To do it by hand:
 
 ```bash
 # Remove from .gitignore (if present)
@@ -46,7 +46,7 @@ Note: `.git/info/exclude` can't be shared with your team since it's not committe
 
 The `[permissions.rulesync]` profile that rulesync generates into `.codex/config.toml` extends Codex CLI's `:workspace` baseline. That baseline is deliberately conservative, so day-to-day development can still hit permission denials: `git push`/`git fetch` over SSH cannot reach the SSH agent socket, some build tools fail without a writable temp dir, and Codex may be blocked from reading its own `~/.codex` configuration.
 
-rulesync emits the `.git` write carve-out for you (`".git/**" = "write"` under `:workspace_roots`; opt out with the `codexcli.git_write_rules: false` override). The whole subtree — including `.git/config` — is writable, because everyday commands such as `git remote add`, `git push -u`, and local-scope `git config` write to the repository config; users who want stricter isolation can add their own `read` override (e.g. `read: { ".git/config": "allow" }`) in the canonical permissions. Everything below, however, depends on your environment or workflow, so rulesync does not add it by default. Where to put each piece differs, because the two tables are managed differently:
+rulesync emits the `.git` write carve-out for you (`".git/**" = "write"` under `:workspace_roots`; opt out with the `codexcli.git_write_rules: false` override; it is left out when a broader workspace-relative deny or read-only rule such as `read: { "**": "deny" }` covers `.git`). The whole subtree — including `.git/config` — is writable, because everyday commands such as `git remote add`, `git push -u`, and local-scope `git config` write to the repository config; users who want stricter isolation can add their own `read` override (e.g. `read: { ".git/config": "allow" }`) in the canonical permissions. Everything below, however, depends on your environment or workflow, so rulesync does not add it by default. Where to put each piece differs, because the two tables are managed differently:
 
 **Network settings: edit `.codex/config.toml` directly.** Network settings are out of rulesync's management scope by design, keeping you free to edit them. rulesync preserves user-authored network keys when it regenerates the file — `network.enabled` (as long as the profile carries no rulesync-managed allow domains) and unknown keys such as `dangerously_allow_all_unix_sockets` are carried forward verbatim, with a warning so they stay visible:
 
@@ -100,7 +100,7 @@ What each entry does:
 - **`:root` / `:minimal` write**: package runners such as `npx {package}` unpack into the npm cache under the home directory (`~/.npm/_npx`), and many dev tools write to home-directory caches (`~/.cache`, `~/.local`, corepack/pnpm stores); the `:workspace` baseline denies these writes, which breaks the commands outright. `":root" = "write"` alone is not enough: rulesync emits `":minimal" = "read"` by default (the platform-default system paths needed for sandboxed command execution), and Codex treats that entry as narrowing the broader `:root` grant — the policy no longer qualifies for full disk write access, so writes that `:root` appears to allow can still be denied. Raise `":minimal"` to write alongside `":root"` to get the intended effect. Trade-off: the pair grants the sandbox full disk write access, including platform system paths — a compromised or prompt-injected session could then modify shell startup files, `PATH` binaries, or system configuration outside the workspace, effectively neutralizing the sandbox's write isolation. Prefer narrower home-directory patterns instead (e.g. `"~/.npm/**"`, `"~/.cache/**"`) unless you specifically need system-wide writes, at the cost of chasing each tool's cache path.
 - **`:tmpdir` / `:slash_tmp` write**: many build tools require a writable temp directory (`$TMPDIR` and `/tmp` respectively).
 - **`~/.codex/**` read with `auth.json` deny**: Codex can read its own configuration tree while your credentials stay protected. Tilde paths are expanded by Codex itself, so no manual `$HOME` resolution is needed.
-- **`glob_scan_max_depth`**: no need to add it — rulesync emits the Codex default (`8`) automatically whenever the generated workspace-root rules contain unbounded `**` patterns (the default `.git/**` carve-out already is one).
+- **`glob_scan_max_depth`**: no need to add it — rulesync emits the Codex default (`8`) automatically whenever the generated workspace-root rules contain unbounded `**` patterns (the default `.git/**` carve-out, when emitted, already is one).
 
 See the [Codex permissions reference](https://developers.openai.com/codex/permissions) for the full path and network syntax.
 
@@ -122,3 +122,30 @@ CLAUDE.md                 linguist-generated
 ```
 
 Adjust the list to match the targets you have configured. These entries only affect how GitHub displays the files in diffs — they don't change how Git tracks them, and they don't interfere with the tools reading the rules.
+
+## How do I keep many repositories in sync with a shared source?
+
+Rulesync stops at the repository boundary. A consumer repository declares its `sources` in `rulesync.jsonc`, pins what it resolved in `rulesync.lock`, and moves forward only when someone runs `rulesync install --update` there — the same model as an npm or Bun lockfile. Nothing in the tool schedules that run, watches the shared repository, or walks other clones, so with fifteen consumers the layer above the lockfile is yours to shape, and either of the two obvious shapes works:
+
+- **On demand.** Run `rulesync install --update && rulesync generate` in a repository when you want it to pick up the shared changes, review the diff, and commit the lockfile with the regenerated files.
+- **Scheduled.** A cron-triggered CI job that runs the same two commands and opens a pull request when the lockfile changed is an ordinary way to drive rulesync; nothing in the tool assumes the update is manual. Compare the lockfile with `resolvedAt` ignored (the `-I` flag needs Git 2.30 or newer): `--update` stamps a fresh timestamp on every source it re-resolves, so the file changes even when no `resolvedRef` did.
+
+  ```bash
+  rulesync install --update && rulesync generate
+  git diff --quiet -I '"resolvedAt"' -- rulesync.lock rulesync-npm.lock.json || echo "shared source moved: open a pull request"
+  ```
+
+Keep `rulesync doctor --strict && rulesync install --frozen && rulesync generate --check` in the consumer's CI either way; that is what guards a repository whose lockfile has fallen behind its own `rulesync.jsonc` or whose generated files have drifted, independent of how updates are triggered.
+
+To see whether a repository is behind without changing anything, run `rulesync install --outdated` there. It re-resolves each declared source the same way `--update` does, compares the result with the lockfile, lists the sources that are outdated or not yet locked, and exits with code `1` when any is (`2` when a source cannot be resolved), without writing the lockfile or any other file. It is what a scheduled job can run first to decide whether an update is needed, and running it across clones shows which consumers are behind. See [Checking for Outdated Sources](./guide/declarative-sources.md#checking-for-outdated-sources) for the details.
+
+Updating many repositories at once is a loop over clones that does, per repository, exactly what a single one does: skip a dirty working tree, run `rulesync install --update && rulesync generate`, run the CI guard, and commit. Rulesync does not orchestrate that loop, and the shared repository does not have to know who consumes it.
+
+## Is there a GUI or web dashboard for managing Rulesync?
+
+No. Rulesync is a CLI and a library, and it does not ship a `rulesync ui` command or a dashboard. The `.rulesync/` directory and `rulesync.jsonc` are plain files meant to be reviewed in pull requests like any other source, and the rules, commands, subagents and skills in them are ordinary Markdown with frontmatter that any editor can open. Bundling a web UI would add a server, a frontend and their runtime dependencies to every install.
+
+A graphical front end can be built on top of Rulesync instead, from either of two existing entry points:
+
+- The [Programmatic API](./api/programmatic-api.md) exports `generate`, `importFromTool` and `convertFromTool`, so a desktop or web app can drive the same operations as the CLI from Node.js.
+- The [Rulesync MCP Server](./reference/mcp-server.md) lets an AI agent read, create, update and delete Rulesync files and run `generate`, `import` and `convert`, which covers the "browse, edit and regenerate" part of a dashboard from inside your coding assistant.

@@ -18,8 +18,11 @@ import {
 import { ToolFile } from "../../types/tool-file.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
+import { parseGlobPattern } from "../../utils/glob.js";
+import { type Logger, warnWithFallback } from "../../utils/logger.js";
 import { applySharedConfigPatch, sharedConfigFileKey } from "../shared/shared-config-gateway.js";
 import { RulesyncPermissions } from "./rulesync-permissions.js";
+import { bashRulesHonoringAllTools } from "./shell-command-categories.js";
 import {
   ToolPermissions,
   type ToolPermissionsForDeletionParams,
@@ -30,6 +33,9 @@ import {
 
 const RULESYNC_PROFILE_NAME = "rulesync";
 const CODEX_WORKSPACE_ROOTS_KEY = ":workspace_roots";
+// The `:workspace_roots` table key that addresses the workspace root itself
+// (codex-rs emits and accepts `"."` for a bare `:workspace_roots` entry).
+const CODEX_WORKSPACE_ROOT_SUBPATH = ".";
 const CODEX_WORKSPACE_BASELINE = ":workspace";
 const CODEX_READ_ONLY_BASELINE = ":read-only";
 // Codex rejects `extends = ":danger-full-access"`, but the built-in can be
@@ -46,6 +52,17 @@ const CODEX_EXTENDABLE_BASELINES = new Set<string>(CODEX_EXTENDABLE_BASELINE_PRO
 // config.toml sets the key (an existing user-set value is never clobbered).
 const CODEX_DEFAULT_APPROVAL_POLICY = "on-request";
 const CODEX_DEFAULT_APPROVALS_REVIEWER = "auto_review";
+// `approval_policy = "untrusted"` was retired in Codex 0.149.0 (openai/codex
+// PR #39630): an explicit value makes Codex refuse to start with
+// `approval_policy = "untrusted" is no longer supported; remove this setting`.
+// The strict behavior moved to a user-level `[projects."<path>"]
+// trust_level = "untrusted"` entry, which is per-machine state rulesync does
+// not author. `on-failure` is still read as an alias of `on-request` but is
+// documented as deprecated.
+// https://learn.chatgpt.com/docs/config-file/config-reference
+// https://learn.chatgpt.com/docs/agent-approvals-security#migrate-from-the-retired-untrusted-approval-policy
+const CODEX_RETIRED_APPROVAL_POLICY = "untrusted";
+const CODEX_DEPRECATED_APPROVAL_POLICY = "on-failure";
 const CODEX_GLOB_SCAN_MAX_DEPTH = 8; // Matches Codex CLI default glob_scan_max_depth
 // `:minimal = "read"` enables `include_platform_defaults()` (FileSystemSpecialPath::Minimal,
 // openai/codex#13434), providing platform/runtime read access for basic sandboxed command execution.
@@ -80,7 +97,8 @@ const CODEX_MINIMAL_KEY = ":minimal";
 // Like `:minimal`, this default-valued entry is not imported into the
 // rulesync model (it is re-added on every export); a user-customized value
 // for the same key imports — and generates — normally, winning over the
-// default.
+// default. The default pair itself also imports as a user rule when the rest
+// of the table restricts `.git`, since generation would not re-add it there.
 const CODEX_GIT_WRITE_RULES: Readonly<Record<string, "read" | "write">> = {
   ".git/**": "write",
 };
@@ -291,6 +309,15 @@ export class CodexcliPermissions extends ToolPermissions {
     const config = convertCodexProfileToRulesync({ profile, domainsHadUnknown });
 
     const override = extractCodexcliOverride(table);
+    if (override.approval_policy === CODEX_RETIRED_APPROVAL_POLICY) {
+      // Lifting it would only have the next generate warn and drop it again;
+      // surface the migration once, at the file that still carries it.
+      warnWithFallback(
+        undefined,
+        `${join(this.getRelativeDirPath(), this.getRelativeFilePath())} sets approval_policy = "${CODEX_RETIRED_APPROVAL_POLICY}", which was retired in Codex 0.149.0 and makes Codex refuse to start. It was not imported; remove it from the file, or mark the project untrusted in your user config instead ([projects."<path>"] trust_level = "${CODEX_RETIRED_APPROVAL_POLICY}").`,
+      );
+      delete override.approval_policy;
+    }
     // The profile's `extends` baseline is modeled as the
     // `codexcli.base_permission_profile` override (not a top-level key), so it
     // round-trips explicitly. Non-extendable or custom parents are skipped;
@@ -340,15 +367,17 @@ export class CodexcliRulesFile extends ToolFile {
 export function createCodexcliBashRulesFile({
   outputRoot = process.cwd(),
   config,
+  logger,
 }: {
   outputRoot?: string;
   config: PermissionsConfig;
+  logger?: Logger;
 }): CodexcliRulesFile {
   return new CodexcliRulesFile({
     outputRoot,
     relativeDirPath: CODEXCLI_RULES_DIR_PATH,
     relativeFilePath: CODEXCLI_BASH_RULES_FILE_NAME,
-    fileContent: buildCodexBashRulesContent(config),
+    fileContent: buildCodexBashRulesContent({ config, logger }),
   });
 }
 
@@ -406,34 +435,46 @@ function convertRulesyncToCodexProfile({
       continue;
     }
 
+    // bash is not part of the permission profile; createCodexcliBashRulesFile
+    // writes it to .codex/rules/rulesync.rules.
+    if (toolName === "bash") {
+      continue;
+    }
+
     logger?.warn(
-      `Codex CLI permissions support only read/edit/write/webfetch categories. Skipping: ${toolName}`,
+      `Codex CLI permission profiles support only read/edit/write/webfetch categories (bash goes to .codex/rules/rulesync.rules). Skipping: ${toolName}`,
     );
   }
 
-  // Codex has a single access level per path (deny < read < write), so rules
-  // for the same pattern across the canonical read/edit/write categories are
-  // merged instead of last-category-wins overwriting (e.g. `read: allow` +
-  // `write: deny` emits `"read"`, not `"deny"`).
-  for (const [pattern, access] of mergeFilesystemCategoryRules({
+  addCodexFilesystemRules({
     categoryRules: filesystemCategoryRules,
+    filesystem,
+    workspaceRootFilesystem,
     logger,
-  })) {
-    addFilesystemRule({
-      filesystem,
-      workspaceRootFilesystem,
-      pattern,
-      access,
-      logger,
-    });
-  }
+  });
 
-  applyDefaultGitWriteRules({ config, filesystem, workspaceRootFilesystem });
+  applyDefaultGitWriteRules({
+    config,
+    filesystem,
+    workspaceRootFilesystem,
+    logger,
+  });
 
   if (Object.keys(workspaceRootFilesystem).length > 0) {
-    if (typeof filesystem[CODEX_WORKSPACE_ROOTS_KEY] === "string") {
+    const directWorkspaceRootsAccess = filesystem[CODEX_WORKSPACE_ROOTS_KEY];
+    if (isCodexFilesystemAccess(directWorkspaceRootsAccess)) {
+      // Codex addresses the workspace root itself as the `"."` subpath of a
+      // `:workspace_roots` table (compile_scoped_filesystem_path in
+      // codex-rs/core/src/config/permissions.rs), so the direct access rule is
+      // preserved there instead of being silently dropped. When an explicit
+      // `"."` (or `"./"`) rule also exists, the more restrictive access wins.
+      mergeIntoWorkspaceRootTable({
+        workspaceRootFilesystem,
+        pattern: CODEX_WORKSPACE_ROOT_SUBPATH,
+        access: directWorkspaceRootsAccess,
+      });
       logger?.warn(
-        `"${CODEX_WORKSPACE_ROOTS_KEY}" is set as a direct filesystem access rule in the permissions, but it will be overwritten by workspace-root rules. Consider removing the direct "${CODEX_WORKSPACE_ROOTS_KEY}" entry.`,
+        `"${CODEX_WORKSPACE_ROOTS_KEY}" is set as a direct filesystem access rule in the permissions alongside workspace-relative rules; it is emitted as the "${CODEX_WORKSPACE_ROOT_SUBPATH}" entry of the "${CODEX_WORKSPACE_ROOTS_KEY}" table.`,
       );
     }
     if (Object.keys(workspaceRootFilesystem).some((pattern) => pattern.includes("**"))) {
@@ -468,6 +509,62 @@ function convertRulesyncToCodexProfile({
   };
 }
 
+function addCodexFilesystemRules({
+  categoryRules,
+  filesystem,
+  workspaceRootFilesystem,
+  logger,
+}: {
+  categoryRules: Partial<Record<"read" | "edit" | "write", Record<string, PermissionAction>>>;
+  filesystem: CodexFilesystem;
+  workspaceRootFilesystem: CodexFilesystemRuleTable;
+  logger?: ToolPermissionsFromRulesyncPermissionsParams["logger"];
+}): void {
+  // Codex has a single access level per path (deny < read < write), so rules
+  // for the same pattern across the canonical read/edit/write categories are
+  // merged instead of last-category-wins overwriting (e.g. `read: allow` +
+  // `write: deny` emits `"read"`, not `"deny"`).
+  const normalizedCategoryRules = normalizeWorkspaceRelativeCategoryRules({
+    categoryRules,
+    logger,
+  });
+  for (const rule of mergeFilesystemCategoryRules({
+    categoryRules: normalizedCategoryRules,
+    logger,
+  })) {
+    const access = normalizeCodexFilesystemAccess({
+      pattern: rule.pattern,
+      access: rule.access,
+      writeRestriction: rule.writeRestriction,
+      logger,
+    });
+    if (access === undefined) {
+      continue;
+    }
+
+    if (access === "read" && rule.writeRestriction === "ask") {
+      logger?.warn(
+        `Codex CLI cannot express "ask" for filesystem write permissions: pattern "${rule.pattern}" will be emitted as read-only.`,
+      );
+    }
+    // Only warn when the read side was unspecified: an explicit `read: allow`
+    // on the same pattern already asks for exactly Codex's `"read"` level.
+    if (access === "read" && rule.writeRestriction === "deny" && rule.readUnspecified) {
+      logger?.warn(
+        `Codex CLI maps a write-side deny to read-only access: pattern "${rule.pattern}" will be emitted as "read". A broader read deny may be overridden by this more-specific path.`,
+      );
+    }
+
+    addFilesystemRule({
+      filesystem,
+      workspaceRootFilesystem,
+      pattern: rule.pattern,
+      access,
+      logger,
+    });
+  }
+}
+
 // Fill in the default `.git` carve-out after the user's rules so a
 // user-specified value for the same key always wins. Suppressed by an
 // explicit `codexcli.git_write_rules: false`, and also skipped when:
@@ -477,15 +574,26 @@ function convertRulesyncToCodexProfile({
 // - the user authored a direct `":workspace_roots"` string rule — that is an
 //   explicit access decision for the whole workspace tree (e.g. a blanket
 //   deny), and injecting defaults would force the string rule to be replaced
-//   by a rule table.
+//   by a rule table; or
+// - `.git` is covered by a broader restrictive entry of the generated
+//   `:workspace_roots` table (e.g. `"**" = "deny"` from `read: { "**": "deny" }`,
+//   or `"." = "read"` from `edit: { ".": "deny" }`) — Codex resolves the more
+//   specific `.git/**` entry with priority, so the carve-out would silently
+//   reopen `.git` under that restriction. The decision reads only the emitted
+//   table, so a generate -> import -> generate round trip reaches the same
+//   result. `:root` and `/**` do not count here: they are not table entries,
+//   and the `:workspace` baseline re-grants the workspace above them, so
+//   `.git` still needs the carve-out.
 function applyDefaultGitWriteRules({
   config,
   filesystem,
   workspaceRootFilesystem,
+  logger,
 }: {
   config: PermissionsConfig;
   filesystem: CodexFilesystem;
   workspaceRootFilesystem: CodexFilesystemRuleTable;
+  logger?: ToolPermissionsFromRulesyncPermissionsParams["logger"];
 }): void {
   if (config.codexcli?.git_write_rules === false) {
     return;
@@ -497,8 +605,37 @@ function applyDefaultGitWriteRules({
     return;
   }
   for (const [pattern, access] of Object.entries(CODEX_GIT_WRITE_RULES)) {
-    workspaceRootFilesystem[pattern] ??= access;
+    if (workspaceRootFilesystem[pattern] !== undefined) {
+      continue;
+    }
+    if (isRestrictedInWorkspaceRootTable({ pattern, table: workspaceRootFilesystem })) {
+      logger?.warn(
+        `Skipping the default Codex CLI "${pattern}" = "${access}" carve-out: ".git" is covered by a broader workspace-relative deny or read-only rule, which the carve-out would reopen. To keep it, author read and edit allows for "${pattern}"; to silence this warning, set codexcli.git_write_rules to false.`,
+      );
+      continue;
+    }
+    workspaceRootFilesystem[pattern] = access;
   }
+}
+
+// Whether the most specific other entry of a `:workspace_roots` table that
+// covers `pattern` is restrictive (`deny` or `read`). Shared by generation
+// (applyDefaultGitWriteRules) and import so both reach the same decision.
+function isRestrictedInWorkspaceRootTable({
+  pattern,
+  table,
+}: {
+  pattern: string;
+  table: CodexFilesystemRuleTable;
+}): boolean {
+  const readRules: Record<string, PermissionAction> = {};
+  for (const [tablePattern, access] of Object.entries(table)) {
+    if (tablePattern === pattern) {
+      continue;
+    }
+    readRules[tablePattern] = access === "write" ? "allow" : "deny";
+  }
+  return isCoveredByReadRestriction({ pattern, readRules });
 }
 
 function convertCodexProfileToRulesync({
@@ -536,13 +673,21 @@ function convertCodexProfileToRulesync({
           // the shared canonical model (and other tools' outputs), and it is
           // re-added on every export anyway. Only the exact default
           // pattern/value pair is skipped — a customized value (e.g.
-          // `".git/**" = "read"`) imports normally.
+          // `".git/**" = "read"`) imports normally. So does the default pair
+          // when the rest of the table restricts `.git`: generation would not
+          // re-add it there, so it must have been authored by the user.
           if (
             pattern === CODEX_WORKSPACE_ROOTS_KEY &&
-            CODEX_GIT_WRITE_RULES[nestedPattern] === nestedAccess
+            CODEX_GIT_WRITE_RULES[nestedPattern] === nestedAccess &&
+            !isRestrictedInWorkspaceRootTable({ pattern: nestedPattern, table: access })
           ) {
             continue;
           }
+          // A `"."` table key (the workspace root itself) imports as the
+          // portable canonical `"."` pattern, not as the Codex-only
+          // `:workspace_roots` special path: other tools do not understand
+          // `:workspace_roots`, and generation already emits a direct
+          // `:workspace_roots` rule as this same `"."` entry.
           addRulesyncFilesystemRule(permission, nestedPattern, nestedAccess);
         }
       }
@@ -835,7 +980,172 @@ function addFilesystemRule({
     return;
   }
 
-  workspaceRootFilesystem[pattern] = access;
+  mergeIntoWorkspaceRootTable({ workspaceRootFilesystem, pattern, access });
+}
+
+const PERMISSION_ACTION_RESTRICTIVENESS: Record<PermissionAction, number> = {
+  deny: 2,
+  ask: 1,
+  allow: 0,
+};
+
+// Rewrite workspace-relative canonical patterns into the `:workspace_roots`
+// subpath form Codex accepts BEFORE the read/edit/write categories are
+// merged, so rules that differ only by a leading `./` (e.g. `read: "src/**"`
+// + `edit: "./src/**"`) meet on one key instead of silently shadowing each
+// other. Within one category, patterns that collapse onto the same key keep
+// the more restrictive action. Patterns Codex would reject (see
+// toWorkspaceRootSubpath) are dropped with a warning. Absolute, drive, `~`,
+// and special-path patterns are left untouched.
+function normalizeWorkspaceRelativeCategoryRules({
+  categoryRules,
+  logger,
+}: {
+  categoryRules: Partial<Record<"read" | "edit" | "write", Record<string, PermissionAction>>>;
+  logger?: ToolPermissionsFromRulesyncPermissionsParams["logger"];
+}): Partial<Record<"read" | "edit" | "write", Record<string, PermissionAction>>> {
+  const result: Partial<Record<"read" | "edit" | "write", Record<string, PermissionAction>>> = {};
+  for (const category of ["read", "edit", "write"] as const) {
+    const rules = categoryRules[category];
+    if (rules === undefined) {
+      continue;
+    }
+    const normalized: Record<string, PermissionAction> = {};
+    for (const [pattern, action] of Object.entries(rules)) {
+      const key =
+        pattern.trim() === "" || canBeCodexFilesystemRoot(pattern)
+          ? pattern
+          : toWorkspaceRootSubpath(pattern);
+      if (key === undefined) {
+        logger?.warn(
+          `Skipping Codex CLI ${category} filesystem entry for workspace-relative pattern "${pattern}": Codex rejects a ":workspace_roots" subpath containing a ".." segment or an empty leading segment and would refuse the whole config, so the rule is dropped entirely — even a deny — and the path is NOT protected by the generated profile. Use a normalized relative path instead.`,
+        );
+        continue;
+      }
+      const existing = normalized[key];
+      normalized[key] =
+        existing === undefined ||
+        PERMISSION_ACTION_RESTRICTIVENESS[action] > PERMISSION_ACTION_RESTRICTIVENESS[existing]
+          ? action
+          : existing;
+    }
+    result[category] = normalized;
+  }
+  return result;
+}
+
+// Codex's `relative_subpath` (codex-rs/core/src/config/permission_path.rs)
+// rejects a `:workspace_roots` subpath whose first segment is `""`, `.`, or
+// `..` (or that contains a `..` segment), and only the exact `"."` key is
+// special-cased as the workspace root itself. Leading `./` segments are
+// therefore stripped: `"./"` becomes `"."` and `"./src/**"` becomes
+// `"src/**"`. `"./**"` becomes `"."` rather than the bare glob `"**"`, which
+// Codex accepts only with `deny` access, while a trailing `/**` on the root
+// already means the whole workspace (Codex strips it to `"."`). Returns
+// `undefined` for a subpath Codex would reject: one with a `..` segment, or
+// with an empty leading segment after stripping (e.g. `.//src`, which must
+// never turn into the absolute `/src`).
+function toWorkspaceRootSubpath(pattern: string): string | undefined {
+  let subpath = pattern;
+  while (subpath.startsWith("./")) {
+    subpath = subpath.slice("./".length);
+  }
+  if (subpath === "" || (subpath === "**" && subpath !== pattern)) {
+    return CODEX_WORKSPACE_ROOT_SUBPATH;
+  }
+  if (subpath.startsWith("/") || subpath.split(/[\\/]/).some((segment) => segment === "..")) {
+    return undefined;
+  }
+  return subpath;
+}
+
+// Insert a `:workspace_roots` table entry. Distinct canonical patterns can
+// collapse onto the same emitted key (e.g. `"./src"` and `"src"`, or a direct
+// `:workspace_roots` rule and `"."`); the more restrictive access wins.
+function mergeIntoWorkspaceRootTable({
+  workspaceRootFilesystem,
+  pattern,
+  access,
+}: {
+  workspaceRootFilesystem: CodexFilesystemRuleTable;
+  pattern: string;
+  access: CodexFilesystemAccess;
+}): void {
+  const existing = workspaceRootFilesystem[pattern];
+  workspaceRootFilesystem[pattern] =
+    existing === undefined ? access : moreRestrictiveCodexAccess({ a: existing, b: access });
+}
+
+function normalizeCodexFilesystemAccess({
+  pattern,
+  access,
+  writeRestriction,
+  logger,
+}: {
+  pattern: string;
+  access: CodexFilesystemAccess;
+  writeRestriction?: "ask" | "deny";
+  logger?: ToolPermissionsFromRulesyncPermissionsParams["logger"];
+}): CodexFilesystemAccess | undefined {
+  if (isWindowsDevicePath(pattern) && !canBeCodexFilesystemRoot(pattern)) {
+    // On a non-Windows host the device path is not absolute, so it would land
+    // in the `:workspace_roots` table. Codex rejects it there under the
+    // Windows path convention (relative_subpath splits on `\`, leaving an
+    // empty first segment) and treats it as a meaningless literal file name
+    // under the POSIX convention, so no entry — not even a deny — can express
+    // it. Skip it entirely.
+    logger?.warn(
+      `Skipping Codex CLI ${access} filesystem entry for Windows device path "${pattern}": Codex cannot express it as a workspace-root entry (it is rejected on Windows and matches nothing elsewhere), so the rule is dropped entirely — even a deny — and the path is NOT protected by the generated profile. Use a plain drive path such as "C:\\..." instead.`,
+    );
+    return undefined;
+  }
+  if ((access === "read" || access === "write") && isWindowsDevicePath(pattern)) {
+    if (writeRestriction !== undefined) {
+      logger?.warn(
+        `Codex CLI does not support Windows device paths for read/write access: pattern "${pattern}" will be emitted as "deny" because its write-side ${writeRestriction} restriction cannot be represented as read-only access. Use a plain drive path such as "C:\\..." instead.`,
+      );
+      return "deny";
+    }
+    logger?.warn(
+      `Skipping unsupported Codex CLI ${access} filesystem entry for Windows device path "${pattern}"; the base permission profile remains in effect. Use a plain drive path such as "C:\\..." instead.`,
+    );
+    return undefined;
+  }
+  if ((access === "read" || access === "write") && hasUnsupportedCodexFilesystemGlob(pattern)) {
+    if (writeRestriction !== undefined) {
+      logger?.warn(
+        `Codex CLI only supports deny access for non-trailing filesystem globs: pattern "${pattern}" will be emitted as "deny" because its write-side ${writeRestriction} restriction cannot be represented as read-only access. Use an exact path or trailing "/**" for read/write access.`,
+      );
+      return "deny";
+    }
+    logger?.warn(
+      `Skipping unsupported Codex CLI ${access} filesystem glob "${pattern}"; the base permission profile remains in effect. Use an exact path or trailing "/**" for read/write access.`,
+    );
+    return undefined;
+  }
+  return access;
+}
+
+function hasCodexFilesystemGlob(pattern: string): boolean {
+  return (
+    pattern.includes("*") || pattern.includes("?") || pattern.includes("[") || pattern.includes("]")
+  );
+}
+
+// Windows device paths (`\\?\...`, `\\.\...`) cannot be emitted as grants:
+// Codex normalizes them only under the Windows path convention and rejects
+// them as workspace-root subpaths, while elsewhere their `?` counts as a glob
+// character. Rulesync cannot know the platform Codex runs on, so they are
+// treated as unsupported for read/write grants.
+function isWindowsDevicePath(pattern: string): boolean {
+  return pattern.startsWith("\\\\?\\") || pattern.startsWith("\\\\.\\");
+}
+
+function hasUnsupportedCodexFilesystemGlob(pattern: string): boolean {
+  const pathWithoutTrailingGlob = pattern.endsWith("/**")
+    ? pattern.slice(0, -"/**".length)
+    : pattern;
+  return hasCodexFilesystemGlob(pathWithoutTrailingGlob);
 }
 
 function canBeCodexFilesystemRoot(pattern: string): boolean {
@@ -862,7 +1172,13 @@ function addRulesyncFilesystemRule(
     permission.read ??= {};
     permission.read[pattern] = "allow";
   } else {
+    // Codex's `write` level includes read access, so it imports as both a
+    // read and an edit allow. Importing the edit side alone would leave the
+    // read side unspecified, and a broader read deny (e.g. `:root = "deny"`)
+    // would then turn the path into `deny` on regenerate.
+    permission.read ??= {};
     permission.edit ??= {};
+    permission.read[pattern] = "allow";
     permission.edit[pattern] = "allow";
   }
 }
@@ -910,6 +1226,7 @@ function computeCodexcliOverridePatch({
       continue;
     }
     if (value === undefined) continue;
+    if (key === "approval_policy" && !isWritableApprovalPolicy({ value, logger })) continue;
     if (key === "sandbox_mode" || key === "sandbox_workspace_write") {
       logger?.warn(
         `Codex CLI permission override key "${key}" is deprecated. Codex prioritizes the legacy sandbox settings over permission profiles when both are present, so it disables the generated "${RULESYNC_PROFILE_NAME}" permissions profile. Use "base_permission_profile" and the shared "permission" block instead.`,
@@ -920,20 +1237,70 @@ function computeCodexcliOverridePatch({
       isPlainObject(existingValue) && isPlainObject(value) ? { ...existingValue, ...value } : value;
   }
 
-  // Defaults for keys rulesync recommends always pinning. The override wins,
-  // then an existing user-set value in config.toml; the default fills the key
-  // only when both are absent (the gateway preserves existing keys that are
-  // not in the patch, so leaving them out of the patch keeps user values).
+  fillCodexcliDefaults({ existing, patch, logger });
+  return patch;
+}
+
+// Defaults for keys rulesync recommends always pinning. The override wins,
+// then an existing user-set value in config.toml; the default fills the key
+// only when both are absent (the gateway preserves existing keys that are
+// not in the patch, so leaving them out of the patch keeps user values).
+// The one existing value that is not kept is the retired `approval_policy =
+// "untrusted"` — typically left behind by an earlier rulesync run that still
+// wrote it — because preserving it keeps producing a config.toml Codex
+// refuses to start with; it is replaced by the default, with a warning.
+function fillCodexcliDefaults({
+  existing,
+  patch,
+  logger,
+}: {
+  existing: UnknownTable;
+  patch: Record<string, unknown>;
+  logger?: ToolPermissionsFromRulesyncPermissionsParams["logger"];
+}): void {
   const defaults: Record<string, string> = {
     approval_policy: CODEX_DEFAULT_APPROVAL_POLICY,
     approvals_reviewer: CODEX_DEFAULT_APPROVALS_REVIEWER,
   };
   for (const [key, value] of Object.entries(defaults)) {
-    if (patch[key] === undefined && existing[key] === undefined) {
+    if (patch[key] !== undefined) continue;
+    if (existing[key] === undefined) {
+      patch[key] = value;
+      continue;
+    }
+    if (key === "approval_policy" && existing[key] === CODEX_RETIRED_APPROVAL_POLICY) {
+      logger?.warn(
+        `The existing Codex CLI config.toml sets approval_policy = "${CODEX_RETIRED_APPROVAL_POLICY}", which was retired in Codex 0.149.0 and makes Codex refuse to start, so it was replaced with "${value}". To keep the strict behavior, mark the project untrusted in your user config instead ([projects."<path>"] trust_level = "${CODEX_RETIRED_APPROVAL_POLICY}").`,
+      );
       patch[key] = value;
     }
   }
-  return patch;
+}
+
+// Whether an authored `approval_policy` may be written. The retired
+// `untrusted` never is: writing it would produce a config.toml Codex rejects
+// at startup, so the key is left to the existing value or the default instead
+// — the same outcome as the "remove this setting" migration Codex asks for.
+// The deprecated `on-failure` alias is still written, with a warning.
+function isWritableApprovalPolicy({
+  value,
+  logger,
+}: {
+  value: unknown;
+  logger?: ToolPermissionsFromRulesyncPermissionsParams["logger"];
+}): boolean {
+  if (value === CODEX_RETIRED_APPROVAL_POLICY) {
+    logger?.warn(
+      `Codex CLI permission override "approval_policy": "${CODEX_RETIRED_APPROVAL_POLICY}" was retired in Codex 0.149.0 and makes Codex refuse to start, so it was not written. Remove it from the override; to keep the strict behavior, mark the project untrusted in your user config instead ([projects."<path>"] trust_level = "${CODEX_RETIRED_APPROVAL_POLICY}").`,
+    );
+    return false;
+  }
+  if (value === CODEX_DEPRECATED_APPROVAL_POLICY) {
+    logger?.warn(
+      `Codex CLI permission override "approval_policy": "${CODEX_DEPRECATED_APPROVAL_POLICY}" is deprecated; Codex reads it as "${CODEX_DEFAULT_APPROVAL_POLICY}". Use "${CODEX_DEFAULT_APPROVAL_POLICY}" instead.`,
+    );
+  }
+  return true;
 }
 
 // Lift the whitelisted top-level keys back into the `codexcli` override so they
@@ -1027,9 +1394,18 @@ function mapReadAction(action: PermissionAction): "read" | "deny" {
   return action === "allow" ? "read" : "deny";
 }
 
-function mapWriteAction(action: PermissionAction): "write" | "deny" {
-  return action === "allow" ? "write" : "deny";
+function mapWriteAction(action: PermissionAction): "write" | "read" {
+  return action === "allow" ? "write" : "read";
 }
+
+type MergedCodexFilesystemRule = {
+  pattern: string;
+  access: "read" | "write" | "deny";
+  writeRestriction?: "ask" | "deny";
+  // True when no canonical `read` rule exists for this exact pattern, i.e. the
+  // Codex `"read"` level was derived from the write side alone.
+  readUnspecified?: boolean;
+};
 
 /**
  * Merge the canonical read/edit/write category rules into one Codex access
@@ -1039,19 +1415,32 @@ function mapWriteAction(action: PermissionAction): "write" | "deny" {
  * - `edit` and `write` collapse onto Codex's write side; when both carry the
  *   same pattern, the more restrictive action wins (`deny` > `ask` > `allow`).
  * - `read: allow` + write-side `allow` → `"write"`.
- * - `read: allow` + write-side non-allow → `"read"` (readable but not
- *   writable — exactly what Codex's `"read"` level expresses).
- * - `read` non-allow → `"deny"` regardless of the write side; a contradictory
- *   write-side `allow` (unreadable but writable is not expressible in Codex)
- *   is warned about.
+ * - A write-side non-allow → `"read"` (readable but not writable — exactly
+ *   what Codex's `"read"` level expresses). An `ask` action is approximated
+ *   this way because Codex has no path-level write approval.
+ * - A write-side-only rule (no `read` rule for the same pattern) whose path
+ *   is covered by a broader `read` deny/ask rule (e.g. `X/**` covering
+ *   `X/id_rsa`, or `:root`) → `"deny"`, for a write-side `allow` too (with a
+ *   warning). Codex resolves the most specific path, so emitting `"read"` or
+ *   `"write"` there would re-open reads the user denied. Only the most
+ *   specific covering read rule counts: a narrower `read: allow` between the
+ *   broad deny and the path keeps the path readable.
+ * - A `read` non-allow on the same pattern → `"deny"` regardless of the
+ *   write side; a contradictory write-side `allow` (unreadable but writable
+ *   is not expressible in Codex) is warned about.
  * - Single-category patterns keep the existing mapReadAction/mapWriteAction
  *   mappings.
  *
  * Iteration order is read → edit → write with first-seen pattern order, so
  * the emitted table is stable regardless of the authored category order.
  * Note the merge is one-way: `"{path}" = "read"` imports back as
- * `read: allow` only (the explicit write-side deny is implied by Codex's
- * access level and not re-materialized).
+ * `read: allow` only. The write-side restriction is implied by Codex's access
+ * level and not re-materialized, so both `read: allow` + write-side
+ * `ask`/`deny` and a write-side-only `ask`/`deny` (e.g. `edit: { "/x/**":
+ * "deny" }` with no `read` rule) lose their write restriction on
+ * `rulesync import`. This is deliberate: importing `"read"` as an extra
+ * `edit: deny` would push a restriction to every other tool that the Codex
+ * profile alone cannot prove was authored.
  */
 function mergeFilesystemCategoryRules({
   categoryRules,
@@ -1059,27 +1448,9 @@ function mergeFilesystemCategoryRules({
 }: {
   categoryRules: Partial<Record<"read" | "edit" | "write", Record<string, PermissionAction>>>;
   logger?: ToolPermissionsFromRulesyncPermissionsParams["logger"];
-}): Array<[string, "read" | "write" | "deny"]> {
+}): MergedCodexFilesystemRule[] {
   const readRules = categoryRules.read ?? {};
-  const writeSideRestrictiveness: Record<PermissionAction, number> = {
-    deny: 2,
-    ask: 1,
-    allow: 0,
-  };
-
-  // Collapse edit/write onto Codex's single write side, restrictive-wins.
-  const writeSideRules: Record<string, PermissionAction> = {};
-  for (const category of ["edit", "write"] as const) {
-    for (const [pattern, action] of Object.entries(categoryRules[category] ?? {})) {
-      const existing = writeSideRules[pattern];
-      if (
-        existing === undefined ||
-        writeSideRestrictiveness[action] > writeSideRestrictiveness[existing]
-      ) {
-        writeSideRules[pattern] = action;
-      }
-    }
-  }
+  const writeSideRules = collapseWriteSideRules(categoryRules);
 
   const patterns: string[] = [];
   const seen = new Set<string>();
@@ -1090,37 +1461,268 @@ function mergeFilesystemCategoryRules({
     }
   }
 
-  const merged: Array<[string, "read" | "write" | "deny"]> = [];
+  const merged: MergedCodexFilesystemRule[] = [];
   for (const pattern of patterns) {
     const readAction = readRules[pattern];
     const writeAction = writeSideRules[pattern];
 
-    if (readAction === undefined) {
-      merged.push([pattern, mapWriteAction(writeAction as PermissionAction)]);
-      continue;
-    }
     if (writeAction === undefined) {
-      merged.push([pattern, mapReadAction(readAction)]);
+      merged.push({ pattern, access: mapReadAction(readAction as PermissionAction) });
       continue;
     }
 
-    if (readAction === "allow") {
-      merged.push([pattern, writeAction === "allow" ? "write" : "read"]);
+    if (readAction !== undefined && readAction !== "allow") {
+      if (writeAction === "allow") {
+        logger?.warn(
+          `Codex CLI cannot express "writable but not readable": pattern "${pattern}" has read: ${readAction} and a write-side allow. Emitting "deny".`,
+        );
+      }
+      merged.push({ pattern, access: "deny" });
       continue;
     }
 
-    if (writeAction === "allow") {
-      logger?.warn(
-        `Codex CLI cannot express "writable but not readable": pattern "${pattern}" has read: ${readAction} and a write-side allow. Emitting "deny".`,
-      );
+    // Here the read side is either an explicit `allow` or unspecified.
+    const writeRestriction = writeAction === "allow" ? undefined : writeAction;
+    const readUnspecified = readAction === undefined;
+    if (readUnspecified && isCoveredByReadRestriction({ pattern, readRules })) {
+      // A broader read deny/ask covers this path; a more-specific `"read"` or
+      // `"write"` entry would override it in Codex, so keep the path fully
+      // denied.
+      if (writeRestriction === undefined) {
+        logger?.warn(
+          `Codex CLI cannot express "writable but not readable": pattern "${pattern}" has a write-side allow but is covered by a broader read deny/ask rule. Emitting "deny".`,
+        );
+      }
+      merged.push({ pattern, access: "deny" });
+      continue;
     }
-    merged.push([pattern, "deny"]);
+
+    merged.push({
+      pattern,
+      access: mapWriteAction(writeAction),
+      ...(writeRestriction !== undefined ? { writeRestriction } : {}),
+      ...(readUnspecified ? { readUnspecified } : {}),
+    });
   }
   return merged;
 }
 
-function buildCodexBashRulesContent(config: PermissionsConfig): string {
-  const bashRules = config.permission.bash ?? {};
+// Collapse edit/write onto Codex's single write side, restrictive-wins.
+function collapseWriteSideRules(
+  categoryRules: Partial<Record<"read" | "edit" | "write", Record<string, PermissionAction>>>,
+): Record<string, PermissionAction> {
+  const writeSideRules: Record<string, PermissionAction> = {};
+  for (const category of ["edit", "write"] as const) {
+    for (const [pattern, action] of Object.entries(categoryRules[category] ?? {})) {
+      const existing = writeSideRules[pattern];
+      if (
+        existing === undefined ||
+        PERMISSION_ACTION_RESTRICTIVENESS[action] > PERMISSION_ACTION_RESTRICTIVENESS[existing]
+      ) {
+        writeSideRules[pattern] = action;
+      }
+    }
+  }
+  return writeSideRules;
+}
+
+// Whether the most specific canonical `read` rule (other than `pattern`
+// itself) that covers `pattern` is a deny/ask. Codex applies a path entry to
+// its whole subtree and resolves the most specific entry, so a narrower
+// `read: allow` between a broad deny and `pattern` keeps `pattern` readable.
+//
+// Covering forms:
+// - `:root` and `/**` are treated conservatively as covering every pattern.
+// - `**`, `.`, `./**`, and `:workspace_roots` cover every workspace-relative
+//   pattern (`:workspace_roots` is emitted as its `"."` table entry when
+//   workspace-relative rules exist).
+// - An exact path `X` or `X/**` covers `X` and everything below it, but only
+//   when both are the same kind of path (both absolute/drive-root/`~`, or
+//   both workspace-relative). Leading `./` segments are ignored, and for
+//   Windows drive paths (`C:\...`) a backslash is treated as a separator and
+//   the drive letter is compared case-insensitively.
+//
+// Deliberately not matched (a generic warning is still logged for a
+// write-side deny mapped to `"read"`): `~/...` versus the equivalent absolute
+// path (Codex expands `~` on the machine it runs on, which rulesync cannot
+// know), other special paths such as `:tmpdir`, and non-trailing globs such as
+// `**/*.pem`, whose semantics could not be verified against Codex's resolver.
+// Ties between equally specific rules resolve to the restrictive action.
+function isCoveredByReadRestriction({
+  pattern,
+  readRules,
+}: {
+  pattern: string;
+  readRules: Record<string, PermissionAction>;
+}): boolean {
+  const key = normalizeCoverageKey(pattern);
+  const isWorkspaceRelative = !canBeCodexFilesystemRoot(pattern);
+  const keyHasDotSegment = hasDotPathSegment(pattern);
+  let best: { specificity: number; restrictive: boolean } | undefined;
+  for (const [readPattern, action] of Object.entries(readRules)) {
+    if (readPattern === pattern) {
+      continue;
+    }
+    const specificity = coverageSpecificity({ readPattern, key, isWorkspaceRelative });
+    if (specificity === undefined) {
+      continue;
+    }
+    const restrictive = action !== "allow";
+    // A read allow that Codex never receives (it is skipped as an unsupported
+    // glob or device-path grant) cannot override a broader deny.
+    if (!restrictive && isSkippedCodexGrant(readPattern)) {
+      continue;
+    }
+    // Coverage is matched by literal prefix, while Codex lexically resolves
+    // `.`/`..` segments (e.g. `/home/me/public/../.ssh/id_rsa` is really
+    // `/home/me/.ssh/id_rsa`). When either side has such a segment, a
+    // narrower allow may only look like it covers the key, so it never wins;
+    // restrictive rules still cover.
+    if (!restrictive && (keyHasDotSegment || hasDotPathSegment(readPattern))) {
+      continue;
+    }
+    if (
+      best === undefined ||
+      specificity > best.specificity ||
+      (specificity === best.specificity && restrictive)
+    ) {
+      best = { specificity, restrictive };
+    }
+  }
+  return best?.restrictive ?? false;
+}
+
+// How specifically `readPattern` covers the normalized `key`, or `undefined`
+// when it does not cover it. Larger values are more specific.
+function coverageSpecificity({
+  readPattern,
+  key,
+  isWorkspaceRelative,
+}: {
+  readPattern: string;
+  key: string;
+  isWorkspaceRelative: boolean;
+}): number | undefined {
+  if (readPattern === ":root" || readPattern === "/**") {
+    return 0;
+  }
+  if (readPattern === CODEX_WORKSPACE_ROOTS_KEY) {
+    return isWorkspaceRelative ? 1 : undefined;
+  }
+  // A path pattern only covers a key of the same kind: an absolute/drive-root
+  // pattern never covers a workspace-relative key and vice versa (e.g. the
+  // relative `C:` must not cover the drive path `C:\secret\k`).
+  if (canBeCodexFilesystemRoot(readPattern) === isWorkspaceRelative) {
+    return undefined;
+  }
+  const normalized = normalizeCoverageKey(readPattern);
+  if (normalized === "**" || normalized === ".") {
+    return isWorkspaceRelative ? 1 : undefined;
+  }
+  const withoutTrailingGlob = normalized.endsWith("/**")
+    ? normalized.slice(0, -"/**".length)
+    : normalized;
+  if (withoutTrailingGlob.startsWith(":") || hasCodexFilesystemGlob(withoutTrailingGlob)) {
+    return undefined;
+  }
+  const base = stripTrailingSlash(withoutTrailingGlob);
+  if (base === "") {
+    return undefined;
+  }
+  const covers = key === base || key.startsWith(base.endsWith("/") ? base : `${base}/`);
+  return covers ? 2 + base.length : undefined;
+}
+
+// Normalize a pattern for coverage comparison only (emitted keys are never
+// rewritten): toCoverageForm, then, for absolute, drive, and `~` paths,
+// lexically resolve `.`/`..` segments the way Codex does, so
+// `/home/me/public/../.ssh/id_rsa` is compared as `/home/me/.ssh/id_rsa`.
+function normalizeCoverageKey(pattern: string): string {
+  const form = toCoverageForm(pattern);
+  return canBeCodexFilesystemRoot(pattern) && !pattern.startsWith(":")
+    ? resolveDotSegments(form)
+    : form;
+}
+
+// Lexically resolve `.` and `..` segments of a `/`-separated absolute, drive
+// (`c:/...`), or `~` path. The first segment is the anchor (`""` for `/`,
+// `c:`, or `~`); `..` never climbs above `/` or a drive root, and a `..`
+// above `~` is kept because the home directory's parent is unknown here.
+function resolveDotSegments(path: string): string {
+  const [anchor = "", ...rest] = path.split("/");
+  const stack: string[] = [];
+  for (const segment of rest) {
+    if (segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      if (stack.length > 0 && stack[stack.length - 1] !== "..") {
+        stack.pop();
+      } else if (anchor === "~") {
+        stack.push(segment);
+      }
+      continue;
+    }
+    stack.push(segment);
+  }
+  const resolved = [anchor, ...stack].join("/");
+  return resolved === "" ? "/" : stripTrailingSlash(resolved);
+}
+
+// Drop every leading `./` and a trailing slash (the workspace root itself
+// becomes `.`, and `./**` becomes `**`), and for Windows drive paths lowercase
+// the drive letter and use `/` as the separator. Dot segments are kept.
+function toCoverageForm(pattern: string): string {
+  let normalized = /^[A-Za-z]:[\\/]/.test(pattern)
+    ? `${pattern.charAt(0).toLowerCase()}${pattern.slice(1).replaceAll("\\", "/")}`
+    : pattern;
+  while (normalized.startsWith("./")) {
+    normalized = normalized.slice("./".length);
+  }
+  normalized = stripTrailingSlash(normalized);
+  // Only a `./`-prefixed pattern collapses to the workspace root; a genuinely
+  // empty pattern stays empty and covers nothing.
+  return normalized === "" && pattern !== "" ? "." : normalized;
+}
+
+// Whether a pattern (in coverage form, before dot-segment resolution)
+// contains a `.` or `..` path segment. The bare workspace root `.` itself is
+// not a dot segment.
+function hasDotPathSegment(pattern: string): boolean {
+  const form = toCoverageForm(pattern);
+  if (form === ".") {
+    return false;
+  }
+  return form.split(/[\\/]/).some((segment) => segment === "." || segment === "..");
+}
+
+function isSkippedCodexGrant(pattern: string): boolean {
+  return isWindowsDevicePath(pattern) || hasUnsupportedCodexFilesystemGlob(pattern);
+}
+
+function moreRestrictiveCodexAccess({
+  a,
+  b,
+}: {
+  a: CodexFilesystemAccess;
+  b: CodexFilesystemAccess;
+}): CodexFilesystemAccess {
+  const rank: Record<CodexFilesystemAccess, number> = { deny: 0, none: 0, read: 1, write: 2 };
+  return rank[a] <= rank[b] ? a : b;
+}
+
+function stripTrailingSlash(pattern: string): string {
+  return pattern.length > 1 && pattern.endsWith("/") ? pattern.slice(0, -1) : pattern;
+}
+
+function buildCodexBashRulesContent({
+  config,
+  logger,
+}: {
+  config: PermissionsConfig;
+  logger?: Logger;
+}): string {
+  const bashRules = bashRulesHonoringAllTools(config.permission);
   const entries = Object.entries(bashRules);
 
   const header = [
@@ -1133,8 +1735,8 @@ function buildCodexBashRulesContent(config: PermissionsConfig): string {
 
   const ruleBlocks = entries
     .map(([pattern, action]) => {
-      const tokens = toCommandPatternTokens(pattern);
-      if (tokens.length === 0) {
+      const tokens = toCodexPrefixRuleTokens({ commandPattern: pattern, action, logger });
+      if (tokens === null) {
         return null;
       }
 
@@ -1142,7 +1744,8 @@ function buildCodexBashRulesContent(config: PermissionsConfig): string {
       const decision = mapBashActionToDecision(action);
       return [
         "",
-        `# ${pattern}`,
+        // A line break in the key would end the comment and let the rest run as rule code.
+        `# ${pattern.replace(/[\r\n\u2028\u2029]+/g, " ")}`,
         "prefix_rule(",
         `    pattern = [${serializedTokens}],`,
         `    decision = ${JSON.stringify(decision)},`,
@@ -1159,12 +1762,77 @@ function buildCodexBashRulesContent(config: PermissionsConfig): string {
   return [...header, ...ruleBlocks].join("\n");
 }
 
-function toCommandPatternTokens(commandPattern: string): string[] {
-  return commandPattern
-    .trim()
-    .split(/\s+/)
-    .map((token) => token.trim())
-    .filter((token) => token.length > 0);
+/**
+ * Turn a canonical bash pattern into the `pattern` of a Codex `prefix_rule`,
+ * or `null` when Codex cannot express it.
+ *
+ * Each element of a Codex pattern is a literal token (or a list of literal
+ * alternatives), and the rule matches any command that starts with those
+ * tokens. Glob characters are therefore not wildcards there: `["sudo", "*"]`
+ * only matches the command `sudo *` typed literally, so a `sudo *` deny would
+ * block nothing.
+ *
+ * A trailing standalone `*` word says "anything after this", which is exactly
+ * what a prefix rule already means, so it is dropped: `sudo *` becomes
+ * `["sudo"]`. That holds for allow, ask and deny alike. The prefix rule also
+ * matches the bare command (`sudo` with no arguments), as the Letta Code and
+ * Tabnine adapters' `<prefix> *` translations do. Any other wildcard
+ * (`npm install*`, `git * --no-verify`) has no prefix-rule equivalent. Cutting
+ * the pattern down to the tokens before it would widen the rule — a deny on
+ * `npm install*` would block every `npm` command, an allow would approve
+ * them all — so the pattern is skipped with a warning instead.
+ *
+ * Wildcards are recognized with rulesync's own glob grammar, so a lone `[`
+ * (the `test` command) stays a literal token.
+ * @see https://developers.openai.com/codex/rules
+ */
+function toCodexPrefixRuleTokens({
+  commandPattern,
+  action,
+  logger,
+}: {
+  commandPattern: string;
+  action: PermissionAction;
+  logger?: Logger;
+}): string[] | null {
+  // A legacy `git:*` spells "any arguments" on the last word, the same as
+  // `git *` (see the deepagents adapter).
+  const normalized = commandPattern.trim().replace(/(?<=\S):\*$/, " *");
+  if (normalized.length === 0) {
+    return null;
+  }
+
+  // A pattern of only wildcard words (`*`, `* *`, or the legacy `*:*`) covers
+  // every command. A prefix rule needs at least one token, so Codex rules
+  // cannot say "every command"; the approval policy can.
+  if (/^\*+(\s+\*+)*$/.test(normalized)) {
+    warnWithFallback(
+      logger,
+      `Skipping Codex CLI bash rule "${commandPattern}" (${action}): it matches every command, which a Codex prefix_rule cannot express, so no rule is written for it. Set codexcli.approval_policy to control how Codex approves commands in general.`,
+    );
+    return null;
+  }
+
+  // Only one trailing wildcard word is dropped: `docker * *` needs at least two
+  // more words, which a prefix rule cannot require, so it falls through to the
+  // skip below instead of becoming a rule for every `docker` command.
+  const rest = normalized.replace(/\s+\*+$/, "");
+
+  // Check the whole remainder, not word by word: a class such as `git[ ]status`
+  // spans the space the words are split on.
+  if (hasCommandGlob(rest)) {
+    warnWithFallback(
+      logger,
+      `Skipping Codex CLI bash rule "${commandPattern}" (${action}): Codex prefix_rule patterns are literal tokens, so only a trailing standalone "*" can be translated. The rule is dropped entirely — even a deny — and Codex does NOT enforce it. Rewrite it as literal words, optionally followed by " *".`,
+    );
+    return null;
+  }
+
+  return rest.split(/\s+/);
+}
+
+function hasCommandGlob(token: string): boolean {
+  return parseGlobPattern(token).steps.some((step) => step.kind !== "literal");
 }
 
 function mapBashActionToDecision(action: PermissionAction): "allow" | "prompt" | "forbidden" {

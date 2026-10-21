@@ -4,6 +4,32 @@ import { parseSource } from "./source-parser.js";
 
 describe("parseSource", () => {
   describe("GitHub URL parsing", () => {
+    it.each([
+      ["main/shared%20rules", "main", "shared rules"],
+      ["main/%E8%A7%84%E5%88%99", "main", "规则"],
+      // cspell:ignore Frules
+      ["feature%2Frules/shared%23rules", "feature/rules", "shared#rules"],
+      ["main/shared%2520rules", "main", "shared%20rules"],
+    ])("should decode URL components once in %s", (suffix, ref, path) => {
+      expect(parseSource(`https://github.com/owner/repo/tree/${suffix}`)).toEqual({
+        provider: "github",
+        owner: "owner",
+        repo: "repo",
+        ref,
+        path,
+      });
+    });
+
+    it("should decode blob URLs with literal percent signs", () => {
+      expect(parseSource("https://github.com/owner/repo/blob/main/100%25/rules.md")).toEqual({
+        provider: "github",
+        owner: "owner",
+        repo: "repo",
+        ref: "main",
+        path: "100%/rules.md",
+      });
+    });
+
     it("should parse basic GitHub URL", () => {
       const result = parseSource("https://github.com/owner/repo");
       expect(result).toEqual({
@@ -66,6 +92,41 @@ describe("parseSource", () => {
 
     it("should throw error for invalid GitHub URL", () => {
       expect(() => parseSource("https://github.com/owner")).toThrow(/Invalid github URL/);
+    });
+
+    it("should reject malformed percent-encoding with a descriptive error", () => {
+      expect(() => parseSource("https://github.com/o/r/tree/main/100%/rules")).toThrow(
+        "Invalid github URL: https://github.com/o/r/tree/main/100%/rules. Malformed percent-encoding in ref or path.",
+      );
+    });
+
+    it("should reject malformed percent-encoding in the ref", () => {
+      expect(() => parseSource("https://github.com/o/r/tree/100%/rules")).toThrow(
+        /Malformed percent-encoding in ref or path/,
+      );
+    });
+
+    it.each([
+      "tree/main/..%2Fx",
+      "tree/main/rules/..%2F..%2Fx",
+      "tree/main/rules%2F..%2Fx",
+      "tree/main/%2E%2E%2Fx",
+      "tree/main/..%5Cx",
+      "blob/main/..%2Fx",
+    ])("should reject a decoded path with a '..' segment in %s", (suffix) => {
+      expect(() => parseSource(`https://github.com/o/r/${suffix}`)).toThrow(
+        /Path must not contain "\.\." segments/,
+      );
+    });
+
+    it("should accept path segments that only contain '..' as part of a name", () => {
+      expect(parseSource("https://github.com/o/r/tree/main/a..b/c..")).toEqual({
+        provider: "github",
+        owner: "o",
+        repo: "r",
+        ref: "main",
+        path: "a..b/c..",
+      });
     });
   });
 

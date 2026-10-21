@@ -14,6 +14,7 @@ import {
   GitHubReleaseSchema,
   GitHubRepoInfoSchema,
 } from "../types/fetch.js";
+import { quoteForLog, stripControlCharacters } from "../utils/control-characters.js";
 import { formatError } from "../utils/error.js";
 import type { Logger } from "../utils/logger.js";
 
@@ -140,7 +141,7 @@ export class GitHubClient {
 
       // API returns single object for files, array for directories
       if (!Array.isArray(data)) {
-        throw new GitHubClientError(`Path "${path}" is not a directory`);
+        throw new GitHubClientError(`Path ${quoteForLog(path)} is not a directory`);
       }
 
       const entries: GitHubFileEntry[] = [];
@@ -157,6 +158,38 @@ export class GitHubClient {
         options?.onIncompleteListing?.();
       }
       return entries;
+    } catch (error) {
+      throw this.handleError(error);
+    }
+  }
+
+  /**
+   * The paths a tree records as executable (git mode `100755`). The contents
+   * API says nothing about a file's mode, so a script fetched through it
+   * lands without its executable bit; one tree listing per fetch supplies
+   * the bit for every file at once. `truncated` is the API's own flag: a
+   * tree past its size limit is returned in part, and a path it left out
+   * is indistinguishable from a plain file.
+   */
+  async listExecutablePaths(
+    owner: string,
+    repo: string,
+    ref: string,
+  ): Promise<{ paths: Set<string>; truncated: boolean }> {
+    try {
+      const { data } = await this.octokit.git.getTree({
+        owner,
+        repo,
+        tree_sha: ref,
+        recursive: "1",
+      });
+      const paths = new Set<string>();
+      for (const entry of data.tree) {
+        if (entry.type === "blob" && entry.mode === "100755" && typeof entry.path === "string") {
+          paths.add(entry.path);
+        }
+      }
+      return { paths, truncated: data.truncated === true };
     } catch (error) {
       throw this.handleError(error);
     }
@@ -222,7 +255,9 @@ export class GitHubClient {
 
       if (parsed.data.size > MAX_FILE_SIZE) {
         throw new GitHubClientError(
-          `File "${path}" exceeds maximum size limit of ${MAX_FILE_SIZE / 1024 / 1024}MB`,
+          // `path` names a file in the remote repository, so it is stripped
+          // and quoted before it reaches a terminal.
+          `File ${quoteForLog(path)} exceeds maximum size limit of ${MAX_FILE_SIZE / 1024 / 1024}MB`,
         );
       }
 
@@ -370,7 +405,10 @@ export class GitHubClient {
    * Get human-readable error message for HTTP status codes
    */
   private getErrorMessage(statusCode: number, apiError?: GitHubApiError): string {
-    const baseMessage = apiError?.message ?? `HTTP ${statusCode}`;
+    // The message comes from the API, which relays text the repository owner
+    // wrote, so it reaches the terminal stripped of anything that could forge a
+    // line around it.
+    const baseMessage = stripControlCharacters(apiError?.message ?? `HTTP ${statusCode}`);
 
     switch (statusCode) {
       case 401:

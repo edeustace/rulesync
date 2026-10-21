@@ -1,9 +1,16 @@
+import type { KeyOperation } from "../lib/orphan-sweep.js";
+
 /**
  * Result of writing AI files, including both count and file paths
  */
 export type WriteResult = {
   count: number;
   paths: string[];
+  /**
+   * The owned top-level keys the writes of shared config files add, change or
+   * remove; absent when no write touched such a key.
+   */
+  keyOperations?: KeyOperation[];
 };
 
 /**
@@ -34,6 +41,7 @@ export type CountableResult = {
   permissionsCount: number;
   checksCount: number;
   activationCount?: number;
+  pluginManifestCount?: number;
 };
 
 /**
@@ -50,6 +58,7 @@ export function calculateTotalCount(result: CountableResult): number {
     result.hooksCount +
     result.permissionsCount +
     result.checksCount +
-    (result.activationCount ?? 0)
+    (result.activationCount ?? 0) +
+    (result.pluginManifestCount ?? 0)
   );
 }

@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { SKILL_FILE_NAME } from "../../constants/general.js";
 import { RULESYNC_SKILLS_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
+import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
 import { RulesyncSkill } from "./rulesync-skill.js";
@@ -87,6 +88,56 @@ describe("VibeSkill", () => {
     expect(vibeSkill.getBody()).toBe("Review the diff.");
   });
 
+  describe("reserved built-in skill names", () => {
+    // Vibe's SkillManager skips a project or user skill named like one of its
+    // built-ins (`vibe`, `skill-creator`) with only a debug log, so the
+    // generate side warns instead of letting the skill vanish silently.
+    it.each(["vibe", "skill-creator"])(
+      "should warn and still generate a skill named %s",
+      (name) => {
+        const logger = createMockLogger();
+        const rulesyncSkill = new RulesyncSkill({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+          dirName: name,
+          frontmatter: { name, description: "Collides with a built-in", targets: ["vibe"] },
+          body: "Body.",
+          validate: true,
+        });
+
+        const vibeSkill = VibeSkill.fromRulesyncSkill({
+          outputRoot: testDir,
+          rulesyncSkill,
+          logger,
+        });
+
+        expect(vibeSkill.getFrontmatter().name).toBe(name);
+        expect(logger.warn).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringMatching(
+            new RegExp(`^Vibe skills: the skill name "${name}" is reserved for a Vibe built-in`),
+          ),
+        );
+      },
+    );
+
+    it("should not warn for any other skill name", () => {
+      const logger = createMockLogger();
+      const rulesyncSkill = new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "vibe-check",
+        frontmatter: { name: "vibe-check", description: "Not reserved", targets: ["vibe"] },
+        body: "Body.",
+        validate: true,
+      });
+
+      VibeSkill.fromRulesyncSkill({ outputRoot: testDir, rulesyncSkill, logger });
+
+      expect(logger.warn).not.toHaveBeenCalled();
+    });
+  });
+
   it("should import a Vibe skill into rulesync with a vibe metadata section", () => {
     const vibeSkill = new VibeSkill({
       outputRoot: testDir,
@@ -115,6 +166,63 @@ describe("VibeSkill", () => {
         "allowed-tools": ["read_file"],
       },
     });
+  });
+
+  it("should fall back to the root-level license/compatibility/metadata when the vibe section omits them", () => {
+    const rulesyncSkill = new RulesyncSkill({
+      outputRoot: testDir,
+      relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+      dirName: "root-fields",
+      frontmatter: {
+        name: "root-fields",
+        description: "Root-level standard fields",
+        targets: ["vibe"],
+        license: "MIT",
+        compatibility: "Requires git",
+        metadata: { author: "root" },
+      },
+      body: "Body",
+    });
+
+    const frontmatter = VibeSkill.fromRulesyncSkill({
+      outputRoot: testDir,
+      rulesyncSkill,
+    }).getFrontmatter();
+
+    expect(frontmatter.license).toBe("MIT");
+    expect(frontmatter.compatibility).toBe("Requires git");
+    expect(frontmatter.metadata).toEqual({ author: "root" });
+  });
+
+  it("should let the vibe section override the root-level license/compatibility/metadata", () => {
+    const rulesyncSkill = new RulesyncSkill({
+      outputRoot: testDir,
+      relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+      dirName: "section-wins",
+      frontmatter: {
+        name: "section-wins",
+        description: "Section overrides the root-level fields",
+        targets: ["vibe"],
+        license: "MIT",
+        compatibility: "Requires git",
+        metadata: { author: "root" },
+        vibe: {
+          license: "Apache-2.0",
+          compatibility: { vibe: ">=1.0.0" },
+          metadata: { author: "section" },
+        },
+      },
+      body: "Body",
+    });
+
+    const frontmatter = VibeSkill.fromRulesyncSkill({
+      outputRoot: testDir,
+      rulesyncSkill,
+    }).getFrontmatter();
+
+    expect(frontmatter.license).toBe("Apache-2.0");
+    expect(frontmatter.compatibility).toEqual({ vibe: ">=1.0.0" });
+    expect(frontmatter.metadata).toEqual({ author: "section" });
   });
 
   it("should pick up root-level user-invocable when vibe section omits it", () => {
@@ -162,6 +270,90 @@ describe("VibeSkill", () => {
     });
 
     expect(vibeSkill.getFrontmatter()["user-invocable"]).toBe(false);
+  });
+
+  describe("disable-model-invocation", () => {
+    const buildRulesyncSkill = (frontmatter: Record<string, unknown>) =>
+      new RulesyncSkill({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
+        dirName: "explicit-only",
+        frontmatter: {
+          name: "explicit-only",
+          description: "Explicit-only skill",
+          targets: ["vibe"],
+          ...frontmatter,
+        },
+        body: "Body",
+      });
+
+    it("should pick up the root-level value when the vibe section omits it", () => {
+      const vibeSkill = VibeSkill.fromRulesyncSkill({
+        outputRoot: testDir,
+        rulesyncSkill: buildRulesyncSkill({ "disable-model-invocation": true }),
+      });
+
+      expect(vibeSkill.getFrontmatter()["disable-model-invocation"]).toBe(true);
+    });
+
+    it("should let the vibe section override the root-level value", () => {
+      const vibeSkill = VibeSkill.fromRulesyncSkill({
+        outputRoot: testDir,
+        rulesyncSkill: buildRulesyncSkill({
+          "disable-model-invocation": true,
+          vibe: { "disable-model-invocation": false },
+        }),
+      });
+
+      expect(vibeSkill.getFrontmatter()["disable-model-invocation"]).toBe(false);
+    });
+
+    it("should omit the key when neither the root nor the vibe section sets it", () => {
+      const vibeSkill = VibeSkill.fromRulesyncSkill({
+        outputRoot: testDir,
+        rulesyncSkill: buildRulesyncSkill({}),
+      });
+
+      expect(vibeSkill.getFrontmatter()).not.toHaveProperty("disable-model-invocation");
+    });
+
+    it("should round-trip the key into the vibe section on import", async () => {
+      const skillDir = join(testDir, ".vibe", "skills", "explicit-only");
+      await ensureDir(skillDir);
+      await writeFileContent(
+        join(skillDir, SKILL_FILE_NAME),
+        `---
+name: explicit-only
+description: Explicit-only skill
+disable-model-invocation: true
+---
+Body`,
+      );
+
+      const vibeSkill = await VibeSkill.fromDir({
+        outputRoot: testDir,
+        relativeDirPath: join(".vibe", "skills"),
+        dirName: "explicit-only",
+      });
+      const rulesyncSkill = vibeSkill.toRulesyncSkill();
+
+      expect(rulesyncSkill.getFrontmatter().vibe).toEqual({ "disable-model-invocation": true });
+      expect(
+        VibeSkill.fromRulesyncSkill({ outputRoot: testDir, rulesyncSkill }).getFrontmatter()[
+          "disable-model-invocation"
+        ],
+      ).toBe(true);
+    });
+
+    it("should reject a non-boolean value", () => {
+      const result = VibeSkillFrontmatterSchema.safeParse({
+        name: "explicit-only",
+        description: "Explicit-only skill",
+        "disable-model-invocation": "yes",
+      });
+
+      expect(result.success).toBe(false);
+    });
   });
 
   it("should load from .agents/skills import fallback when requested by the processor", async () => {

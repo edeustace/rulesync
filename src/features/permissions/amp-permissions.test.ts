@@ -254,6 +254,34 @@ describe("AmpPermissions", () => {
       expect(json["amp.tools.disable"]).toEqual([]);
       expect(json.other).toBe(1);
     });
+
+    it("strips a root `__proto__` and keeps the rest of the settings", async () => {
+      // Sanitizing runs before the plain-object check, so this no longer fails
+      // with "Amp settings must be a JSON object" the way it did when the raw
+      // prototype swap reached that check. Dropping the one poisoned key is the
+      // point: the user's unrelated settings survive.
+      await writeFileContent(
+        join(testDir, ".amp", "settings.json"),
+        '{"__proto__":{"amp.tools.disable":["bash"]},"amp.tools.disable":["web"]}',
+      );
+
+      const instance = await AmpPermissions.fromFile({ outputRoot: testDir });
+      const settings = JSON.parse(instance.getFileContent());
+
+      expect(settings["amp.tools.disable"]).toEqual(["web"]);
+      expect(Object.hasOwn(settings, "__proto__")).toBe(false);
+    });
+
+    it("reports the offset when the settings file is malformed", async () => {
+      await writeFileContent(join(testDir, ".amp", "settings.json"), "{ not json");
+
+      await expect(AmpPermissions.fromFile({ outputRoot: testDir })).rejects.toThrow(
+        /Failed to parse Amp settings: SyntaxError: Failed to parse JSONC content: .* at offset \d+/,
+      );
+      await expect(AmpPermissions.fromFile({ outputRoot: testDir })).rejects.toMatchObject({
+        cause: expect.any(SyntaxError),
+      });
+    });
   });
 
   describe("toRulesyncPermissions", () => {
@@ -291,6 +319,39 @@ describe("AmpPermissions", () => {
       expect(config.permission.read_file).toEqual({ "*": "allow" });
       expect(config.permission.web).toEqual({ "*": "ask" });
       expect(config.permission.bash).toEqual({ "rm *": "deny", "git *": "allow" });
+    });
+
+    it("strips prototype-pollution keys recursively while retaining valid permissions", async () => {
+      await writeFileContent(
+        join(testDir, ".amp", "settings.json"),
+        '{"constructor":{"polluted":true},"amp.permissions":[{"tool":"bash","action":"allow","metadata":{"prototype":{"polluted":true},"safe":"value"}}]}',
+      );
+
+      const instance = await AmpPermissions.fromFile({ outputRoot: testDir });
+      const settings = JSON.parse(instance.getFileContent());
+      const config = JSON.parse(instance.toRulesyncPermissions().getFileContent());
+
+      expect(Object.hasOwn(settings, "constructor")).toBe(false);
+      expect(settings["amp.permissions"][0].metadata).toEqual({ safe: "value" });
+      expect(config.permission.bash).toEqual({ "*": "allow" });
+    });
+
+    it("ignores a permission entry reachable only through `__proto__`", async () => {
+      // The PoC from #2855, and the case a naive filter cannot defend against:
+      // `constructor` and `prototype` arrive as own keys and are easy to skip,
+      // while `__proto__` never becomes one -- the engine swaps the object's
+      // prototype instead, so the entry is readable without appearing in
+      // `Object.keys`.
+      await writeFileContent(
+        join(testDir, ".amp", "settings.json"),
+        '{"amp.permissions":[{"__proto__":{"tool":"bash","action":"allow"},"matches":{}}]}',
+      );
+
+      const instance = await AmpPermissions.fromFile({ outputRoot: testDir });
+      const config = JSON.parse(instance.toRulesyncPermissions().getFileContent());
+
+      expect(config.permission.bash).toBeUndefined();
+      expect(Object.prototype).not.toHaveProperty("tool");
     });
 
     it("routes delegate entries into the amp override on import (no canonical equivalent)", async () => {

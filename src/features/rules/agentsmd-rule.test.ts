@@ -323,8 +323,9 @@ describe("AgentsMdRule", () => {
         await writeFileContent(join(testDir, relativePath), "# rule");
       }
 
-      const patterns = AgentsMdRule.getNestedFilePatterns({ outputRoot: testDir });
+      const patterns = AgentsMdRule.getNestedFilePatterns();
       const matched = await findFilesByGlobs(patterns.include, {
+        cwd: testDir,
         type: "file",
         followSymbolicLinks: false,
         ignore: patterns.ignore,
@@ -345,8 +346,9 @@ describe("AgentsMdRule", () => {
       await symlink(join(outsideDir, "secret.md"), join(testDir, "docs", "AGENTS.md"));
       await symlink(outsideDir, join(testDir, "linked"));
 
-      const patterns = AgentsMdRule.getNestedFilePatterns({ outputRoot: testDir });
+      const patterns = AgentsMdRule.getNestedFilePatterns();
       const matched = await findFilesByGlobs(patterns.include, {
+        cwd: testDir,
         type: "file",
         followSymbolicLinks: false,
         ignore: patterns.ignore,
@@ -400,6 +402,42 @@ describe("AgentsMdRule", () => {
       expect(regenerated.getRelativeFilePath()).toBe("AGENTS.md");
     });
 
+    it("should resolve an imported nested rule to the same path with and without deriveSubprojectPathFromGlobs", async () => {
+      // Import writes both the explicit `subprojectPath` and the matching
+      // `globs`, so a generate -> import -> generate cycle lands in the same
+      // directory whether or not the config option is on: the explicit path
+      // wins, and the derived one would have agreed anyway.
+      const subprojectDir = join(testDir, "packages", "api");
+      await ensureDir(subprojectDir);
+      await writeFileContent(join(subprojectDir, "AGENTS.md"), "# API\n\nAPI instructions.");
+      const imported = (
+        await AgentsMdRule.fromFile({
+          outputRoot: testDir,
+          relativeDirPath: join("packages", "api"),
+          relativeFilePath: "AGENTS.md",
+        })
+      ).toRulesyncRule();
+
+      for (const deriveSubprojectPathFromGlobs of [false, true]) {
+        const reloaded = new RulesyncRule({
+          outputRoot: testDir,
+          relativeDirPath: imported.getRelativeDirPath(),
+          relativeFilePath: imported.getRelativeFilePath(),
+          frontmatter: imported.getFrontmatter(),
+          body: imported.getBody(),
+          deriveSubprojectPathFromGlobs,
+        });
+        expect(reloaded.getFrontmatter().agentsmd?.subprojectPath).toBe("packages/api");
+
+        const regenerated = AgentsMdRule.fromRulesyncRule({
+          outputRoot: testDir,
+          rulesyncRule: reloaded,
+        });
+        expect(regenerated.getRelativeDirPath()).toBe(join("packages", "api"));
+        expect(regenerated.getRelativeFilePath()).toBe("AGENTS.md");
+      }
+    });
+
     it("should exclude build directories only at the project root", async () => {
       // A top-level `build/` is a build directory; `packages/build/` is a package.
       for (const relativePath of [
@@ -410,8 +448,9 @@ describe("AgentsMdRule", () => {
         await writeFileContent(join(testDir, relativePath), "# rule");
       }
 
-      const patterns = AgentsMdRule.getNestedFilePatterns({ outputRoot: testDir });
+      const patterns = AgentsMdRule.getNestedFilePatterns();
       const matched = await findFilesByGlobs(patterns.include, {
+        cwd: testDir,
         type: "file",
         followSymbolicLinks: false,
         ignore: patterns.ignore,

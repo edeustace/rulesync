@@ -9,9 +9,21 @@ updates:
       default-days: 1
     open-pull-requests-limit: 2
     groups:
+      # Minor and patch bumps travel together so a routine week is one PR.
       all-dependencies:
         patterns:
           - "*"
+        update-types:
+          - "minor"
+          - "patch"
+      # Semver-major bumps get their own PR so they are never buried inside a
+      # 100-package batch and can be reviewed, reverted, or bisected alone.
+      # (0.x packages still classify 0.23 -> 0.24 as minor and stay above.)
+      major-dependencies:
+        patterns:
+          - "*"
+        update-types:
+          - "major"
     commit-message:
       prefix: "chore"
       prefix-development: "chore"
@@ -37,8 +49,35 @@ updates:
       all-actions:
         patterns:
           - "*"
+    # actions/checkout is excluded from automatic bumps, so its SHA pins must
+    # be updated by hand and kept identical across every workflow file.
     ignore:
       - dependency-name: "actions/checkout"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    labels:
+      - "ci"
+      - "automated"
+    assignees:
+      - "dyoshikawa"
+      - "cm-dyoshikawa"
+
+  # The root `github-actions` entry only scans `.github/workflows/`, so a
+  # composite action that pins third-party actions needs its own entry.
+  # This bumps the action pins only; `CICD_SENSOR_VERSION` and its digests in
+  # action.yml are bumped by hand (see the GitHub Actions security rule).
+  - package-ecosystem: "github-actions"
+    directory: "/.github/actions/cicd-sensor"
+    schedule:
+      interval: "weekly"
+    cooldown:
+      default-days: 1
+    open-pull-requests-limit: 1
+    groups:
+      all-actions:
+        patterns:
+          - "*"
     commit-message:
       prefix: "ci"
       include: "scope"

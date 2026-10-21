@@ -79,21 +79,25 @@ Add a `sources` array to your `rulesync.jsonc`:
 
 Each entry in `sources` accepts:
 
-| Property    | Type       | Description                                                                                                                                                                                                           |
-| ----------- | ---------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`    | `string`   | Repository source. For GitHub transport: `owner/repo` or `owner/repo@ref:path`. For git transport: a full git URL. For npm transport: a package name (`pkg` or `@scope/pkg`).                                         |
-| `skills`    | `string[]` | Optional skill names to fetch. `"*"` selects all skills. When both `skills` and `rules` are omitted, all skills are fetched for backward compatibility.                                                               |
-| `rules`     | `string[]` | Optional rule names to fetch. Names may include or omit `.md`; `"*"` selects every direct `.md` file under `rulesPath`. Setting only `rules` fetches no skills.                                                       |
-| `transport` | `string`   | `"github"` (default) uses the GitHub REST API. `"git"` uses git CLI and works with any git remote. `"npm"` (experimental) fetches a package from an npm-compatible registry.                                          |
-| `ref`       | `string`   | Branch, tag, or ref to fetch from. Defaults to the remote's default branch. For GitHub transport, use the `@ref` source syntax. For npm transport: an exact version or dist-tag (defaults to `latest`).               |
-| `path`      | `string`   | Path to the skills directory within the repository. Defaults to `"skills"`. Set to `""`, `"."`, or `"./"` to target the entire repository root (see note below). For GitHub transport, use the `:path` source syntax. |
-| `rulesPath` | `string`   | Path to the rules directory within the repository or package. Defaults to `"rules"`. This is independent from the skills-only `path` field.                                                                           |
-| `registry`  | `string`   | npm transport only. Base URL of the npm-compatible registry. Defaults to `https://registry.npmjs.org`.                                                                                                                |
-| `tokenEnv`  | `string`   | npm transport only. Name of the environment variable holding the registry token. Defaults to `NPM_TOKEN`.                                                                                                             |
+| Property    | Type       | Description                                                                                                                                                                                                                                                                |
+| ----------- | ---------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `source`    | `string`   | Repository source. For GitHub transport: `owner/repo` or `owner/repo@ref:path`. For git transport: a full git URL. For npm transport: a package name (`pkg` or `@scope/pkg`).                                                                                              |
+| `skills`    | `string[]` | Optional skill names to fetch. `"*"` selects all skills. When both `skills` and `rules` are omitted, all skills are fetched for backward compatibility. An empty list (`[]`) is an error; to take no skills, omit `skills` and list only `rules`.                          |
+| `rules`     | `string[]` | Optional rule names to fetch. Names may include or omit `.md`; `"*"` selects every direct `.md` file under `rulesPath`. Setting only `rules` fetches no skills. An empty list (`[]`) is an error; to take no rules, omit `rules` and list the skills you want in `skills`. |
+| `transport` | `string`   | `"github"` (default) uses the GitHub REST API. `"git"` uses git CLI and works with any git remote. `"npm"` (experimental) fetches a package from an npm-compatible registry.                                                                                               |
+| `ref`       | `string`   | Branch, tag, or ref to fetch from. Defaults to the remote's default branch. For GitHub transport, use the `@ref` source syntax. For npm transport: an exact version or dist-tag (defaults to `latest`).                                                                    |
+| `path`      | `string`   | Path to the skills directory within the repository. Defaults to `"skills"`. Set to `""`, `"."`, or `"./"` to target the entire repository root (see note below). For GitHub transport, use the `:path` source syntax.                                                      |
+| `rulesPath` | `string`   | Path to the rules directory within the repository or package. Defaults to `"rules"`. This is independent from the skills-only `path` field.                                                                                                                                |
+| `registry`  | `string`   | npm transport only. Base URL of the npm-compatible registry. Defaults to `https://registry.npmjs.org`.                                                                                                                                                                     |
+| `tokenEnv`  | `string`   | npm transport only. Name of the environment variable holding the registry token. Defaults to `NPM_TOKEN`.                                                                                                                                                                  |
+
+An empty `skills` or `rules` list fails only the source that declares it, in `--frozen` mode too: the other sources are still installed into `.curated/`, and then `install` exits with an error that counts the failed sources.
 
 Rules are flat source files: only direct `.md` children of `rulesPath` are discovered. Nested rule files are not installed. Fetched rules are written to `.rulesync/rules/.curated/<rule-name>.md`; during generation they behave as if they were ordinary files directly under `.rulesync/rules/`.
 
 > **Repository-root paths (`path: "."`):** When `path` is `""`, `"."`, or `"./"` (with the `git` transport), rulesync disables sparse-checkout and fetches the **entire** repository tree, then groups each top-level directory as a skill. This is useful for single-skill repositories whose `SKILL.md` lives at the repo root (`<repo>/SKILL.md`) rather than under a `skills/` container. Because the whole tree is fetched, prefer a narrower `path` for large repositories; the fetch is still bounded by rulesync's file-count, total-size, and depth limits.
+
+> **Symlinks (`git` transport):** Symlinks inside the fetched `path` or `rulesPath` are skipped. If the directory itself, or one of its parents, is a symlink that resolves outside the cloned repository, rulesync warns and fetches nothing from it, so a source repository cannot make `install` copy files from elsewhere on your machine.
 
 ## npm Transport (Experimental)
 
@@ -124,8 +128,8 @@ When `rulesync install` runs and `sources` is configured:
 3. **Filtering** — Only the names selected by `skills` and `rules` are fetched. Omitting both fields retains the historical behavior of fetching all skills.
 4. **Precedence rules**:
    - **Local inputs win within one source tree** — Rules and skills outside `.curated/` take precedence over a same-named curated artifact in that input root. Across multiple `inputRoots`, root order remains primary: a later root replaces an earlier root's effective artifact even when the later artifact is curated.
-   - **First-declared source wins** — If two sources provide an artifact with the same name, the one declared first in the `sources` array is used.
-5. **Output** — Fetched rules are written to `.rulesync/rules/.curated/<rule-name>.md`; fetched skills are written to `.rulesync/skills/.curated/<skill-name>/`. Both directories are automatically added to `.gitignore` by `rulesync gitignore`.
+   - **First-declared source wins** — If two sources provide an artifact with the same name, the one declared first in the `sources` array is used. This holds even though GitHub-transport sources are downloaded concurrently (up to 4 sources and 10 requests at a time): writes, name-collision checks and lockfile updates still run one source at a time in declared order. git and npm transport sources are fetched one at a time.
+5. **Output** — Fetched rules are written to `.rulesync/rules/.curated/<rule-name>.md`; fetched skills are written to `.rulesync/skills/.curated/<skill-name>/`. Both directories are automatically added to `.gitignore` by `rulesync gitignore`. A skill's supporting file that the source records as executable keeps that bit in `.curated/` (mode `0755`), so `rulesync generate` carries it into each generated skill directory and a `scripts/run.sh` the skill tells the agent to run stays runnable. The GitHub transport reads the mode from the repository tree (git mode `100755`) with one extra request per source, and only when a fetched skill has files beside `SKILL.md`; if the tree is cut short or cannot be read, the files are still installed without the bit and a warning says so. The git transport takes the bit from the checked-out file, and the npm transport from the tarball entry's mode.
 
 ## Install Modes
 
@@ -204,12 +208,13 @@ Run with `npx rulesync install --mode gh`.
 
 The `install` command accepts these flags:
 
-| Flag              | Description                                                                                                                                                          |
-| ----------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `--mode <mode>`   | Install mode: `rulesync` (default), `apm`, or `gh`. See **Install Modes** above.                                                                                     |
-| `--update`        | Force re-resolve all source refs, ignoring the lockfile (useful to pull new updates).                                                                                |
-| `--frozen`        | Fail if a lockfile is missing or does not cover declared sources and rule selections. Fetches missing locked artifacts without updating the lockfile. Useful for CI. |
-| `--token <token>` | GitHub token for private repositories.                                                                                                                               |
+| Flag              | Description                                                                                                                                                                          |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `--mode <mode>`   | Install mode: `rulesync` (default), `apm`, or `gh`. See **Install Modes** above.                                                                                                     |
+| `--update`        | Force re-resolve all source refs, ignoring the lockfile (useful to pull new updates).                                                                                                |
+| `--frozen`        | Fail if a lockfile is missing or does not cover declared sources and their skill and rule selections. Fetches missing locked artifacts without updating the lockfile. Useful for CI. |
+| `--outdated`      | Report which sources are behind in the lockfile without installing or writing anything. See **Checking for Outdated Sources** below.                                                 |
+| `--token <token>` | GitHub token for private repositories.                                                                                                                                               |
 
 ```bash
 # Install rules and skills using locked refs
@@ -221,6 +226,9 @@ rulesync install --update
 # Strict CI mode — fail if lockfile doesn't cover all sources and selections
 rulesync install --frozen
 
+# Report sources whose lockfile entry is behind (read-only)
+rulesync install --outdated
+
 # Install then generate
 rulesync install && rulesync generate
 
@@ -230,7 +238,7 @@ rulesync generate
 
 ## Lockfile
 
-The lockfile at `rulesync.lock` (at the project root) records the resolved commit SHA, rule selection metadata, and per-artifact integrity hashes for each source so that builds are reproducible. Rulesync verifies cached rule content against these hashes before reusing it. It is safe to commit this file. An example:
+The lockfile at `rulesync.lock` (at the project root) records the resolved commit SHA, the skill and rule selections each entry was written for, and per-artifact integrity hashes for each source so that builds are reproducible. Rulesync verifies cached rule and skill content against these hashes before reusing it: a curated rule or skill whose files were edited, added, or removed in place is fetched again at its locked ref (under `--frozen` too) and restored to the locked content. Two cases are checked for presence only: a skill whose name an earlier declared source already installed (the curated directory holds that source's copy, which takes precedence), and a skill locked with an empty integrity by the migration from the legacy lockfile format, until `--update` or a ref change fetches it again and records its hash. It is safe to commit this file. An example:
 
 ```json
 {
@@ -244,6 +252,8 @@ The lockfile at `rulesync.lock` (at the project root) records the resolved commi
         "my-skill": { "integrity": "sha256-abcdef..." },
         "another-skill": { "integrity": "sha256-123456..." }
       },
+      "skillSelection": ["*"],
+      "skillsPath": "skills",
       "rules": {
         "testing-guidelines": { "integrity": "sha256-789abc..." }
       },
@@ -256,6 +266,22 @@ The lockfile at `rulesync.lock` (at the project root) records the resolved commi
 ```
 
 To update locked refs, run `rulesync install --update`.
+
+### Checking for Outdated Sources
+
+`rulesync install --outdated` answers "is my lockfile behind its sources?" without changing anything: it writes no lockfile, fetches no rules or skills, and touches no files. For each declared source it resolves the ref the same way `--update` would — the `ref` declared in `rulesync.jsonc` (or in the source string, such as `owner/repo@v1`), or the default branch when none is declared (the `latest` dist-tag for npm sources) — and compares the result with the commit SHA (`resolvedRef`) or package version (`resolvedVersion`) in the lockfile. Each source is reported as up to date, outdated, not locked (declared but missing from the lockfile), or failed (its ref could not be resolved, for example because the network or the registry is unreachable, or a token is missing).
+
+The exit code makes the check usable in CI and scripts:
+
+| Exit code | Meaning                                                                                 |
+| --------- | --------------------------------------------------------------------------------------- |
+| `0`       | Every source is locked at the ref it resolves to now.                                   |
+| `1`       | At least one source is outdated or not locked; `rulesync install --update` moves it on. |
+| `2`       | At least one source could not be resolved, so its status is unknown.                    |
+
+With the global `--json` flag, the per-source report (`source`, `transport`, `status`, `requestedRef`, `lockedRef`, `latestRef`, `error`) is returned as `data.sources` on success and as `error.details.sources` when the command exits non-zero. Any other error — an invalid flag combination or an unreadable configuration file, for example — also exits with code `1`, as it does for every command; with `--json`, only an outdated result carries `error.details.sources`. `--outdated` works only in the default `rulesync` mode and cannot be combined with `--update` or `--frozen`. It checks refs only; whether the lockfile covers each source's `skills` and `rules` selection is what `--frozen` checks.
+
+Changing a source's `skills` or `rules` selection in `rulesync.jsonc` (for example, adding a skill name to an explicit list, or switching to `"*"`), or its `path` or `rulesPath`, is picked up by the next plain `rulesync install`: the entry is refetched at its locked ref and the lockfile records the new selection and path. Under `--frozen`, a selection or path the lockfile does not cover fails the install instead. A lockfile written before `skillSelection` or `skillsPath` was recorded is fetched again once, at its locked ref, by the next plain `rulesync install`, which then records them; commit the updated lockfile so `--frozen` installs keep reusing the cache.
 
 npm-transport sources (experimental) are pinned in a separate `rulesync-npm.lock.json`, because they lock a resolved package version and tarball integrity instead of a commit SHA:
 
@@ -272,6 +298,8 @@ npm-transport sources (experimental) are pinned in a separate `rulesync-npm.lock
       "skills": {
         "my-skill": { "integrity": "sha256-abcdef..." }
       },
+      "skillSelection": ["my-skill"],
+      "skillsPath": "skills",
       "rules": {
         "testing-guidelines": { "integrity": "sha256-789abc..." }
       },

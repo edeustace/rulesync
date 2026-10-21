@@ -1,3 +1,4 @@
+import { symlink } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, MockedFunction, vi } from "vitest";
@@ -157,6 +158,7 @@ vi.mocked(OpenCodeCommand).forDeletion = vi.fn().mockImplementation((params) => 
   isDeletable: () => true,
   getRelativeFilePath: () => params.relativeFilePath,
 }));
+vi.mocked(OpenCodeCommand).loadAdditionalImportFiles = vi.fn().mockResolvedValue([]);
 
 // Set up static methods after mocking
 vi.mocked(RooCommand).fromFile = vi.fn();
@@ -297,6 +299,7 @@ describe("CommandsProcessor", () => {
         outputRoot: expect.any(String),
         rulesyncCommand: mockRulesyncCommand,
         global: false,
+        logger: expect.anything(),
       });
       expect(result).toEqual([mockClaudecodeCommand]);
     });
@@ -339,6 +342,7 @@ describe("CommandsProcessor", () => {
         outputRoot: expect.any(String),
         rulesyncCommand: mockRulesyncCommand,
         global: true,
+        logger: expect.anything(),
       });
     });
 
@@ -376,6 +380,7 @@ describe("CommandsProcessor", () => {
         outputRoot: expect.any(String),
         rulesyncCommand: mockRulesyncCommand,
         global: false,
+        logger: expect.anything(),
       });
       expect(result).toEqual([mockRooCommand]);
     });
@@ -416,6 +421,7 @@ describe("CommandsProcessor", () => {
         outputRoot: expect.any(String),
         rulesyncCommand: mockRulesyncCommand,
         global: true,
+        logger: expect.anything(),
       });
     });
 
@@ -707,6 +713,65 @@ describe("CommandsProcessor", () => {
 
       expect(result).toHaveLength(1);
     });
+
+    it("should skip a command the tool refuses to write, checked on the flattened path", async () => {
+      // `getWriteBlockReason` is the per-command write gate; it runs after
+      // flattening so the tool sees the name it would load, and a refused
+      // command is dropped with a warning instead of reaching
+      // `fromRulesyncCommand` or the collision bookkeeping.
+      const getWriteBlockReason = vi
+        .fn()
+        .mockImplementation(({ rulesyncCommand }: { rulesyncCommand: RulesyncCommand }) =>
+          rulesyncCommand.getRelativeFilePath() === "goal.md" ? "the name is reserved" : null,
+        );
+      vi.mocked(KiloCommand).getWriteBlockReason = getWriteBlockReason;
+      try {
+        processor = new CommandsProcessor({ logger, outputRoot: testDir, toolTarget: "kilo" });
+
+        const reserved = new RulesyncCommand({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_COMMANDS_RELATIVE_DIR_PATH,
+          relativeFilePath: join("nested", "goal.md"),
+          fileContent: "reserved",
+          frontmatter: { targets: ["kilo"], description: "reserved" },
+          body: "reserved",
+        });
+        const allowed = new RulesyncCommand({
+          outputRoot: testDir,
+          relativeDirPath: RULESYNC_COMMANDS_RELATIVE_DIR_PATH,
+          relativeFilePath: "review.md",
+          fileContent: "allowed",
+          frontmatter: { targets: ["kilo"], description: "allowed" },
+          body: "allowed",
+        });
+        const converted = new KiloCommand({
+          outputRoot: testDir,
+          relativeDirPath: join(".kilo", "commands"),
+          relativeFilePath: "review.md",
+          frontmatter: {},
+          body: "converted",
+        });
+        vi.mocked(KiloCommand.fromRulesyncCommand).mockReturnValue(converted);
+
+        const result = await processor.convertRulesyncFilesToToolFiles([reserved, allowed]);
+
+        expect(result).toEqual([converted]);
+        expect(getWriteBlockReason).toHaveBeenCalledTimes(2);
+        expect(getWriteBlockReason.mock.calls[0]![0]!.rulesyncCommand.getRelativeFilePath()).toBe(
+          "goal.md",
+        );
+        expect(getWriteBlockReason.mock.calls[0]![0]!.global).toBe(false);
+        expect(vi.mocked(KiloCommand.fromRulesyncCommand)).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledTimes(1);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringMatching(
+            /^Skipping command "nested[/\\]+goal\.md" for 'kilo': the name is reserved$/,
+          ),
+        );
+      } finally {
+        delete (KiloCommand as { getWriteBlockReason?: unknown }).getWriteBlockReason;
+      }
+    });
   });
 
   describe("convertToolFilesToRulesyncFiles", () => {
@@ -834,9 +899,9 @@ describe("CommandsProcessor", () => {
 
       const result = await processor.loadRulesyncFiles();
 
-      expect(mockFindFilesByGlobs).toHaveBeenCalledWith(
-        join(testDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH, "**", "*.md"),
-      );
+      expect(mockFindFilesByGlobs).toHaveBeenCalledWith("**/*.md", {
+        cwd: join(testDir, RULESYNC_COMMANDS_RELATIVE_DIR_PATH),
+      });
       expect(RulesyncCommand.fromFile).toHaveBeenCalledTimes(2);
       expect(RulesyncCommand.fromFile).toHaveBeenCalledWith({
         outputRoot: testDir,
@@ -966,9 +1031,9 @@ describe("CommandsProcessor", () => {
       const result = await processor.loadToolFiles();
 
       expect(mockFindFilesByGlobs).toHaveBeenCalledWith(
-        expect.stringContaining(join(".claude", "commands", "**", "*.md")),
+        "**/*.md",
         // Loading follows symlinks; collecting deletion candidates does not.
-        { followSymbolicLinks: true },
+        { cwd: join(testDir, ".claude", "commands"), followSymbolicLinks: true },
       );
       expect(ClaudecodeCommand.fromFile).toHaveBeenCalledWith({
         outputRoot: testDir,
@@ -1200,9 +1265,9 @@ describe("CommandsProcessor", () => {
       await processor.loadToolFiles();
 
       expect(mockFindFilesByGlobs).toHaveBeenCalledWith(
-        expect.stringContaining(join(".cursor", "commands", "*.md")),
+        "*.md",
         // Loading follows symlinks; collecting deletion candidates does not.
-        { followSymbolicLinks: true },
+        { cwd: join(testDir, ".cursor", "commands"), followSymbolicLinks: true },
       );
       // Should NOT contain "**" in the glob pattern
       const calledGlob = mockFindFilesByGlobs.mock.calls[0]![0] as string;
@@ -1217,9 +1282,9 @@ describe("CommandsProcessor", () => {
       await processor.loadToolFiles();
 
       expect(mockFindFilesByGlobs).toHaveBeenCalledWith(
-        expect.stringContaining(join(".claude", "commands", "**", "*.md")),
+        "**/*.md",
         // Loading follows symlinks; collecting deletion candidates does not.
-        { followSymbolicLinks: true },
+        { cwd: join(testDir, ".claude", "commands"), followSymbolicLinks: true },
       );
     });
   });
@@ -1232,30 +1297,48 @@ describe("CommandsProcessor", () => {
           "antigravity-cli",
           "antigravity-ide",
           "augmentcode",
+          "augmentcode-plugin",
+          "bob",
           "claudecode",
           "claudecode-plugin",
           "claudecode-legacy",
           "cline",
+          "codebuddy",
+          "codewhale",
+          "commandcode",
+          "continue",
           "copilot",
           "cursor",
           "factorydroid",
+          "firebender",
           "goose",
+          "gitlabduo",
           "grokcli",
           "junie",
           "kilo",
+          "kimi-code-plugin",
           "kiro",
           "kiro-cli",
           "kiro-ide",
+          "lettacode",
+          "mimocode",
+          "omp",
           "opencode",
           "pi",
+          "qoder",
           "qwencode",
           "reasonix",
           "roo",
           "zoocode",
           "rovodev",
+          "tabnine",
           "takt",
+          "trae",
           "devin",
           "warp",
+          "kimi-code",
+          "zcode",
+          "zcode-plugin",
         ]),
       );
     });
@@ -1268,30 +1351,48 @@ describe("CommandsProcessor", () => {
           "antigravity-cli",
           "antigravity-ide",
           "augmentcode",
+          "augmentcode-plugin",
+          "bob",
           "claudecode",
           "claudecode-plugin",
           "claudecode-legacy",
           "cline",
+          "codebuddy",
+          "codewhale",
+          "commandcode",
+          "continue",
           "copilot",
           "cursor",
           "factorydroid",
+          "firebender",
           "goose",
+          "gitlabduo",
           "grokcli",
           "junie",
           "kilo",
+          "kimi-code-plugin",
           "kiro",
           "kiro-cli",
           "kiro-ide",
+          "lettacode",
+          "mimocode",
+          "omp",
           "opencode",
           "pi",
+          "qoder",
           "qwencode",
           "reasonix",
           "roo",
           "zoocode",
           "rovodev",
+          "tabnine",
           "takt",
+          "trae",
           "devin",
           "warp",
+          "kimi-code",
+          "zcode",
+          "zcode-plugin",
         ]),
       );
     });
@@ -1305,34 +1406,154 @@ describe("CommandsProcessor", () => {
           "antigravity-cli",
           "antigravity-ide",
           "augmentcode",
+          "bob",
           "claudecode",
           "claudecode-legacy",
           "cline",
+          "codebuddy",
+          "codewhale",
           "codexcli",
+          "commandcode",
+          "continue",
           "cursor",
           "factorydroid",
+          "firebender",
           "goose",
+          "gitlabduo",
           "grokcli",
           "hermesagent",
           "junie",
           "kilo",
           "kiro-cli",
+          "lettacode",
+          "mimocode",
+          "omp",
           "opencode",
           "pi",
+          "qoder",
           "qwencode",
           "reasonix",
           "roo",
           "zoocode",
           "rovodev",
+          "tabnine",
           "takt",
+          "trae",
           "devin",
           "warp",
+          "kimi-code",
+          "zcode",
         ]),
       );
     });
   });
 
   describe("loadToolFiles with forDeletion: true", () => {
+    it("never sweeps a committedOutput project root (Letta Code's .commands/)", async () => {
+      await writeFileContent(join(testDir, ".commands", "hand-written.md"), "Hand-written prompt");
+
+      const actualFile =
+        await vi.importActual<typeof import("../../utils/file.js")>("../../utils/file.js");
+      mockFindFilesByGlobs.mockImplementation(actualFile.findFilesByGlobs);
+
+      try {
+        const projectProcessor = new CommandsProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "lettacode",
+        });
+        expect(await projectProcessor.loadToolFiles({ forDeletion: true })).toEqual([]);
+        expect(mockFindFilesByGlobs).not.toHaveBeenCalled();
+      } finally {
+        mockFindFilesByGlobs.mockReset();
+      }
+    });
+
+    it("still sweeps a committedOutput target at global scope", async () => {
+      await writeFileContent(join(testDir, ".letta", "commands", "stale.md"), "Stale prompt");
+
+      const actualFile =
+        await vi.importActual<typeof import("../../utils/file.js")>("../../utils/file.js");
+      mockFindFilesByGlobs.mockImplementation(actualFile.findFilesByGlobs);
+
+      try {
+        const globalProcessor = new CommandsProcessor({
+          logger,
+          outputRoot: testDir,
+          toolTarget: "lettacode",
+          global: true,
+        });
+        const toolFiles = await globalProcessor.loadToolFiles({ forDeletion: true });
+        expect(toolFiles.map((file) => file.getRelativeFilePath())).toEqual(["stale.md"]);
+      } finally {
+        mockFindFilesByGlobs.mockReset();
+      }
+    });
+
+    it("should load files when the output root contains glob metacharacters", async () => {
+      const literalRoot = join(testDir, "project(glob)");
+      await writeFileContent(
+        join(literalRoot, ".claude", "commands", "literal.md"),
+        "---\ndescription: Literal path\n---\n\nContent",
+      );
+
+      const literalProcessor = new CommandsProcessor({
+        logger,
+        outputRoot: literalRoot,
+        toolTarget: "claudecode",
+      });
+
+      const actualFile =
+        await vi.importActual<typeof import("../../utils/file.js")>("../../utils/file.js");
+      mockFindFilesByGlobs.mockImplementation(actualFile.findFilesByGlobs);
+
+      try {
+        const toolFiles = await literalProcessor.loadToolFiles({ forDeletion: true });
+
+        expect(toolFiles).toHaveLength(1);
+        expect(toolFiles[0]?.getRelativeFilePath()).toBe("literal.md");
+      } finally {
+        mockFindFilesByGlobs.mockReset();
+      }
+    });
+
+    // `*` is not a legal filename character on Windows.
+    it.skipIf(process.platform === "win32")(
+      "should not reach a sibling project when the output root ends in a wildcard",
+      async () => {
+        // Matching too much is the dangerous direction here: every path this
+        // returns goes on the `--delete` orphan list, so a root read as a
+        // pattern would put another project's files there.
+        const literalRoot = join(testDir, "project*x");
+        await writeFileContent(
+          join(literalRoot, ".claude", "commands", "mine.md"),
+          "---\ndescription: Mine\n---\n\nContent",
+        );
+        await writeFileContent(
+          join(testDir, "projectOTHERx", ".claude", "commands", "theirs.md"),
+          "---\ndescription: Theirs\n---\n\nContent",
+        );
+
+        const literalProcessor = new CommandsProcessor({
+          logger,
+          outputRoot: literalRoot,
+          toolTarget: "claudecode",
+        });
+
+        const actualFile =
+          await vi.importActual<typeof import("../../utils/file.js")>("../../utils/file.js");
+        mockFindFilesByGlobs.mockImplementation(actualFile.findFilesByGlobs);
+
+        try {
+          const toolFiles = await literalProcessor.loadToolFiles({ forDeletion: true });
+
+          expect(toolFiles.map((file) => file.getRelativeFilePath())).toEqual(["mine.md"]);
+        } finally {
+          mockFindFilesByGlobs.mockReset();
+        }
+      },
+    );
+
     it("should return files with correct paths for deletion", async () => {
       processor = new CommandsProcessor({ logger, outputRoot: testDir, toolTarget: "claudecode" });
 
@@ -1355,6 +1576,8 @@ describe("CommandsProcessor", () => {
         "claudecode",
         "claudecode-legacy",
         "cline",
+        "codebuddy",
+        "codewhale",
         "junie",
         "kilo",
         "roo",
@@ -1486,6 +1709,120 @@ describe("CommandsProcessor secondary import roots", () => {
     expect(mockLogger.warn).toHaveBeenCalledWith(expect.stringContaining("Duplicate augmentcode"));
   });
 
+  it("drops a shared-root copy that differs only in case and says which spelling won", async () => {
+    // Written back into one `.rulesync/commands/` tree, `commit.md` and
+    // `Commit.md` are a single file on macOS and Windows, so an exact-match
+    // check would let the shared-root copy overwrite the tool's own one.
+    const mockLogger = createMockLogger();
+    const actualFile =
+      await vi.importActual<typeof import("../../utils/file.js")>("../../utils/file.js");
+    vi.mocked(findFilesByGlobs).mockImplementation(actualFile.findFilesByGlobs);
+    await ensureDir(join(testDir, ".augment", "commands"));
+    await ensureDir(join(testDir, ".agents", "commands"));
+    const body = ["---", "description: Commit", "---", "", "Commit it.", ""].join("\n");
+    await writeFileContent(join(testDir, ".augment", "commands", "commit.md"), body);
+    await writeFileContent(join(testDir, ".agents", "commands", "Commit.md"), body);
+
+    const processor = new CommandsProcessor({
+      outputRoot: testDir,
+      toolTarget: "augmentcode",
+      logger: mockLogger,
+    });
+    const loaded = await processor.loadToolFiles();
+
+    expect(loaded.map((file) => file.getRelativeFilePath())).toEqual(["commit.md"]);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /Case-insensitive augmentcode command collision: "commit\.md" and "Commit\.md" .* Keeping "commit\.md" from the higher-precedence .*\.augment.*commands .* ignoring "Commit\.md"/,
+      ),
+    );
+  });
+
+  it("drops a shared-root copy whose basename differs only in case from a nested command", async () => {
+    // The flattened twin of `git/commit.md` is matched by basename; the match
+    // must fold case the same way the exact path match does.
+    const mockLogger = createMockLogger();
+    const actualFile =
+      await vi.importActual<typeof import("../../utils/file.js")>("../../utils/file.js");
+    vi.mocked(findFilesByGlobs).mockImplementation(actualFile.findFilesByGlobs);
+    await ensureDir(join(testDir, ".augment", "commands", "git"));
+    await ensureDir(join(testDir, ".agents", "commands"));
+    const body = ["---", "description: Commit", "---", "", "Commit it.", ""].join("\n");
+    await writeFileContent(join(testDir, ".augment", "commands", "git", "commit.md"), body);
+    await writeFileContent(join(testDir, ".agents", "commands", "COMMIT.md"), body);
+
+    const processor = new CommandsProcessor({
+      outputRoot: testDir,
+      toolTarget: "augmentcode",
+      logger: mockLogger,
+    });
+    const loaded = await processor.loadToolFiles();
+
+    expect(loaded.map((file) => file.getRelativeFilePath())).toEqual([join("git", "commit.md")]);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("Case-insensitive augmentcode command collision"),
+    );
+  });
+
+  it("reports a case-only collision inside the secondary source as same-source", async () => {
+    // OpenCode's inline `command` block can hold `Commit` and `commit` as two
+    // JSON keys; only the first can survive the write-back. JSON parsing
+    // itself is covered by opencode-command.test.ts, so this test mocks
+    // `loadAdditionalImportFiles` directly to isolate the dedupe logic below.
+    const mockLogger = createMockLogger();
+    vi.mocked(OpenCodeCommand.loadAdditionalImportFiles).mockResolvedValueOnce([
+      { getRelativeFilePath: () => "Commit.md" } as unknown as OpenCodeCommand,
+      { getRelativeFilePath: () => "commit.md" } as unknown as OpenCodeCommand,
+    ]);
+
+    const processor = new CommandsProcessor({
+      outputRoot: testDir,
+      toolTarget: "opencode",
+      logger: mockLogger,
+    });
+    const loaded = await processor.loadToolFiles();
+
+    expect(loaded.map((file) => file.getRelativeFilePath())).toEqual(["Commit.md"]);
+    expect(mockLogger.warn).toHaveBeenCalledWith(
+      expect.stringMatching(
+        /Case-insensitive opencode command collision: "Commit\.md" and "commit\.md" .* Keeping "Commit\.md" from earlier in the same source/,
+      ),
+    );
+  });
+
+  it("keeps a flat shared-root command that does not collide with anything", async () => {
+    // A flat command's own relative path already equals its basename, so
+    // checking a basename-matching tool's secondary candidates against both
+    // must not treat that command as colliding with itself.
+    const mockLogger = createMockLogger();
+    const actualFile =
+      await vi.importActual<typeof import("../../utils/file.js")>("../../utils/file.js");
+    vi.mocked(findFilesByGlobs).mockImplementation(actualFile.findFilesByGlobs);
+    await writeFileContent(
+      join(testDir, ".augment", "commands", "other.md"),
+      ["---", "description: Other", "---", "", "Other command.", ""].join("\n"),
+    );
+    await writeFileContent(
+      join(testDir, ".agents", "commands", "unique.md"),
+      ["---", "description: Unique", "---", "", "Unique command.", ""].join("\n"),
+    );
+
+    const processor = new CommandsProcessor({
+      outputRoot: testDir,
+      toolTarget: "augmentcode",
+      logger: mockLogger,
+    });
+    const loaded = await processor.loadToolFiles();
+
+    expect(loaded.map((file) => file.getRelativeFilePath()).toSorted()).toEqual([
+      "other.md",
+      "unique.md",
+    ]);
+    expect(mockLogger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("augmentcode command"),
+    );
+  });
+
   it("keeps a nested command from the shared root that only shares a basename", async () => {
     // `.agents/commands/docs/commit.md` is `/docs:commit` — a different command
     // from `/git:commit`, not the flattened twin the basename match is for.
@@ -1594,4 +1931,38 @@ describe("CommandsProcessor Goose slash-command retraction", () => {
 
     expect(await readFileContent(configPath)).toBe(before);
   });
+
+  it.skipIf(process.platform === "win32")(
+    "refuses to rewrite a config reached through a link out of the output root",
+    async () => {
+      const outsideConfigPath = join(testDir, "outside", "config.yaml");
+      await writeFileContent(
+        outsideConfigPath,
+        [
+          "slash_commands:",
+          "  - command: removed",
+          `    recipe_path: ${join(testDir, ".config", "goose", "recipes", "removed.yaml")}`,
+          "",
+        ].join("\n"),
+      );
+      const before = await readFileContent(outsideConfigPath);
+      const root = join(testDir, "root");
+      await ensureDir(join(root, ".config", "goose"));
+      await symlink(outsideConfigPath, join(root, ".config", "goose", "config.yaml"));
+      const gooseLogger = createMockLogger();
+      const processor = new CommandsProcessor({
+        outputRoot: root,
+        toolTarget: "goose",
+        global: true,
+        logger: gooseLogger,
+      });
+
+      await processor.removeOrphanAiFiles([], []);
+
+      expect(await readFileContent(outsideConfigPath)).toBe(before);
+      expect(gooseLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("through a symbolic link"),
+      );
+    },
+  );
 });

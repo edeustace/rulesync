@@ -2,12 +2,17 @@ import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { CLAUDECODE_SETTINGS_SCHEMA_URL } from "../../constants/claudecode-paths.js";
 import { RULESYNC_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
 import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { HooksConfigSchema } from "../../types/hooks.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
 import { ClaudecodeHooks } from "./claudecode-hooks.js";
+import {
+  HOOKS_OWNERSHIP_LOCK_FILE_NAME,
+  serializeHooksOwnershipLock,
+} from "./hooks-ownership-lock.js";
 import { RulesyncHooks } from "./rulesync-hooks.js";
 
 const logger = createMockLogger();
@@ -159,6 +164,112 @@ describe("ClaudecodeHooks", () => {
       });
     });
 
+    it("should write failClosed as onFailure: block on command and http hooks only", async () => {
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(join(testDir, ".claude", "settings.json"), JSON.stringify({}));
+
+      const config = {
+        version: 1,
+        hooks: {
+          preToolUse: [
+            { type: "command", command: "check.sh", failClosed: true },
+            { type: "http", url: "https://example.com/hook", failClosed: true },
+            { type: "prompt", prompt: "Review this", failClosed: true },
+            { type: "command", command: "fail-open.sh", failClosed: false },
+            // Upstream: onFailure has no effect on background command hooks.
+            { type: "command", command: "bg.sh", async: true, failClosed: true },
+            { type: "command", command: "rewake.sh", asyncRewake: true, failClosed: true },
+            // `async` is command-only and not emitted on http hooks, so it
+            // cannot switch onFailure off there.
+            { type: "http", url: "https://example.com/bg", async: true, failClosed: true },
+          ],
+          // Upstream: onFailure has no effect on Stop hooks.
+          stop: [{ type: "command", command: "on-stop.sh", failClosed: true }],
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const claudecodeHooks = await ClaudecodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+        logger,
+      });
+
+      const parsed = JSON.parse(claudecodeHooks.getFileContent());
+      const [command, http, prompt, failOpen, background, rewake, httpWithAsync] =
+        parsed.hooks.PreToolUse[0].hooks;
+      expect(command.onFailure).toBe("block");
+      expect(http.onFailure).toBe("block");
+      expect(prompt).not.toHaveProperty("onFailure");
+      expect(failOpen).not.toHaveProperty("onFailure");
+      expect(background).not.toHaveProperty("onFailure");
+      expect(background.async).toBe(true);
+      expect(rewake).not.toHaveProperty("onFailure");
+      expect(httpWithAsync.onFailure).toBe("block");
+      expect(httpWithAsync).not.toHaveProperty("async");
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining('from a "http" hook on "preToolUse": this tool ignores'),
+      );
+      for (const flag of ["async", "asyncRewake"]) {
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(`ignores "onFailure" on a hook that sets "${flag}"`),
+        );
+      }
+      expect(parsed.hooks.Stop[0].hooks[0]).not.toHaveProperty("onFailure");
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Dropping "failClosed" from a "prompt" hook on "preToolUse"'),
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Dropping "failClosed" from a "command" hook on "stop"'),
+      );
+    });
+
+    it("should read onFailure back as failClosed on import", () => {
+      const claudecodeHooks = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                hooks: [
+                  { type: "command", command: "block.sh", onFailure: "block" },
+                  { type: "http", url: "https://example.com/hook", onFailure: "continue" },
+                  { type: "command", command: "typo.sh", onFailure: "Block" },
+                  { type: "command", command: "bg.sh", async: true, onFailure: "block" },
+                  { type: "command", command: "rewake.sh", asyncRewake: true, onFailure: "block" },
+                ],
+              },
+            ],
+          },
+        }),
+        validate: false,
+      });
+
+      const parsed = claudecodeHooks.toRulesyncHooks({ logger }).getJson();
+      const [block, cont, typo, background, rewake] = parsed.hooks.preToolUse ?? [];
+      expect(block?.failClosed).toBe(true);
+      expect(cont?.failClosed).toBe(false);
+      expect(typo).not.toHaveProperty("failClosed");
+      expect(background).not.toHaveProperty("failClosed");
+      expect(rewake).not.toHaveProperty("failClosed");
+      expect(rewake?.asyncRewake).toBe(true);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('ignores "onFailure" on a hook that sets "asyncRewake"'),
+      );
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('"Block" is not a value this tool documents for it'),
+      );
+    });
+
     it("should use the braced placeholder for an exec-form command", async () => {
       await ensureDir(join(testDir, ".claude"));
       await writeFileContent(join(testDir, ".claude", "settings.json"), JSON.stringify({}));
@@ -194,6 +305,40 @@ describe("ClaudecodeHooks", () => {
       expect(hooks[0].command).toBe("${CLAUDE_PROJECT_DIR}/scripts/exec.sh");
       expect(hooks[1].command).toBe("${CLAUDE_PROJECT_DIR}/scripts/empty-args.sh");
       expect(hooks[2].command).toBe('"$CLAUDE_PROJECT_DIR"/scripts/shell-form.sh');
+    });
+
+    it("should not anchor later words of a PowerShell hook", async () => {
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(join(testDir, ".claude", "settings.json"), JSON.stringify({}));
+
+      const config = {
+        version: 1,
+        hooks: {
+          preToolUse: [
+            // PowerShell would expand `$CLAUDE_PROJECT_DIR` as an undefined
+            // variable, so the POSIX scanner must leave its words alone.
+            { command: "node ./x.js", shell: "powershell" },
+            { command: "node ./x.js", shell: "bash" },
+          ],
+        },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const claudecodeHooks = await ClaudecodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+
+      const hooks = JSON.parse(claudecodeHooks.getFileContent()).hooks.PreToolUse[0].hooks;
+      expect(hooks[0].command).toBe("node ./x.js");
+      expect(hooks[1].command).toBe('node "$CLAUDE_PROJECT_DIR"/x.js');
     });
 
     it("should keep command-only fields off non-command hooks", async () => {
@@ -497,6 +642,58 @@ describe("ClaudecodeHooks", () => {
       expect(parsed.hooks.DirectoryAdded[0].matcher).toBe("slash_command");
     });
 
+    it("keeps the matcher on PreModelSwitch and PostModelSwitch", async () => {
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(join(testDir, ".claude", "settings.json"), JSON.stringify({}));
+
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: {
+            preModelSwitch: [{ matcher: ".*opus.*", command: "guard-model.sh" }],
+            postModelSwitch: [{ command: "log-model.sh" }],
+          },
+        }),
+        validate: false,
+      });
+
+      const claudecodeHooks = await ClaudecodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+
+      const parsed = JSON.parse(claudecodeHooks.getFileContent());
+      expect(parsed.hooks.PreModelSwitch[0].matcher).toBe(".*opus.*");
+      expect(parsed.hooks.PreModelSwitch[0].hooks[0].command).toBe("guard-model.sh");
+      expect(parsed.hooks.PostModelSwitch[0].hooks[0].command).toBe("log-model.sh");
+    });
+
+    it("should import PreModelSwitch and PostModelSwitch", () => {
+      const claudecodeHooks = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          hooks: {
+            PreModelSwitch: [{ matcher: "claude-opus-5", hooks: [{ command: "guard-model.sh" }] }],
+            PostModelSwitch: [{ hooks: [{ command: "log-model.sh" }] }],
+          },
+        }),
+        validate: false,
+      });
+
+      const parsed = claudecodeHooks.toRulesyncHooks().getJson();
+      expect(parsed.hooks.preModelSwitch?.[0]).toMatchObject({
+        matcher: "claude-opus-5",
+        command: "guard-model.sh",
+      });
+      expect(parsed.hooks.postModelSwitch?.[0]).toMatchObject({ command: "log-model.sh" });
+    });
+
     it("should only prefix dot-relative commands with $CLAUDE_PROJECT_DIR", async () => {
       await ensureDir(join(testDir, ".claude"));
       await writeFileContent(join(testDir, ".claude", "settings.json"), JSON.stringify({}));
@@ -507,6 +704,8 @@ describe("ClaudecodeHooks", () => {
           sessionStart: [
             { type: "command", command: ".rulesync/hooks/session-start.sh" },
             { type: "command", command: "npx prettier --write ./src/hooks/format.ts" },
+            { type: "command", command: "npx eslint --fix" },
+            { type: "command", command: ". ./env.sh && run" },
           ],
         },
       };
@@ -531,7 +730,11 @@ describe("ClaudecodeHooks", () => {
       expect(sessionStartEntry.matcher).toBeUndefined();
       expect(sessionStartEntry.hooks[0].command).toContain("$CLAUDE_PROJECT_DIR");
       expect(sessionStartEntry.hooks[0].command).toContain(".rulesync/hooks/session-start.sh");
+      // A data argument keeps its meaning relative to the working directory.
       expect(sessionStartEntry.hooks[1].command).toBe("npx prettier --write ./src/hooks/format.ts");
+      expect(sessionStartEntry.hooks[2].command).toBe("npx eslint --fix");
+      // A lone `.` is the `source` builtin, so only its script is anchored.
+      expect(sessionStartEntry.hooks[3].command).toBe('. "$CLAUDE_PROJECT_DIR"/env.sh && run');
     });
 
     it("should quote only the $CLAUDE_PROJECT_DIR variable so it survives word-splitting on project paths with spaces", async () => {
@@ -689,6 +892,225 @@ describe("ClaudecodeHooks", () => {
       expect(parsed.hooks).toBeDefined();
       expect(parsed.hooks.SessionStart).toBeDefined();
     });
+
+    it("should keep an existing third-party command on regenerate", async () => {
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(
+        join(testDir, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  { type: "command", command: "echo start" },
+                  { type: "command", command: "other-tool-hook claude-hook" },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: { sessionStart: [{ command: "echo start" }] },
+        }),
+        validate: false,
+      });
+
+      const parsed = JSON.parse(
+        (
+          await ClaudecodeHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks,
+            preserveUnowned: true,
+            validate: false,
+          })
+        ).getFileContent(),
+      );
+      const commands = parsed.hooks.SessionStart[0].hooks.map(
+        (handler: { command: string }) => handler.command,
+      );
+      expect(commands).toEqual(["echo start", "other-tool-hook claude-hook"]);
+    });
+
+    it("should retract its own hook that the sources no longer define", async () => {
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(
+        join(testDir, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  { type: "command", command: "echo start" },
+                  { type: "command", command: "other-tool-hook claude-hook" },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+      await writeFileContent(
+        join(testDir, ".claude", HOOKS_OWNERSHIP_LOCK_FILE_NAME),
+        serializeHooksOwnershipLock([
+          { event: "SessionStart", matcher: "", identity: "command:echo start" },
+        ]),
+      );
+
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({ version: 1, hooks: {} }),
+        validate: false,
+      });
+
+      const parsed = JSON.parse(
+        (
+          await ClaudecodeHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks,
+            preserveUnowned: true,
+            validate: false,
+          })
+        ).getFileContent(),
+      );
+      const commands = parsed.hooks.SessionStart[0].hooks.map(
+        (handler: { command: string }) => handler.command,
+      );
+      expect(commands).toEqual(["other-tool-hook claude-hook"]);
+    });
+
+    it("should write an ownership lock only when preserving", async () => {
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: { sessionStart: [{ command: "echo start" }] },
+        }),
+        validate: false,
+      });
+
+      const preserving = await ClaudecodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        preserveUnowned: true,
+        validate: false,
+      });
+      const lockFiles = await ClaudecodeHooks.getAuxiliaryFiles({ toolHooks: preserving });
+      expect(lockFiles).toHaveLength(1);
+      expect(lockFiles[0]?.getRelativeFilePath()).toBe(HOOKS_OWNERSHIP_LOCK_FILE_NAME);
+      expect(JSON.parse(lockFiles[0]!.getFileContent()).owned).toEqual([
+        { event: "SessionStart", matcher: "", identity: "command:echo start" },
+      ]);
+
+      const replacing = await ClaudecodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+      expect(await ClaudecodeHooks.getAuxiliaryFiles({ toolHooks: replacing })).toEqual([]);
+    });
+
+    it("should replace existing third-party commands unless preserveUnowned is set", async () => {
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(
+        join(testDir, ".claude", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            SessionStart: [
+              {
+                hooks: [
+                  { type: "command", command: "echo start" },
+                  { type: "command", command: "other-tool-hook claude-hook" },
+                ],
+              },
+            ],
+          },
+        }),
+      );
+
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: { sessionStart: [{ command: "echo start" }] },
+        }),
+        validate: false,
+      });
+
+      const parsed = JSON.parse(
+        (
+          await ClaudecodeHooks.fromRulesyncHooks({
+            outputRoot: testDir,
+            rulesyncHooks,
+            validate: false,
+          })
+        ).getFileContent(),
+      );
+      const commands = parsed.hooks.SessionStart[0].hooks.map(
+        (handler: { command: string }) => handler.command,
+      );
+      expect(commands).toEqual(["echo start"]);
+    });
+  });
+
+  describe("$schema", () => {
+    const rulesyncHooks = () =>
+      new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: { preToolUse: [{ command: "echo hi" }] },
+        }),
+        validate: false,
+      });
+
+    it.each([{ global: false }, { global: true }])(
+      "adds $schema first when hooks alone writes a settings file (global: $global)",
+      async ({ global }) => {
+        const claudecodeHooks = await ClaudecodeHooks.fromRulesyncHooks({
+          outputRoot: testDir,
+          rulesyncHooks: rulesyncHooks(),
+          validate: false,
+          global,
+        });
+
+        const content = JSON.parse(claudecodeHooks.getFileContent());
+        expect(Object.keys(content)).toEqual(["$schema", "hooks"]);
+        expect(content.$schema).toBe(CLAUDECODE_SETTINGS_SCHEMA_URL);
+      },
+    );
+
+    it("keeps a $schema the settings file already states", async () => {
+      const pinned = "https://mirror.example.test/claude-code-settings.json";
+      await ensureDir(join(testDir, ".claude"));
+      await writeFileContent(
+        join(testDir, ".claude", "settings.json"),
+        JSON.stringify({ $schema: pinned, model: "opus" }, null, 2),
+      );
+
+      const claudecodeHooks = await ClaudecodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks: rulesyncHooks(),
+        validate: false,
+      });
+
+      const content = JSON.parse(claudecodeHooks.getFileContent());
+      expect(content.$schema).toBe(pinned);
+      expect(Object.keys(content)).toEqual(["$schema", "model", "hooks"]);
+    });
   });
 
   describe("toRulesyncHooks", () => {
@@ -704,6 +1126,42 @@ describe("ClaudecodeHooks", () => {
       expect(() => claudecodeHooks.toRulesyncHooks()).toThrow(
         /Failed to parse Claude hooks content/,
       );
+    });
+
+    it("should refuse a root that is not a mapping and name the file once", () => {
+      const claudecodeHooks = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: "[]",
+        validate: false,
+      });
+
+      expect(() => claudecodeHooks.toRulesyncHooks()).toThrow(
+        "Failed to parse Claude hooks content in .claude/settings.json: Error: expected a mapping at the root",
+      );
+    });
+
+    it("should import an empty file as no hooks and drop a root-level __proto__", () => {
+      const empty = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: "",
+        validate: false,
+      });
+      expect(empty.toRulesyncHooks().getJson().hooks).toEqual({});
+
+      const polluted = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: '{"__proto__":{"polluted":true},"hooks":{}}',
+        validate: false,
+      });
+      const json = polluted.toRulesyncHooks().getJson();
+      expect(json.hooks).toEqual({});
+      expect(Object.hasOwn(json, "__proto__")).toBe(false);
     });
 
     it("should import DirectoryAdded and the per-handler fields, undoing the exec-form prefix", () => {
@@ -881,6 +1339,259 @@ describe("ClaudecodeHooks", () => {
       const rulesyncHooks = claudecodeHooks.toRulesyncHooks();
       const json = rulesyncHooks.getJson();
       expect(json.hooks.sessionStart?.[0]?.command).toBe("./scripts/format.sh --fix --quiet");
+    });
+
+    // https://github.com/dyoshikawa/rulesync/issues/3171 — the variable must be
+    // normalized wherever a path starts with it, not only as the first token,
+    // or it leaks into targets (e.g. Codex CLI) that never set it.
+    const importCommand = (command: string): string | undefined => {
+      const claudecodeHooks = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          hooks: {
+            PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command }] }],
+          },
+        }),
+        validate: false,
+      });
+      return claudecodeHooks.toRulesyncHooks().getJson().hooks.preToolUse?.[0]?.command;
+    };
+
+    it("should strip only the leading word of a PowerShell hook", () => {
+      const claudecodeHooks = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          hooks: {
+            PreToolUse: [
+              {
+                matcher: "Bash",
+                hooks: [
+                  {
+                    type: "command",
+                    command: '"$CLAUDE_PROJECT_DIR"/a.ps1 --config $CLAUDE_PROJECT_DIR/c.json',
+                    shell: "powershell",
+                  },
+                ],
+              },
+            ],
+          },
+        }),
+        validate: false,
+      });
+      const command = claudecodeHooks.toRulesyncHooks().getJson().hooks.preToolUse?.[0]?.command;
+      expect(command).toBe("./a.ps1 --config $CLAUDE_PROJECT_DIR/c.json");
+    });
+
+    it.each([
+      ['"$CLAUDE_PROJECT_DIR"/.claude/hooks/a.sh', "./.claude/hooks/a.sh"],
+      ['"$CLAUDE_PROJECT_DIR/.claude/hooks/b.sh"', '"./.claude/hooks/b.sh"'],
+      ["$CLAUDE_PROJECT_DIR/.claude/hooks/c.sh", "./.claude/hooks/c.sh"],
+      ["${CLAUDE_PROJECT_DIR}/.claude/hooks/d.sh", "./.claude/hooks/d.sh"],
+      ['python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/e.py"', 'python3 "./.claude/hooks/e.py"'],
+      ['python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/f.py', "python3 ./.claude/hooks/f.py"],
+      ["node $CLAUDE_PROJECT_DIR/.claude/hooks/g.js", "node ./.claude/hooks/g.js"],
+      ['python3 "${CLAUDE_PROJECT_DIR}/.claude/hooks/h.py"', 'python3 "./.claude/hooks/h.py"'],
+      ['python3 "${CLAUDE_PROJECT_DIR}"/.claude/hooks/i.py', "python3 ./.claude/hooks/i.py"],
+      ['uv run "$CLAUDE_PROJECT_DIR/my hooks/j.py" --flag', 'uv run "./my hooks/j.py" --flag'],
+      [
+        "$CLAUDE_PROJECT_DIR/lint.sh && node $CLAUDE_PROJECT_DIR/check.js",
+        "./lint.sh && node ./check.js",
+      ],
+      // The form generate writes for a quoted path.
+      ['"$CLAUDE_PROJECT_DIR"/"my hooks/k.sh" --fix', '"./my hooks/k.sh" --fix'],
+      ["\"$CLAUDE_PROJECT_DIR\"/'my hooks/k.sh'", "'./my hooks/k.sh'"],
+      // A variable closing a double-quoted string keeps that quote in place.
+      ['echo "$CLAUDE_PROJECT_DIR/"', 'echo "./"'],
+      // An inner shell expands the variable inside single quotes.
+      ["bash -c 'test -x $CLAUDE_PROJECT_DIR/k.sh'", "bash -c 'test -x ./k.sh'"],
+      [
+        "bash -c '$CLAUDE_PROJECT_DIR/k.sh && node \"$CLAUDE_PROJECT_DIR/l.js\"'",
+        `bash -c './k.sh && node "./l.js"'`,
+      ],
+      // After a `cd`, only the leading variable is normalized.
+      [
+        "$CLAUDE_PROJECT_DIR/a.sh && cd sub && $CLAUDE_PROJECT_DIR/b.sh",
+        "./a.sh && cd sub && $CLAUDE_PROJECT_DIR/b.sh",
+      ],
+    ])("should normalize %s to %s on import", (command, expected) => {
+      expect(importCommand(command)).toBe(expected);
+    });
+
+    it.each([
+      // A longer variable name is a different variable.
+      "$CLAUDE_PROJECT_DIR2/hook.sh",
+      "python3 ${CLAUDE_PROJECT_DIR_OLD}/hook.py",
+      // An escaped `$` is a literal, not an expansion.
+      'echo "\\$CLAUDE_PROJECT_DIR/hook.sh"',
+      // A bare variable that does not start a path.
+      'cd "$CLAUDE_PROJECT_DIR" && ./hook.sh',
+      // The value of an option or assignment, which generate never anchors.
+      "tool --config=$CLAUDE_PROJECT_DIR/c.json",
+      // Another tool's variable is not Claude Code's to rewrite.
+      "$CLAUDE_PLUGIN_ROOT/hook.sh",
+    ])("should leave %s untouched on import", (command) => {
+      expect(importCommand(command)).toBe(command);
+    });
+
+    it.each([
+      ["npx prettier --write $CLAUDE_PROJECT_DIR/src", true],
+      ['x > "$CLAUDE_PROJECT_DIR"/out.log', true],
+      ['node ./a.js "$CLAUDE_PROJECT_DIR"/data', true],
+      ['node "$CLAUDE_PROJECT_DIR"/x.js', false],
+      ["$CLAUDE_PROJECT_DIR/a.sh && cd sub && $CLAUDE_PROJECT_DIR/b.sh", false],
+    ])(
+      "should warn about %s only when generate cannot restore the variable: %s",
+      (command, warns) => {
+        const warnSpy = vi.spyOn(logger, "warn").mockClear();
+        const claudecodeHooks = new ClaudecodeHooks({
+          outputRoot: testDir,
+          relativeDirPath: ".claude",
+          relativeFilePath: "settings.json",
+          fileContent: JSON.stringify({
+            hooks: {
+              PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command }] }],
+            },
+          }),
+          validate: false,
+        });
+        claudecodeHooks.toRulesyncHooks({ logger });
+        const warned = warnSpy.mock.calls.some(([message]) =>
+          String(message).includes("is not restored on generate"),
+        );
+        expect(warned).toBe(warns);
+      },
+    );
+
+    it.each([
+      ["PATH=$CLAUDE_PROJECT_DIR/bin:$PATH ./x.sh", true],
+      ["node ./x.js --config=$CLAUDE_PROJECT_DIR/c.json", true],
+      ["$CLAUDE_PROJECT_DIR/a.sh && cd sub && $CLAUDE_PROJECT_DIR/b.sh", true],
+      ['node "$CLAUDE_PROJECT_DIR"/x.js', false],
+      ['env FOO=1 "$CLAUDE_PROJECT_DIR"/x.sh', false],
+    ])("should warn about %s only when the variable is kept: %s", (command, warns) => {
+      const warnSpy = vi.spyOn(logger, "warn").mockClear();
+      const claudecodeHooks = new ClaudecodeHooks({
+        outputRoot: testDir,
+        relativeDirPath: ".claude",
+        relativeFilePath: "settings.json",
+        fileContent: JSON.stringify({
+          hooks: {
+            PreToolUse: [{ matcher: "Bash", hooks: [{ type: "command", command }] }],
+          },
+        }),
+        validate: false,
+      });
+      claudecodeHooks.toRulesyncHooks({ logger });
+      const warned = warnSpy.mock.calls.some(([message]) =>
+        String(message).includes("keeps $CLAUDE_PROJECT_DIR"),
+      );
+      expect(warned).toBe(warns);
+    });
+
+    // Generate re-anchors the `./` paths that name a file the command runs, so
+    // a hook keeps resolving against the project root. Other positions come
+    // back cwd-relative, resolved against the hook's working directory, which
+    // need not be the project root (a worktree, or the target of a `cd`);
+    // import warns about those. Either way a second import is stable.
+    it.each([
+      ['"$CLAUDE_PROJECT_DIR"/.claude/hooks/a.sh', '"$CLAUDE_PROJECT_DIR"/.claude/hooks/a.sh'],
+      ['"$CLAUDE_PROJECT_DIR/.claude/hooks/b.sh"', '"$CLAUDE_PROJECT_DIR"/".claude/hooks/b.sh"'],
+      ["$CLAUDE_PROJECT_DIR/.claude/hooks/c.sh", '"$CLAUDE_PROJECT_DIR"/.claude/hooks/c.sh'],
+      ["${CLAUDE_PROJECT_DIR}/.claude/hooks/d.sh", '"$CLAUDE_PROJECT_DIR"/.claude/hooks/d.sh'],
+      [
+        'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/e.py"',
+        'python3 "$CLAUDE_PROJECT_DIR/.claude/hooks/e.py"',
+      ],
+      [
+        'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/f.py',
+        'python3 "$CLAUDE_PROJECT_DIR"/.claude/hooks/f.py',
+      ],
+      [
+        "node $CLAUDE_PROJECT_DIR/.claude/hooks/g.js",
+        'node "$CLAUDE_PROJECT_DIR"/.claude/hooks/g.js',
+      ],
+      [
+        'uv run "$CLAUDE_PROJECT_DIR/my hooks/j.py" --flag',
+        'uv run "$CLAUDE_PROJECT_DIR/my hooks/j.py" --flag',
+      ],
+      ["npx tsx $CLAUDE_PROJECT_DIR/x.ts", 'npx tsx "$CLAUDE_PROJECT_DIR"/x.ts'],
+      [
+        "node -r $CLAUDE_PROJECT_DIR/r.js $CLAUDE_PROJECT_DIR/a.js",
+        'node -r "$CLAUDE_PROJECT_DIR"/r.js "$CLAUDE_PROJECT_DIR"/a.js',
+      ],
+      [
+        "$CLAUDE_PROJECT_DIR/lint.sh && node $CLAUDE_PROJECT_DIR/check.js",
+        '"$CLAUDE_PROJECT_DIR"/lint.sh && node "$CLAUDE_PROJECT_DIR"/check.js',
+      ],
+      ["bash -c 'test -x $CLAUDE_PROJECT_DIR/k.sh'", "bash -c 'test -x ./k.sh'"],
+      [
+        "bash -c '$CLAUDE_PROJECT_DIR/k.sh && node \"$CLAUDE_PROJECT_DIR/l.js\"'",
+        `bash -c '"$CLAUDE_PROJECT_DIR"/k.sh && node "$CLAUDE_PROJECT_DIR/l.js"'`,
+      ],
+      [
+        "$CLAUDE_PROJECT_DIR/a.sh && cd sub && $CLAUDE_PROJECT_DIR/b.sh",
+        '"$CLAUDE_PROJECT_DIR"/a.sh && cd sub && $CLAUDE_PROJECT_DIR/b.sh',
+      ],
+    ])("should round-trip %s through import and generate", async (command, expected) => {
+      const canonical = importCommand(command);
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: { preToolUse: [{ type: "command", matcher: "Bash", command: canonical }] },
+        }),
+        validate: false,
+      });
+      const generated = await ClaudecodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+      const regenerated: string = JSON.parse(generated.getFileContent()).hooks.PreToolUse[0]
+        .hooks[0].command;
+      expect(regenerated).toBe(expected);
+      expect(importCommand(regenerated)).toBe(canonical);
+    });
+
+    it.each([
+      // `../` and bare `.name` words are never anchored after the first word.
+      "cat ../shared/notes.txt",
+      "git add .gitignore",
+      // Mid-word `./` is not a path start.
+      "ls a/./b",
+      // A command that changes directory keeps its later `./` paths relative.
+      "./build.sh && cd dist && ./post.sh",
+      // Data arguments, and paths handed to a container or another host.
+      "./build.sh ./dist",
+      "./fmt.sh > ./out.log",
+      "docker compose exec -T app ./vendor/bin/pint",
+      "ssh host ./deploy.sh",
+      "kubectl exec pod -- ./x",
+    ])("should not anchor later data or post-cd paths in %s", async (command) => {
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify({
+          version: 1,
+          hooks: { preToolUse: [{ type: "command", matcher: "Bash", command }] },
+        }),
+        validate: false,
+      });
+      const generated = await ClaudecodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+      const regenerated: string = JSON.parse(generated.getFileContent()).hooks.PreToolUse[0]
+        .hooks[0].command;
+      expect(regenerated).toBe(command.replace(/^\.\//, '"$CLAUDE_PROJECT_DIR"/'));
     });
 
     it("should preserve http/mcp_tool/agent hooks with their payload fields on import", () => {

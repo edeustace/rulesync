@@ -13,7 +13,7 @@ import type { ToolTarget } from "../types/tool-targets.js";
 import type { Logger } from "../utils/logger.js";
 import { isPackagingToolTarget } from "../utils/plugin-root.js";
 import { resolveToolOutputRoot } from "../utils/tool-output-root.js";
-import { resetWarnedOnceMessages } from "../utils/warned-once.js";
+import { resetRunWarningState } from "../utils/warned-once.js";
 
 export type ConvertResult = {
   rulesCount: number;
@@ -65,7 +65,7 @@ export async function convertFromTool(params: {
 }): Promise<ConvertResult> {
   // Diagnostics are reported once per run, so a run that follows another in the
   // same process starts from a clean slate.
-  resetWarnedOnceMessages();
+  resetRunWarningState();
 
   const packagingTarget = [params.fromTool, ...params.toTools].find(isPackagingToolTarget);
   if (packagingTarget) {
@@ -199,6 +199,9 @@ function buildRulesStrategy(ctx: ConvertContext) {
         global,
         dryRun,
         logger,
+        // The source's language block is stripped on the way in, so the
+        // destination's root file only carries one when the key is passed on.
+        language: config.getLanguage(),
       }),
     loadSource: (p) => p.loadToolFiles(),
     toRulesync: (p, files) => p.convertToolFilesToRulesyncFiles(files),

@@ -12,7 +12,10 @@ import {
 } from "../../types/hooks.js";
 import type { Logger } from "../../utils/logger.js";
 import { compact } from "../../utils/object.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
+import { quoteValueForWarning } from "../../utils/quote-value.js";
 import { isPlainObject } from "../../utils/type-guards.js";
+import { anchorDotPaths, importProjectDirVariable } from "./hook-command-paths.js";
 
 type ToolMatcherEntry = {
   matcher?: string;
@@ -38,6 +41,15 @@ export type ToolHooksConverterConfig = {
   toolToCanonicalEventNames: Record<string, string>;
   projectDirVar: string;
   supportedHookTypes?: ReadonlySet<HookType>;
+  /**
+   * Tool-side spellings of the canonical hook `type` values, for a tool that
+   * names a handler type differently (e.g. Bob's `https` for the canonical
+   * `http`). A type without an entry is emitted under its canonical name. On
+   * import the mapping is applied in reverse, and the tool spelling of one
+   * canonical type shadows a same-named canonical type: Bob has no `http`
+   * handler, so an `http` in its file is not one either.
+   */
+  hookTypeNames?: Readonly<Partial<Record<HookType, string>>>;
   passthroughFields?: ReadonlyArray<"name" | "description">;
   /**
    * Per-hook boolean fields to carry through the round-trip, each mapping a
@@ -47,10 +59,57 @@ export type ToolHooksConverterConfig = {
    * any other value is ignored so a malformed field can't leak through.
    */
   booleanPassthroughFields?: ReadonlyArray<{
-    readonly canonical: "failClosed" | "async" | "once" | "asyncRewake" | "continueOnBlock";
+    readonly canonical:
+      | "failClosed"
+      | "async"
+      | "once"
+      | "asyncRewake"
+      | "continueOnBlock"
+      | "enabled";
     readonly tool: string;
     /** Emit only on `command` hooks, for a field the tool documents there only. */
     readonly commandOnly?: boolean;
+  }>;
+  /**
+   * Per-hook boolean fields a tool spells as a keyword rather than a boolean
+   * (Goose's `on_failure: "block"` for the canonical `failClosed`). `true` is
+   * emitted as `trueValue`; `false` and an absent field emit nothing, because
+   * the tool's default is the `false` behavior. On import `trueValue` reads
+   * back as `true`, `falseValue` (when given) as `false`, and any other value
+   * is dropped with a warning. `events` lists the canonical events the tool
+   * honours the field on: a `true` authored on another event is dropped with a
+   * warning in both directions, since the tool would ignore it there.
+   */
+  keywordPassthroughFields?: ReadonlyArray<{
+    readonly canonical: "failClosed";
+    readonly tool: string;
+    readonly trueValue: string;
+    readonly falseValue?: string;
+    /** Emit only on `command` hooks, for a field the tool documents there only. */
+    readonly commandOnly?: boolean;
+    /**
+     * Hook types the tool documents the field on, for a field wider than
+     * `command` alone (Claude Code's `onFailure` on `command` and `http`);
+     * unrestricted when absent.
+     */
+    readonly hookTypes?: ReadonlySet<HookType>;
+    /** Canonical events the tool honours the field on; unrestricted when absent. */
+    readonly events?: ReadonlySet<string>;
+    /**
+     * Canonical events the tool ignores the field on, for a field honoured
+     * almost everywhere (the complement of `events`).
+     */
+    readonly ignoredEvents?: ReadonlySet<string>;
+    /**
+     * Boolean command-hook flags that make the tool ignore the field when set
+     * to `true` (Claude Code's `onFailure` on background `async` /
+     * `asyncRewake` command hooks). Checked on `command` hooks only: the flags
+     * are command-only, so they are never emitted on another hook type and
+     * cannot switch the field off there. Each name is read from the canonical
+     * definition on export and from the tool hook on import, so it is meant
+     * for flags the tool spells the same as the canonical field.
+     */
+    readonly ignoredWhenFlags?: ReadonlyArray<"async" | "asyncRewake">;
   }>;
   /**
    * Per-hook number fields to carry through the round-trip, each mapping a
@@ -85,6 +144,16 @@ export type ToolHooksConverterConfig = {
    * whose entries are all strings are emitted and imported, so a malformed
    * value cannot leak into a config the tool would reject.
    */
+  /**
+   * Canonical fields that *restrict* when a hook runs and that the tool
+   * refuses to honour: it skips a handler carrying one rather than run it
+   * unconditionally. On export, a definition carrying a non-empty value for
+   * one of them is skipped with a warning, so the generated config holds
+   * neither a handler the tool will not load nor a widened one that fires on
+   * every call its matcher selects. Import is unaffected: list the field in
+   * {@link stringPassthroughFields} too to keep it on an imported hook.
+   */
+  skippedWhenFields?: ReadonlyArray<"if">;
   arrayPassthroughFields?: ReadonlyArray<{
     readonly canonical: "args";
     readonly tool: string;
@@ -101,6 +170,20 @@ export type ToolHooksConverterConfig = {
    */
   recordPassthroughFields?: ReadonlyArray<{
     readonly canonical: "env";
+    readonly tool: string;
+    /** Emit only on `command` hooks, for a field the tool documents there only. */
+    readonly commandOnly?: boolean;
+  }>;
+  /**
+   * Per-hook object fields to carry through the round-trip, each mapping a
+   * canonical {@link HookDefinitionSchema} object field to its tool-side field
+   * name. Only plain objects are emitted; import additionally checks the value
+   * against the canonical field's own schema, so a hand-written object missing
+   * a required key (Cortex Code's `source.source`) cannot land in a
+   * `.rulesync/hooks.*` that fails validation on the next run.
+   */
+  objectPassthroughFields?: ReadonlyArray<{
+    readonly canonical: "source";
     readonly tool: string;
     /** Emit only on `command` hooks, for a field the tool documents there only. */
     readonly commandOnly?: boolean;
@@ -155,7 +238,46 @@ export type ToolHooksConverterConfig = {
    * rewrite `"*"` to `".*"` in their own generators instead.
    */
   wildcardMatcherMeansAll?: boolean;
+  /**
+   * The unit of the tool's per-hook `timeout` field. The canonical `timeout` is
+   * seconds (docs/reference/file-formats.md), so `"milliseconds"` multiplies by
+   * 1000 on generate and divides on import; the default forwards the value
+   * verbatim.
+   */
+  timeoutUnit?: "seconds" | "milliseconds";
 };
+
+/**
+ * Convert a canonical `timeout` (seconds) into the tool's unit.
+ */
+function emitTimeout({
+  timeout,
+  converterConfig,
+}: {
+  timeout: number;
+  converterConfig: ToolHooksConverterConfig;
+}): number {
+  // A non-finite value is forwarded as-is (JSON writes it as null) rather
+  // than rounded into another non-finite value, matching the Tabnine converter.
+  return converterConfig.timeoutUnit === "milliseconds" && Number.isFinite(timeout)
+    ? Math.round(timeout * 1000)
+    : timeout;
+}
+
+/**
+ * Convert a tool `timeout` back into the canonical unit (seconds).
+ */
+function importTimeout({
+  timeout,
+  converterConfig,
+}: {
+  timeout: number;
+  converterConfig: ToolHooksConverterConfig;
+}): number {
+  return converterConfig.timeoutUnit === "milliseconds" && Number.isFinite(timeout)
+    ? timeout / 1000
+    : timeout;
+}
 
 /**
  * Filter the shared canonical hooks to the supported events and merge tool overrides on top.
@@ -233,6 +355,44 @@ function stripSurroundingQuotes(value: string): string {
 }
 
 /**
+ * Whether a hook is in the exec form, `args` being *present* — an empty array
+ * selects it too, and the docs' own example uses `"args": []`. Only checked
+ * for tools that actually emit `args`; for the rest `command` stays a shell
+ * string.
+ */
+function isExecFormHook({
+  args,
+  converterConfig,
+}: {
+  args: unknown;
+  converterConfig: ToolHooksConverterConfig;
+}): boolean {
+  const emitsArgs =
+    converterConfig.arrayPassthroughFields?.some(({ canonical }) => canonical === "args") ?? false;
+  return emitsArgs && Array.isArray(args);
+}
+
+/**
+ * Whether a hook's command runs in a POSIX shell. The shell-word scanner in
+ * `hook-command-paths.ts` assumes sh syntax, so a `powershell` hook keeps
+ * only the leading-word handling it had before that scanner existed. Only a
+ * tool that emits the `shell` field runs a hook in PowerShell; any other tool
+ * runs it in its own shell whatever the canonical `shell` says.
+ */
+function runsInPosixShell({
+  shell,
+  converterConfig,
+}: {
+  shell: unknown;
+  converterConfig: ToolHooksConverterConfig;
+}): boolean {
+  const emitsShell =
+    converterConfig.stringPassthroughFields?.some(({ canonical }) => canonical === "shell") ??
+    false;
+  return !emitsShell || shell !== "powershell";
+}
+
+/**
  * Apply the optional project directory variable prefix to a command string.
  */
 function applyCommandPrefix({
@@ -245,30 +405,40 @@ function applyCommandPrefix({
   const commandText = def.command;
   const trimmedCommand = typeof commandText === "string" ? commandText.trimStart() : undefined;
   const unquotedCommand = trimmedCommand?.replace(/^["']/, "");
-  const isDotRelativeCommand = unquotedCommand?.startsWith(".") ?? false;
+  // A lone `.` is the `source` builtin (`. ./env.sh`), not a path.
+  const isDotRelativeCommand =
+    typeof unquotedCommand === "string" && /^\.(?!\s|$)/.test(unquotedCommand);
   const isAbsoluteCommand =
     typeof unquotedCommand === "string" &&
     (posix.isAbsolute(unquotedCommand) ||
       win32.isAbsolute(unquotedCommand) ||
       unquotedCommand.startsWith("~/"));
-  // The exec form is `args` being *present* — an empty array selects it too,
-  // and the docs' own example uses `"args": []`. Only checked for tools that
-  // actually emit `args`; for the rest `command` stays a shell string.
-  const emitsArgs =
-    converterConfig.arrayPassthroughFields?.some(({ canonical }) => canonical === "args") ?? false;
-  const isExecForm = emitsArgs && Array.isArray(def.args);
+  const isExecForm = isExecFormHook({ args: def.args, converterConfig });
+  const startsWithVariable = unquotedCommand?.startsWith("$") ?? false;
   const shouldPrefix =
     converterConfig.projectDirVar !== "" &&
     typeof trimmedCommand === "string" &&
-    !trimmedCommand.startsWith("$") &&
+    !startsWithVariable &&
     !isAbsoluteCommand &&
     (!converterConfig.prefixDotRelativeCommandsOnly || isDotRelativeCommand);
+
+  // A later `./` path that names a file the command runs (a script runner's
+  // script argument, the next command in a chain) is anchored too, so a hook
+  // imported with the variable there keeps it. The exec form has no shell to
+  // split words, and a command led by a variable is passed through untouched.
+  const anchorInline = (command: string): string =>
+    isExecForm ||
+    converterConfig.projectDirVar === "" ||
+    startsWithVariable ||
+    !runsInPosixShell({ shell: def.shell, converterConfig })
+      ? command
+      : anchorDotPaths({ command, projectDirVar: converterConfig.projectDirVar });
 
   // Only the variable itself is quoted (not the whole command) so a project path
   // containing a space can't be word-split by the shell, while any trailing
   // arguments after the script path stay outside the quotes and still split normally.
   if (!shouldPrefix || typeof trimmedCommand !== "string") {
-    return def.command;
+    return typeof def.command === "string" ? anchorInline(def.command) : def.command;
   }
 
   // Keep a leading quote around paths containing spaces, but remove `./`
@@ -281,11 +451,11 @@ function applyCommandPrefix({
     // quoting because each argument is passed through verbatim.
     return `${bracePlaceholder(converterConfig.projectDirVar)}/${stripSurroundingQuotes(relativeCommand)}`;
   }
-  return `"${converterConfig.projectDirVar}"/${relativeCommand}`;
+  return anchorInline(`"${converterConfig.projectDirVar}"/${relativeCommand}`);
 }
 
 /**
- * The shape every per-hook passthrough registration shares. The five kinds
+ * The shape every per-hook passthrough registration shares. The six kinds
  * differ only in which canonical field names they accept and in the predicate
  * that decides whether a value is expressible, so both directions are
  * implemented once and parameterized by that predicate.
@@ -364,7 +534,7 @@ function emitPassthroughFields<TValue>({
       // so an authored value can be valid and still unusable here.
       warn?.(
         `Dropping "${canonical}" from a "${hookType}" hook on "${eventName}": ` +
-          `${JSON.stringify(value)} is not a value this tool can express as "${tool}".`,
+          `${quoteValueForWarning(value)} is not a value this tool can express as "${tool}".`,
       );
     }
   }
@@ -439,6 +609,7 @@ const isEmittableString: PassthroughValidator = ({ value }) => isNonEmptyString(
 const isEmittableArray: PassthroughValidator = ({ value }) => isStringArray(value);
 const isEmittableRecord: PassthroughValidator = ({ value }) => isSafeStringRecord(value);
 const isImportableArray: PassthroughValidator = ({ value }) => isSafeStringArray(value);
+const isEmittableObject: PassthroughValidator = ({ value }) => isPlainObject(value);
 
 /**
  * The canonical schema of one hook field, looked up by name. Read off the
@@ -484,11 +655,16 @@ const isImportableString: PassthroughValidator = ({ value, canonical }) =>
 const isImportableNumber: PassthroughValidator = ({ value, canonical }) =>
   Number.isFinite(value) && satisfiesCanonicalField({ value, canonical });
 
+const isImportableObject: PassthroughValidator = ({ value, canonical }) =>
+  isPlainObject(value) && satisfiesCanonicalField({ value, canonical });
+
 /**
  * Say which rule the value broke, so the warning names the actual constraint
  * rather than asserting a canonical rejection that may not be the reason. A
  * closed enum lists its members; a rule carrying its own message (the
- * control-character check behind `safeString`) reuses it.
+ * control-character check behind `safeString`) reuses it. An object field
+ * names the offending key, since zod's generic "Invalid input" would not tell
+ * the reader which key is missing or malformed.
  */
 function describeScalarConstraint({
   canonical,
@@ -508,7 +684,11 @@ function describeScalarConstraint({
   if (issue === undefined) {
     return `it is not a value the canonical "${canonical}" field accepts.`;
   }
-  return `it does not satisfy the canonical "${canonical}" field: ${issue.message}.`;
+  // A record's path element is the user-written key itself (a header name),
+  // so it is quoted like every other value this message carries.
+  const at =
+    issue.path.length > 0 ? ` at ${quoteValueForWarning(issue.path.map(String).join("."))}` : "";
+  return `it does not satisfy the canonical "${canonical}" field${at}: ${issue.message}.`;
 }
 
 const describeInvalidScalar = ({
@@ -520,13 +700,33 @@ const describeInvalidScalar = ({
   canonical: string;
   value: unknown;
 }): string =>
-  `Dropping "${tool}" (${JSON.stringify(value)}) while importing a hook: ` +
+  `Dropping "${tool}" (${quoteValueForWarning(value)}) while importing a hook: ` +
   `${describeScalarConstraint({ canonical, value })} Importing it would fail validation on the ` +
   `next run.`;
 
 const describeInvalidArray = ({ tool }: { tool: string }): string =>
   `Dropping "${tool}" while importing a hook: it must be a list of strings without ` +
   `newline, carriage return or NUL characters.`;
+
+/**
+ * An object is quoted by its offending key rather than its value: the payload
+ * can be arbitrarily large, and the missing or malformed key is what the
+ * reader needs to fix.
+ */
+const describeInvalidObject = ({
+  tool,
+  canonical,
+  value,
+}: {
+  tool: string;
+  canonical: string;
+  value: unknown;
+}): string =>
+  isPlainObject(value)
+    ? `Dropping "${tool}" while importing a hook: ` +
+      `${describeScalarConstraint({ canonical, value })} Importing it would fail validation ` +
+      `on the next run.`
+    : `Dropping "${tool}" while importing a hook: it must be an object.`;
 
 const describeInvalidRecord = ({ tool }: { tool: string }): string =>
   `Dropping "${tool}" while importing a hook: it must be a map of strings whose keys ` +
@@ -586,7 +786,7 @@ function emitGroupPassthroughFields({
     if (!carried.every(agrees)) {
       logger?.warn(
         `"${tool}" belongs to the whole matcher group on "${eventName}" hooks, so every hook in ` +
-          `this group gets ${JSON.stringify(first)} — including any that asked for something ` +
+          `this group gets ${quoteValueForWarning(first)} — including any that asked for something ` +
           `else, or for nothing.`,
       );
     }
@@ -654,6 +854,166 @@ function isSupportedHookType({
   return converterConfig.supportedHookTypes?.has(type ?? "command") ?? true;
 }
 
+type KeywordPassthroughFieldSpec = NonNullable<
+  ToolHooksConverterConfig["keywordPassthroughFields"]
+>[number];
+
+/**
+ * Whether a keyword field applies to this hook, warning about the reason when
+ * it does not. Shared by both directions: the field is unusable on the tool
+ * side either way, so the value is dropped rather than carried into a config
+ * the tool would ignore or refuse.
+ */
+function isKeywordFieldApplicable({
+  spec,
+  hookType,
+  eventName,
+  flags,
+  direction,
+  warn,
+}: {
+  spec: KeywordPassthroughFieldSpec;
+  hookType: HookType;
+  eventName: string;
+  /** The hook the field sits on, read for {@link KeywordPassthroughFieldSpec.ignoredWhenFlags}. */
+  flags: Readonly<Record<string, unknown>>;
+  direction: "generated" | "imported";
+  warn?: (message: string) => void;
+}): boolean {
+  const { canonical, tool, commandOnly, hookTypes, events, ignoredEvents, ignoredWhenFlags } = spec;
+  const field = direction === "generated" ? canonical : tool;
+  if (!isFieldApplicable({ commandOnly, hookType })) {
+    warn?.(
+      `Dropping "${field}" from a "${hookType}" hook on "${eventName}": this tool documents ` +
+        `"${tool}" on "command" hooks only, so it is not ${direction}.`,
+    );
+    return false;
+  }
+  if (hookTypes !== undefined && !hookTypes.has(hookType)) {
+    warn?.(
+      `Dropping "${field}" from a "${hookType}" hook on "${eventName}": this tool documents ` +
+        `"${tool}" on ${[...hookTypes].map((type) => `"${type}"`).join(", ")} hooks only, so it is not ${direction}.`,
+    );
+    return false;
+  }
+  if (events !== undefined && !events.has(eventName)) {
+    warn?.(
+      `Dropping "${field}" from a "${hookType}" hook on "${eventName}": this tool honours ` +
+        `"${tool}" on ${[...events].map((event) => `"${event}"`).join(", ")} only, so it is not ${direction}.`,
+    );
+    return false;
+  }
+  if (ignoredEvents?.has(eventName)) {
+    warn?.(
+      `Dropping "${field}" from a "${hookType}" hook on "${eventName}": this tool ignores ` +
+        `"${tool}" on "${eventName}", so it is not ${direction}.`,
+    );
+    return false;
+  }
+  const setFlag =
+    hookType === "command" ? ignoredWhenFlags?.find((flag) => flags[flag] === true) : undefined;
+  if (setFlag !== undefined) {
+    warn?.(
+      `Dropping "${field}" from a "${hookType}" hook on "${eventName}": this tool ignores ` +
+        `"${tool}" on a hook that sets "${setFlag}", so it is not ${direction}.`,
+    );
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Emit the keyword passthrough fields: a canonical `true` becomes the tool's
+ * keyword, while `false` is omitted as the tool's own default. A `true` the
+ * tool would not honour on this hook is warned about, like the other kinds;
+ * a `false` there is dropped silently, since omitting it changes nothing.
+ */
+function emitKeywordFields({
+  def,
+  hookType,
+  eventName,
+  fields,
+  warn,
+}: {
+  def: HooksConfig["hooks"][string][number];
+  hookType: HookType;
+  eventName: string;
+  fields: readonly KeywordPassthroughFieldSpec[];
+  warn?: (message: string) => void;
+}): Record<string, string> {
+  const emitted: Record<string, string> = {};
+  for (const spec of fields) {
+    const value = def[spec.canonical];
+    if (value !== true) {
+      continue;
+    }
+    if (
+      isKeywordFieldApplicable({
+        spec,
+        hookType,
+        eventName,
+        flags: def,
+        direction: "generated",
+        warn,
+      })
+    ) {
+      emitted[spec.tool] = spec.trueValue;
+    }
+  }
+  return emitted;
+}
+
+/**
+ * Import the keyword passthrough fields back into canonical booleans,
+ * reversing {@link emitKeywordFields}. Only the two documented keywords are
+ * read; anything else is warned about and dropped, so a typo in a hand-written
+ * tool file never lands in `.rulesync/hooks.*` as a boolean it did not mean.
+ */
+function importKeywordFields({
+  h,
+  hookType,
+  eventName,
+  fields,
+  warn,
+}: {
+  h: Record<string, unknown>;
+  hookType: HookType;
+  eventName: string;
+  fields: readonly KeywordPassthroughFieldSpec[];
+  warn?: (message: string) => void;
+}): Record<string, boolean> {
+  const imported: Record<string, boolean> = {};
+  for (const spec of fields) {
+    const value = h[spec.tool];
+    if (value === undefined) {
+      continue;
+    }
+    if (
+      !isKeywordFieldApplicable({
+        spec,
+        hookType,
+        eventName,
+        flags: h,
+        direction: "imported",
+        warn,
+      })
+    ) {
+      continue;
+    }
+    if (value === spec.trueValue) {
+      imported[spec.canonical] = true;
+    } else if (spec.falseValue !== undefined && value === spec.falseValue) {
+      imported[spec.canonical] = false;
+    } else {
+      warn?.(
+        `Dropping "${spec.tool}" from an imported "${hookType}" hook on "${eventName}": ` +
+          `${quoteValueForWarning(value)} is not a value this tool documents for it.`,
+      );
+    }
+  }
+  return imported;
+}
+
 /**
  * Emit every per-hook passthrough kind for one canonical definition.
  */
@@ -677,6 +1037,13 @@ function emitAllPassthroughFields({
       eventName,
       fields: converterConfig.booleanPassthroughFields ?? [],
       isValid: isBooleanValue,
+      warn,
+    }),
+    ...emitKeywordFields({
+      def,
+      hookType,
+      eventName,
+      fields: converterConfig.keywordPassthroughFields ?? [],
       warn,
     }),
     ...emitPassthroughFields<number>({
@@ -711,7 +1078,71 @@ function emitAllPassthroughFields({
       isValid: isEmittableRecord,
       warn,
     }),
+    ...emitPassthroughFields<Record<string, unknown>>({
+      def,
+      hookType,
+      eventName,
+      fields: converterConfig.objectPassthroughFields ?? [],
+      isValid: isEmittableObject,
+      warn,
+    }),
   };
+}
+
+/**
+ * Why a definition must not be emitted for this tool, or `undefined` when it
+ * can be: it carries a restricting field the tool refuses to honour (see
+ * `skippedWhenFields`).
+ */
+function describeExportSkipReason({
+  def,
+  hookType,
+  eventName,
+  converterConfig,
+}: {
+  def: HooksConfig["hooks"][string][number];
+  hookType: HookType;
+  eventName: string;
+  converterConfig: ToolHooksConverterConfig;
+}): string | undefined {
+  const field = converterConfig.skippedWhenFields?.find((name) => isNonEmptyString(def[name]));
+  if (field === undefined) {
+    return undefined;
+  }
+  return (
+    `Skipping a "${eventName}" ${hookType} hook (${quoteValueForWarning(def.command ?? def.url)}): ` +
+    `this tool does not support its "${field}" condition (${quoteValueForWarning(def[field])}), ` +
+    `and without it the hook would run on every call its matcher selects.`
+  );
+}
+
+/**
+ * Whether a definition can be emitted for this tool: its hook type is one the
+ * tool supports, and it carries no restricting field the tool refuses to
+ * honour (warned about here).
+ */
+function isEmittableDefinition({
+  def,
+  hookType,
+  eventName,
+  converterConfig,
+  warn,
+}: {
+  def: HooksConfig["hooks"][string][number];
+  hookType: HookType;
+  eventName: string;
+  converterConfig: ToolHooksConverterConfig;
+  warn?: (message: string) => void;
+}): boolean {
+  if (!isSupportedHookType({ type: hookType, converterConfig })) {
+    return false;
+  }
+  const skipReason = describeExportSkipReason({ def, hookType, eventName, converterConfig });
+  if (skipReason !== undefined) {
+    warn?.(skipReason);
+    return false;
+  }
+  return true;
 }
 
 function buildToolHooks({
@@ -728,7 +1159,7 @@ function buildToolHooks({
   const hooks: Array<Record<string, unknown>> = [];
   for (const def of defs) {
     const hookType = def.type ?? "command";
-    if (!isSupportedHookType({ type: hookType, converterConfig })) {
+    if (!isEmittableDefinition({ def, hookType, eventName, converterConfig, warn })) {
       continue;
     }
     const command = applyCommandPrefix({ def, converterConfig });
@@ -737,9 +1168,12 @@ function buildToolHooks({
       // fields below always win: a misconfigured `tool` name (e.g. mapping onto
       // "type"/"command") can never silently shadow them.
       ...emitAllPassthroughFields({ def, hookType, eventName, converterConfig, warn }),
-      type: hookType,
+      type: converterConfig.hookTypeNames?.[hookType] ?? hookType,
       ...(command !== undefined && command !== null && { command }),
-      ...(def.timeout !== undefined && def.timeout !== null && { timeout: def.timeout }),
+      ...(def.timeout !== undefined &&
+        def.timeout !== null && {
+          timeout: emitTimeout({ timeout: def.timeout, converterConfig }),
+        }),
       ...(def.prompt !== undefined && def.prompt !== null && { prompt: def.prompt }),
       // Type-specific payload fields (https://code.claude.com/docs/en/hooks).
       // Gated per type so e.g. an `url` authored on a command hook never
@@ -799,7 +1233,8 @@ export function canonicalToToolHooks({
   const warn = warnOnce(logger);
   const result: Record<string, unknown[]> = {};
   for (const [eventName, definitions] of Object.entries(effectiveHooks)) {
-    const toolEventName = converterConfig.canonicalToToolEventNames[eventName] ?? eventName;
+    const toolEventName =
+      lookupOwn({ record: converterConfig.canonicalToToolEventNames, key: eventName }) ?? eventName;
     const byMatcher = groupDefinitionsByMatcher({ definitions, converterConfig });
     const entries: unknown[] = [];
     const isNoMatcherEvent = converterConfig.noMatcherEvents?.has(eventName) ?? false;
@@ -837,44 +1272,61 @@ export function canonicalToToolHooks({
 }
 
 /**
- * Convert tool-specific hooks back to canonical format (shared by Claude and Factory Droid).
- * Reverses event name mapping and strips project directory variable prefix from commands.
+ * Strip the project directory variable from a tool command string, converting
+ * it back to `./`-relative paths (see `stripProjectDirVariable`).
  *
- * Note: This function does not strip matchers for noMatcherEvents. Tools themselves never produce
- * matchers on these events, so stripping is unnecessary on import. If a manually edited config
- * includes a matcher on such an event, it will be preserved in canonical format but dropped
- * on the next export (with a warning).
- */
-/**
- * Strip the project directory variable prefix from a tool command string,
- * converting it back to a `./`-relative command.
+ * With `warn`, a command that loses a variable generate will not put back (a
+ * data argument such as `npx prettier --write "$VAR"/src`) is reported: its
+ * path is resolved against the hook's working directory once regenerated.
  */
 function stripCommandPrefix({
   command,
+  args,
+  shell,
   converterConfig,
+  warn,
 }: {
   command: unknown;
+  args: unknown;
+  shell: unknown;
   converterConfig: ToolHooksConverterConfig;
+  warn?: (message: string) => void;
 }): string | undefined {
   const cmd = typeof command === "string" ? command : undefined;
-  if (converterConfig.projectDirVar === "" || typeof cmd !== "string") {
+  const { projectDirVar } = converterConfig;
+  if (projectDirVar === "" || typeof cmd !== "string") {
     return cmd;
   }
-  const quotedPrefix = `"${converterConfig.projectDirVar}"/`;
-  if (cmd.startsWith(quotedPrefix)) {
-    return `./${cmd.slice(quotedPrefix.length)}`;
+  const {
+    command: stripped,
+    unrestored,
+    retained,
+  } = importProjectDirVariable({
+    command: cmd,
+    projectDirVar,
+    // The exec form's command is one executable path, not shell words, and a
+    // non-POSIX shell's words are not what the scanner understands.
+    firstWordOnly:
+      isExecFormHook({ args, converterConfig }) || !runsInPosixShell({ shell, converterConfig }),
+  });
+  if (warn && unrestored) {
+    warn(
+      `Hook command ${quoteValueForWarning(cmd)} was imported as ${quoteValueForWarning(stripped)}: ` +
+        `a ${projectDirVar} path that is not a script the command runs becomes relative to the ` +
+        `hook's working directory and is not restored on generate. Put the exact command in a ` +
+        `tool-specific hooks override (such as "claudecode.hooks") to keep the variable.`,
+    );
   }
-  // The exec form's braced placeholder, so a generated hook round-trips back to
-  // the relative command it was authored as.
-  const bracedPrefix = `${bracePlaceholder(converterConfig.projectDirVar)}/`;
-  if (cmd.startsWith(bracedPrefix)) {
-    return `./${cmd.slice(bracedPrefix.length)}`;
+  if (warn && retained) {
+    warn(
+      `Hook command ${quoteValueForWarning(cmd)} keeps ${projectDirVar} in an assignment or ` +
+        `option value, or in a later word of a command whose later words are not normalized, ` +
+        `so the imported command still refers to it and other tools that do not define it ` +
+        `receive it verbatim. Put the exact command in a tool-specific hooks override (such as ` +
+        `"claudecode.hooks") if other tools should not see it.`,
+    );
   }
-  if (cmd.includes(`${converterConfig.projectDirVar}/`)) {
-    const escapedVar = converterConfig.projectDirVar.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    return cmd.replace(new RegExp(`^${escapedVar}\\/?`), "./");
-  }
-  return cmd;
+  return stripped;
 }
 
 /**
@@ -886,6 +1338,32 @@ const IMPORTED_HOOK_TYPES = new Set<HookType>(["command", "prompt", "http", "mcp
 
 function isImportedHookType(value: unknown): value is HookType {
   return typeof value === "string" && IMPORTED_HOOK_TYPES.has(value as HookType);
+}
+
+/**
+ * The canonical hook type a tool-side `type` value denotes: the tool's own
+ * spelling from {@link ToolHooksConverterConfig.hookTypeNames} when it has
+ * one, otherwise the value itself when it is a canonical type, and `command`
+ * for anything else (the same coercion as before the renames existed).
+ */
+function resolveImportedHookType({
+  value,
+  converterConfig,
+}: {
+  value: unknown;
+  converterConfig: ToolHooksConverterConfig;
+}): HookType {
+  const names = converterConfig.hookTypeNames;
+  if (names !== undefined && typeof value === "string") {
+    for (const [canonical, tool] of Object.entries(names)) {
+      if (tool === value) return canonical as HookType;
+    }
+    // A tool spelling shadows the canonical name it replaces: when the tool
+    // calls the canonical `http` handler `https`, a bare `http` in its file
+    // is not a handler the tool has.
+    if (Object.hasOwn(names, value)) return "command";
+  }
+  return isImportedHookType(value) ? value : "command";
 }
 
 function isStringRecord(value: unknown): value is Record<string, string> {
@@ -924,11 +1402,22 @@ function isSafeStringRecord(value: unknown): value is Record<string, string> {
   if (!isPlainObject(value) || !isStringRecord(value)) {
     return false;
   }
-  return Object.entries(value).every(
-    ([key, entry]) =>
-      key !== "" &&
-      !key.includes("=") &&
-      !CONTROL_CHARS.some((char) => key.includes(char) || entry.includes(char)),
+  return Object.entries(value).every(([key, entry]) => isSafeEnvEntry({ key, value: entry }));
+}
+
+/**
+ * Whether one `env` entry survives the rule {@link isSafeStringRecord} applies
+ * to the whole map. Exported for the adapters that hand a tool an environment
+ * block outside the shared converter (Tabnine, whose hook shape it does not
+ * express) so they drop the same entries this one does.
+ */
+export function isSafeEnvEntry(entry: { key: string; value: unknown }): boolean {
+  const { key, value } = entry;
+  return (
+    typeof value === "string" &&
+    key !== "" &&
+    !key.includes("=") &&
+    !CONTROL_CHARS.some((char) => key.includes(char) || value.includes(char))
   );
 }
 
@@ -1027,11 +1516,13 @@ function importTypePayloadFields({
 function importAllPassthroughFields({
   h,
   hookType,
+  eventName,
   converterConfig,
   warn,
 }: {
   h: Record<string, unknown>;
   hookType: HookType;
+  eventName: string;
   converterConfig: ToolHooksConverterConfig;
   warn?: (message: string) => void;
 }): Record<string, unknown> {
@@ -1041,6 +1532,13 @@ function importAllPassthroughFields({
       hookType,
       fields: converterConfig.booleanPassthroughFields ?? [],
       isValid: isBooleanValue,
+      warn,
+    }),
+    ...importKeywordFields({
+      h,
+      hookType,
+      eventName,
+      fields: converterConfig.keywordPassthroughFields ?? [],
       warn,
     }),
     ...importPassthroughFields<number>({
@@ -1083,6 +1581,16 @@ function importAllPassthroughFields({
       describeInvalid: describeInvalidRecord,
       warn,
     }),
+    ...importPassthroughFields<Record<string, unknown>>({
+      h,
+      hookType,
+      fields: converterConfig.objectPassthroughFields ?? [],
+      // Stricter than the emit side: the canonical field declares the keys the
+      // object must carry, and a hand-written tool config need not.
+      isValid: isImportableObject,
+      describeInvalid: describeInvalidObject,
+      warn,
+    }),
   };
 }
 
@@ -1092,24 +1600,35 @@ function importAllPassthroughFields({
 function toolHookToCanonical({
   h,
   rawEntry,
+  eventName,
   converterConfig,
   warn,
 }: {
   h: Record<string, unknown>;
   rawEntry: ToolMatcherEntry;
+  eventName: string;
   converterConfig: ToolHooksConverterConfig;
   warn?: (message: string) => void;
 }): HooksConfig["hooks"][string][number] {
-  const hookType = isImportedHookType(h.type) ? h.type : "command";
+  const hookType = resolveImportedHookType({ value: h.type, converterConfig });
   // A value that defines this hook type has already been checked by
   // `describeHookSkipReason`; this catches the same field left on a type it
   // does not define, where losing it alone changes nothing.
   const command = importCanonicalString({
-    value: stripCommandPrefix({ command: h.command, converterConfig }),
+    value: stripCommandPrefix({
+      command: h.command,
+      args: h.args,
+      shell: h.shell,
+      converterConfig,
+      warn,
+    }),
     canonical: "command",
     warn,
   });
-  const timeout = typeof h.timeout === "number" ? h.timeout : undefined;
+  const timeout =
+    typeof h.timeout === "number"
+      ? importTimeout({ timeout: h.timeout, converterConfig })
+      : undefined;
   const prompt = importCanonicalString({ value: h.prompt, canonical: "prompt", warn });
   const name = importCanonicalString({ value: h.name, canonical: "name", warn });
   const description = importCanonicalString({
@@ -1130,7 +1649,7 @@ function toolHookToCanonical({
     ...(converterConfig.passthroughFields?.includes("name") && name !== undefined && { name }),
     ...(converterConfig.passthroughFields?.includes("description") &&
       description !== undefined && { description }),
-    ...importAllPassthroughFields({ h, hookType, converterConfig, warn }),
+    ...importAllPassthroughFields({ h, hookType, eventName, converterConfig, warn }),
     ...importGroupPassthroughFields({ rawEntry, converterConfig }),
     ...(matcher !== undefined && matcher !== null && matcher !== "" && { matcher }),
   };
@@ -1170,7 +1689,12 @@ function definingFields({
       field: "command",
       value:
         typeof h.command === "string"
-          ? stripCommandPrefix({ command: h.command, converterConfig })
+          ? stripCommandPrefix({
+              command: h.command,
+              args: h.args,
+              shell: h.shell,
+              converterConfig,
+            })
           : h.command,
     });
   }
@@ -1208,7 +1732,7 @@ function describeGroupSkipReason({
     if (!isGroupPassthroughValue(value, valueType)) {
       return (
         `Skipping the hooks of a matcher group while importing: its "${tool}" ` +
-        `(${JSON.stringify(value)}) is unusable, and these hooks run only where it matches. ` +
+        `(${quoteValueForWarning(value)}) is unusable, and these hooks run only where it matches. ` +
         `Importing them without it would widen when they fire, so they are skipped.`
       );
     }
@@ -1235,7 +1759,7 @@ function describeHookSkipReason({
       continue;
     }
     return (
-      `Skipping a hook while importing: its "${field}" (${JSON.stringify(value)}) is unusable — ` +
+      `Skipping a hook while importing: its "${field}" (${quoteValueForWarning(value)}) is unusable — ` +
       `${describeScalarConstraint({ canonical: field, value })} Keeping the hook without it would ` +
       `change what it does, so the whole hook is skipped.`
     );
@@ -1248,10 +1772,13 @@ function describeHookSkipReason({
  */
 function toolMatcherEntryToCanonical({
   rawEntry,
+  eventName,
   converterConfig,
   warn,
 }: {
   rawEntry: ToolMatcherEntry;
+  /** The canonical event the entry belongs to. */
+  eventName: string;
   converterConfig: ToolHooksConverterConfig;
   warn?: (message: string) => void;
 }): HooksConfig["hooks"][string] {
@@ -1263,13 +1790,13 @@ function toolMatcherEntryToCanonical({
   }
   const definitions: HooksConfig["hooks"][string] = [];
   for (const h of hookDefs) {
-    const hookType = isImportedHookType(h.type) ? h.type : "command";
+    const hookType = resolveImportedHookType({ value: h.type, converterConfig });
     const skipReason = describeHookSkipReason({ h, rawEntry, hookType, converterConfig });
     if (skipReason !== undefined) {
       warn?.(skipReason);
       continue;
     }
-    definitions.push(toolHookToCanonical({ h, rawEntry, converterConfig, warn }));
+    definitions.push(toolHookToCanonical({ h, rawEntry, eventName, converterConfig, warn }));
   }
   return definitions;
 }
@@ -1317,6 +1844,15 @@ export function buildImportedHooksConfig({
   return config;
 }
 
+/**
+ * Convert tool-specific hooks back to canonical format (shared by Claude and Factory Droid).
+ * Reverses event name mapping and strips the project directory variable from commands.
+ *
+ * Note: This function does not strip matchers for noMatcherEvents. Tools themselves never produce
+ * matchers on these events, so stripping is unnecessary on import. If a manually edited config
+ * includes a matcher on such an event, it will be preserved in canonical format but dropped
+ * on the next export (with a warning).
+ */
 export function toolHooksToCanonical({
   hooks,
   converterConfig,
@@ -1335,15 +1871,21 @@ export function toolHooksToCanonical({
   const warn = warnOnce(logger);
   const canonical: HooksConfig["hooks"] = {};
   for (const [toolEventName, matcherEntries] of Object.entries(hooks)) {
-    const eventName = converterConfig.toolToCanonicalEventNames[toolEventName] ?? toolEventName;
+    const eventName =
+      lookupOwn({ record: converterConfig.toolToCanonicalEventNames, key: toolEventName }) ??
+      toolEventName;
     if (!Array.isArray(matcherEntries)) continue;
     const defs: HooksConfig["hooks"][string] = [];
     for (const rawEntry of matcherEntries) {
       if (!isToolMatcherEntry(rawEntry)) continue;
-      defs.push(...toolMatcherEntryToCanonical({ rawEntry, converterConfig, warn }));
+      defs.push(...toolMatcherEntryToCanonical({ rawEntry, eventName, converterConfig, warn }));
     }
     if (defs.length > 0) {
-      canonical[eventName] = defs;
+      // Append rather than assign: a tool can expose two native names for one
+      // canonical event (Devin's `PostCompaction` and `PostCompact`), and both
+      // keys' hooks must survive the import.
+      const existing = Object.hasOwn(canonical, eventName) ? canonical[eventName] : undefined;
+      canonical[eventName] = existing ? [...existing, ...defs] : defs;
     }
   }
   return canonical;

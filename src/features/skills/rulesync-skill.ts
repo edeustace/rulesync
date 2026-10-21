@@ -4,7 +4,7 @@ import { z } from "zod/mini";
 
 import { SKILL_FILE_NAME } from "../../constants/general.js";
 import { RULESYNC_SKILLS_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
-import { AiDir, AiDirFile, ValidationResult } from "../../types/ai-dir.js";
+import { AiDir, AiDirFile, containsPathSeparator, ValidationResult } from "../../types/ai-dir.js";
 import { RulesyncTargetsSchema } from "../../types/tool-targets.js";
 import { formatError } from "../../utils/error.js";
 import { fileExists, readFileContent } from "../../utils/file.js";
@@ -28,12 +28,28 @@ function isUnsafeSkillDirName(name: string): boolean {
     name === "" ||
     name === "." ||
     name === ".." ||
-    name.includes("/") ||
-    name.includes("\\") ||
+    containsPathSeparator(name) ||
     name.endsWith(".") ||
     name.endsWith(" ")
   );
 }
+
+const piSkillSectionSchema = z.looseObject({
+  // Pi implements the Agent Skills spec: `allowed-tools` is a
+  // space-delimited string and `compatibility` a 1-500 character string.
+  // Both legacy rulesync forms stay accepted.
+  // https://agentskills.io/specification
+  "allowed-tools": z.optional(z.union([z.string(), z.array(z.string())])),
+  "disable-model-invocation": z.optional(z.boolean()),
+  license: z.optional(z.string()),
+  compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
+  metadata: z.optional(z.looseObject({})),
+});
+
+const antigravitySkillSectionSchema = z.looseObject({
+  "disable-slash-command": z.optional(z.boolean()),
+  metadata: z.optional(z.looseObject({})),
+});
 
 const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
   name: z.string().check(
@@ -44,19 +60,35 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
   ),
   description: z.string(),
   targets: z._default(RulesyncTargetsSchema, ["*"]),
-  // Default for tools that support the flag (claudecode, cursor, zed, pi, qwencode, grokcli, factorydroid).
+  // Default for tools that support the flag (claudecode, codebuddy, copilot, copilotcli, crush,
+  // cursor, zed, pi, omp, qwencode, vibe, grokcli, factorydroid, dsh, reasonix, commandcode,
+  // lettacode, opencode, mimocode).
   // A target-section value of the same key overrides this default.
   // `devin` also consumes this root value (mapping `true` onto a user-only
   // `triggers` list); it has no section key of the same name, but a
   // `devin.triggers` section value overrides it.
   "disable-model-invocation": z.optional(z.boolean()),
-  // Default for tools that support the flag (claudecode, copilot, copilotcli, cursor,
-  // qwencode, vibe, grokcli, factorydroid).
+  // Default for tools that support the flag (claudecode, codebuddy, copilot, copilotcli,
+  // crush, cursor, qwencode, vibe, grokcli, factorydroid, dsh, reasonix, commandcode, lettacode).
   // A target-section value of the same key overrides this default.
   // `devin` also consumes this root value (mapping `false` onto a model-only
   // `triggers` list); it has no section key of the same name, but a
   // `devin.triggers` section value overrides it.
+  // The Antigravity targets also consume this root value (mapping `false` onto
+  // `disable-slash-command: true`); their section's `disable-slash-command`
+  // overrides it.
   "user-invocable": z.optional(z.boolean()),
+  // Shared defaults for the three Agent Skills standard packaging fields. Each
+  // applies to every tool that models the field, and a target-section value of
+  // the same key overrides it. The per-field tool lists live in
+  // `docs/reference/file-formats.md` (the `.rulesync/skills/` frontmatter).
+  // The Agent Skills spec types `compatibility` as a free-form string (1–500
+  // chars) and `metadata` as a string→string map; the object form of
+  // `compatibility` and non-string `metadata` values stay accepted for
+  // back-compat and are normalized per target where the target requires it.
+  license: z.optional(z.string()),
+  compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
+  metadata: z.optional(z.looseObject({})),
   claudecode: z.optional(
     z.looseObject({
       when_to_use: z.optional(z.string()),
@@ -120,11 +152,27 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
   opencode: z.optional(
     z.looseObject({
       "allowed-tools": z.optional(z.array(z.string())),
-      license: z.optional(z.string()),
-      // OpenCode documents `compatibility` as a free-form string; the object
-      // form stays accepted for back-compat. See https://opencode.ai/docs/skills/
-      compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
-      metadata: z.optional(z.looseObject({})),
+      // OpenCode's actual `Frontmatter` schema (`packages/core/src/skill.ts`
+      // in sst/opencode) does not define `license`, `compatibility`, or
+      // `metadata` at all, so it never validates or rejects them. Left
+      // untyped so rulesync never aborts on a value the tool itself
+      // tolerates. See https://opencode.ai/docs/skills/
+      license: z.optional(z.unknown()),
+      compatibility: z.optional(z.unknown()),
+      metadata: z.optional(z.unknown()),
+      "disable-model-invocation": z.optional(z.boolean()),
+    }),
+  ),
+  // Mirrors `opencode` so a skill round-trips through the shared OpenCode
+  // adapter; MiMo Code itself ignores these extra SKILL.md fields, except
+  // `disable-model-invocation`, which its skill loader reads.
+  mimocode: z.optional(
+    z.looseObject({
+      "allowed-tools": z.optional(z.array(z.string())),
+      license: z.optional(z.unknown()),
+      compatibility: z.optional(z.unknown()),
+      metadata: z.optional(z.unknown()),
+      "disable-model-invocation": z.optional(z.boolean()),
     }),
   ),
   kilo: z.optional(
@@ -132,9 +180,14 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
       // `allowed-tools` is not part of Kilo's official SKILL.md frontmatter; it is
       // retained for backward compatibility with existing rulesync skill files.
       "allowed-tools": z.optional(z.array(z.string())),
-      license: z.optional(z.string()),
-      compatibility: z.optional(z.looseObject({})),
-      metadata: z.optional(z.looseObject({})),
+      // Kilo Code's SKILL.md parser is forked from OpenCode's engine, whose
+      // schema does not model `license`, `compatibility`, or `metadata` at
+      // all, so it cannot reject any shape rulesync writes for them. Left
+      // untyped so rulesync never aborts on a value the tool itself
+      // tolerates.
+      license: z.optional(z.unknown()),
+      compatibility: z.optional(z.unknown()),
+      metadata: z.optional(z.unknown()),
     }),
   ),
   kiro: z.optional(
@@ -150,11 +203,15 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
   deepagents: z.optional(
     z.looseObject({
       "allowed-tools": z.optional(z.array(z.string())),
-      license: z.optional(z.string()),
-      // The Agent Skills spec defines `compatibility` as a free-form string
-      // (1–500 chars); an object form is also tolerated for back-compat.
-      compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
-      metadata: z.optional(z.looseObject({})),
+      // dcode's `_parse_skill_metadata` never hard-fails on an unexpected
+      // shape for `license`, `compatibility`, or `metadata`: values are
+      // coerced with `str()`, an overlong `compatibility` is truncated with a
+      // logged warning, and non-dict `metadata` is replaced with `{}` and a
+      // logged warning. Left untyped so rulesync never aborts on a value the
+      // tool itself tolerates.
+      license: z.optional(z.unknown()),
+      compatibility: z.optional(z.unknown()),
+      metadata: z.optional(z.unknown()),
     }),
   ),
   copilot: z.optional(
@@ -182,19 +239,9 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
       "disable-model-invocation": z.optional(z.boolean()),
     }),
   ),
-  pi: z.optional(
-    z.looseObject({
-      // Pi implements the Agent Skills spec: `allowed-tools` is a
-      // space-delimited string and `compatibility` a 1-500 character string.
-      // Both legacy rulesync forms stay accepted.
-      // https://agentskills.io/specification
-      "allowed-tools": z.optional(z.union([z.string(), z.array(z.string())])),
-      "disable-model-invocation": z.optional(z.boolean()),
-      license: z.optional(z.string()),
-      compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
-      metadata: z.optional(z.looseObject({})),
-    }),
-  ),
+  pi: z.optional(piSkillSectionSchema),
+  // oh-my-pi keeps Pi's SKILL.md format, so its section mirrors `pi`.
+  omp: z.optional(piSkillSectionSchema),
   zed: z.optional(
     z.looseObject({
       "disable-model-invocation": z.optional(z.boolean()),
@@ -214,6 +261,10 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
   ),
   cline: z.optional(z.looseObject({})),
   roo: z.optional(z.looseObject({})),
+  // IBM Bob reads Anthropic-style SKILL.md files and documents only
+  // `name`/`description`, so this section carries any extra keys verbatim.
+  // https://bob.ibm.com/docs/ide/features/skills
+  bob: z.optional(z.looseObject({})),
   // Amp reads the open Agent Skills standard and documents no field beyond
   // `name`/`description`, so this section only carries keys a hand-written
   // SKILL.md happens to add.
@@ -261,6 +312,10 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
       paths: z.optional(z.union([z.string(), z.array(z.string())])),
       "disable-model-invocation": z.optional(z.boolean()),
       "user-invocable": z.optional(z.boolean()),
+      // Custom Modes badge; free-form strings since Cursor falls back to its
+      // default badge for unrecognized values.
+      icon: z.optional(z.string()),
+      color: z.optional(z.string()),
       metadata: z.optional(z.looseObject({})),
     }),
   ),
@@ -285,6 +340,41 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
   // skill tool, `disable-model-invocation: true` blocks auto-invocation.
   grokcli: z.optional(
     z.looseObject({
+      "disable-model-invocation": z.optional(z.boolean()),
+      "user-invocable": z.optional(z.boolean()),
+      // Gitignore-style globs that keep the skill hidden until a tool touches
+      // a matching file. Grok reads a YAML list or a comma-separated string.
+      paths: z.optional(z.union([z.string(), z.array(z.string())])),
+      // The other optional fields Grok's skill parser reads, written verbatim.
+      // `when-to-use` is the documented spelling; `when_to_use` is an alias.
+      "when-to-use": z.optional(z.string()),
+      when_to_use: z.optional(z.string()),
+      "allowed-tools": z.optional(z.union([z.string(), z.array(z.string())])),
+      "argument-hint": z.optional(z.string()),
+      model: z.optional(z.string()),
+      effort: z.optional(z.string()),
+      license: z.optional(z.string()),
+      compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
+      metadata: z.optional(z.looseObject({})),
+    }),
+  ),
+  // DeepSeek Harness reads `whenToUse` (extra trigger-timing context),
+  // `metadata`, and both invocation flags from a skill's frontmatter.
+  dsh: z.optional(
+    z.looseObject({
+      whenToUse: z.optional(z.string()),
+      metadata: z.optional(z.looseObject({})),
+      "disable-model-invocation": z.optional(z.boolean()),
+      "user-invocable": z.optional(z.boolean()),
+    }),
+  ),
+  // Reasonix reads both invocation flags natively on the CLI v2 line; the
+  // adapter also writes the v1 line's `invocation: manual` for a
+  // `disable-model-invocation: true`. `invocation` (`auto` | `manual`) is
+  // Reasonix's own catalog switch and is written verbatim when set.
+  reasonix: z.optional(
+    z.looseObject({
+      invocation: z.optional(z.string()),
       "disable-model-invocation": z.optional(z.boolean()),
       "user-invocable": z.optional(z.boolean()),
     }),
@@ -314,9 +404,44 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
       compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
       metadata: z.optional(z.looseObject({})),
       "user-invocable": z.optional(z.boolean()),
+      "disable-model-invocation": z.optional(z.boolean()),
       "allowed-tools": z.optional(z.union([z.string(), z.array(z.string())])),
     }),
   ),
+  commandcode: z.optional(
+    z.looseObject({
+      license: z.optional(z.string()),
+      compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
+      metadata: z.optional(z.looseObject({})),
+      "disable-model-invocation": z.optional(z.boolean()),
+      "user-invocable": z.optional(z.boolean()),
+    }),
+  ),
+  // Letta Code reads `when_to_use`, `argument-hint`, `category`, `tags` and
+  // both invocation flags from a skill's frontmatter.
+  lettacode: z.optional(
+    z.looseObject({
+      when_to_use: z.optional(z.string()),
+      "argument-hint": z.optional(z.string()),
+      category: z.optional(z.string()),
+      tags: z.optional(z.union([z.string(), z.array(z.string())])),
+      "disable-model-invocation": z.optional(z.boolean()),
+      "user-invocable": z.optional(z.boolean()),
+    }),
+  ),
+  cortexcode: z.optional(z.looseObject({})),
+  // CodeBuddy Code: every documented SKILL.md key (`allowed-tools`, `context`,
+  // `agent`, `model`, `hooks`, ...) passes through this section.
+  // https://www.codebuddy.ai/docs/cli/skills
+  codebuddy: z.optional(
+    z.looseObject({
+      "disable-model-invocation": z.optional(z.boolean()),
+      "user-invocable": z.optional(z.boolean()),
+    }),
+  ),
+  codewhale: z.optional(z.looseObject({})),
+  continue: z.optional(z.looseObject({})),
+  tabnine: z.optional(z.looseObject({})),
   takt: z.optional(
     z.looseObject({
       // Rename the emitted file stem (e.g. "test-skill.md" → "{name}.md").
@@ -326,6 +451,46 @@ const RulesyncSkillFrontmatterSchemaInternal = z.looseObject({
       extends: z.optional(z.string()),
     }),
   ),
+  // Crush's `Skill` struct (internal/skills/skills.go) fields beyond
+  // `name`/`description`: both invocation gates plus the Agent Skills
+  // packaging trio. Crush itself types `compatibility` as a free-form
+  // string, but the section also accepts the legacy object form (mirrors
+  // every other tool section that resolves this field) so an object-shaped
+  // root default round-trips instead of failing validation.
+  // https://github.com/charmbracelet/crush/blob/main/internal/skills/skills.go
+  crush: z.optional(
+    z.looseObject({
+      "disable-model-invocation": z.optional(z.boolean()),
+      "user-invocable": z.optional(z.boolean()),
+      license: z.optional(z.string()),
+      compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
+      metadata: z.optional(z.looseObject({})),
+    }),
+  ),
+  // Meta Muse Code reads the Agent Skills packaging fields: `skills inspect`
+  // reports `license` (1.4.0) and `metadata.display-name` renames the skill in
+  // the UI (1.4.7). https://dev.meta.ai/docs/muse-code/changelog
+  musecode: z.optional(
+    z.looseObject({
+      license: z.optional(z.string()),
+      compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
+      metadata: z.optional(z.looseObject({})),
+    }),
+  ),
+  // ZCode's "Skill SKILL.md Field Reference" allowlists exactly five keys:
+  // required `name`/`description` plus optional `when_to_use`, `license` and
+  // `metadata`. There is no `compatibility` field, so it is not offered here.
+  // https://zcode.z.ai/en/docs/plugin
+  zcode: z.optional(
+    z.looseObject({
+      when_to_use: z.optional(z.string()),
+      license: z.optional(z.string()),
+      metadata: z.optional(z.looseObject({})),
+    }),
+  ),
+  // `antigravity-plugin` reads the `antigravity-ide` section.
+  "antigravity-ide": z.optional(antigravitySkillSectionSchema),
+  "antigravity-cli": z.optional(antigravitySkillSectionSchema),
 });
 
 // Export schema with targets optional for input but guaranteed in output
@@ -338,6 +503,9 @@ export type RulesyncSkillFrontmatterInput = {
   targets?: ("*" | string)[];
   "disable-model-invocation"?: boolean;
   "user-invocable"?: boolean;
+  license?: string;
+  compatibility?: string | Record<string, unknown>;
+  metadata?: Record<string, unknown>;
   claudecode?: {
     when_to_use?: string;
     "allowed-tools"?: string | string[];
@@ -360,6 +528,27 @@ export type RulesyncSkillFrontmatterInput = {
     metadata?: Record<string, unknown>;
   };
   grokcli?: {
+    "disable-model-invocation"?: boolean;
+    "user-invocable"?: boolean;
+    paths?: string | string[];
+    "when-to-use"?: string;
+    when_to_use?: string;
+    "allowed-tools"?: string | string[];
+    "argument-hint"?: string;
+    model?: string;
+    effort?: string;
+    license?: string;
+    compatibility?: string | Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+  };
+  dsh?: {
+    whenToUse?: string;
+    metadata?: Record<string, unknown>;
+    "disable-model-invocation"?: boolean;
+    "user-invocable"?: boolean;
+  };
+  reasonix?: {
+    invocation?: string;
     "disable-model-invocation"?: boolean;
     "user-invocable"?: boolean;
   };
@@ -388,12 +577,23 @@ export type RulesyncSkillFrontmatterInput = {
   };
   opencode?: {
     "allowed-tools"?: string[];
-    license?: string;
-    compatibility?: string | Record<string, unknown>;
-    metadata?: Record<string, unknown>;
+    license?: unknown;
+    compatibility?: unknown;
+    metadata?: unknown;
+    "disable-model-invocation"?: boolean;
+  };
+  mimocode?: {
+    "allowed-tools"?: string[];
+    license?: unknown;
+    compatibility?: unknown;
+    metadata?: unknown;
+    "disable-model-invocation"?: boolean;
   };
   kilo?: {
     "allowed-tools"?: string[];
+    license?: unknown;
+    compatibility?: unknown;
+    metadata?: unknown;
   };
   kiro?: {
     license?: string;
@@ -402,9 +602,9 @@ export type RulesyncSkillFrontmatterInput = {
   };
   deepagents?: {
     "allowed-tools"?: string[];
-    license?: string;
-    compatibility?: string | Record<string, unknown>;
-    metadata?: Record<string, unknown>;
+    license?: unknown;
+    compatibility?: unknown;
+    metadata?: unknown;
   };
   copilot?: {
     license?: string;
@@ -428,6 +628,13 @@ export type RulesyncSkillFrontmatterInput = {
     compatibility?: string | Record<string, unknown>;
     metadata?: Record<string, unknown>;
   };
+  omp?: {
+    "allowed-tools"?: string | string[];
+    "disable-model-invocation"?: boolean;
+    license?: string;
+    compatibility?: string | Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+  };
   zed?: {
     "disable-model-invocation"?: boolean;
   };
@@ -438,6 +645,7 @@ export type RulesyncSkillFrontmatterInput = {
     metadata?: Record<string, unknown>;
   };
   roo?: Record<string, unknown>;
+  bob?: Record<string, unknown>;
   cline?: Record<string, unknown>;
   amp?: Record<string, unknown>;
   devin?: {
@@ -470,6 +678,8 @@ export type RulesyncSkillFrontmatterInput = {
     paths?: string | string[];
     "disable-model-invocation"?: boolean;
     "user-invocable"?: boolean;
+    icon?: string;
+    color?: string;
     metadata?: Record<string, unknown>;
   };
   factorydroid?: {
@@ -500,12 +710,55 @@ export type RulesyncSkillFrontmatterInput = {
     compatibility?: string | Record<string, unknown>;
     metadata?: Record<string, unknown>;
     "user-invocable"?: boolean;
+    "disable-model-invocation"?: boolean;
     "allowed-tools"?: string | string[];
   };
+  commandcode?: Record<string, unknown>;
+  lettacode?: {
+    when_to_use?: string;
+    "argument-hint"?: string;
+    category?: string;
+    tags?: string | string[];
+    "disable-model-invocation"?: boolean;
+    "user-invocable"?: boolean;
+  };
+  cortexcode?: Record<string, unknown>;
+  codebuddy?: Record<string, unknown> & {
+    "disable-model-invocation"?: boolean;
+    "user-invocable"?: boolean;
+  };
+  codewhale?: Record<string, unknown>;
+  continue?: Record<string, unknown>;
+  tabnine?: Record<string, unknown>;
   takt?: {
     name?: string;
     extends?: string;
   };
+  crush?: {
+    "disable-model-invocation"?: boolean;
+    "user-invocable"?: boolean;
+    license?: string;
+    compatibility?: string | Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+  };
+  musecode?: {
+    license?: string;
+    compatibility?: string | Record<string, unknown>;
+    metadata?: Record<string, unknown>;
+  };
+  zcode?: {
+    when_to_use?: string;
+    license?: string;
+    metadata?: Record<string, unknown>;
+  };
+  "antigravity-ide"?: AntigravitySkillSectionInput;
+  "antigravity-cli"?: AntigravitySkillSectionInput;
+};
+
+type AntigravitySkillSectionInput = {
+  "disable-slash-command"?: boolean;
+  metadata?: Record<string, unknown>;
+  [key: string]: unknown;
 };
 
 // Type for output/validated data (targets is always present after validation)

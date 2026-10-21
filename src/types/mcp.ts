@@ -37,6 +37,45 @@ export function isEnvVarEntryArray(value: unknown): value is (string | { name: s
   return Array.isArray(value) && value.every((entry) => EnvVarEntrySchema.safeParse(entry).success);
 }
 
+/**
+ * One `codexcliTools` entry, mirroring Codex's `McpServerToolConfig`. Loose,
+ * because upstream's deserializer ignores keys it does not know, so a field
+ * Codex adds later passes through. The two known fields are checked strictly:
+ * an unknown `approval_mode` variant or a zero `output_token_limit` (a
+ * `NonZeroUsize`) is a deserialization error that makes Codex reject the whole
+ * `config.toml`, so it fails on the rulesync side instead.
+ * @see https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/config/src/mcp_types.rs
+ * @see https://learn.chatgpt.com/docs/config-file/config-reference
+ */
+export const CodexcliMcpToolConfigSchema = z.looseObject({
+  approval_mode: z.optional(z.enum(["auto", "prompt", "writes", "approve"])),
+  output_token_limit: z.optional(z.int().check(z.positive())),
+});
+
+/**
+ * Whether a value is usable as one `codexcliTools` entry. Applied in both
+ * directions by the codex adapter, like {@link isEnvVarEntryArray}.
+ */
+export function isCodexcliToolConfig(value: unknown): value is Record<string, unknown> {
+  return CodexcliMcpToolConfigSchema.safeParse(value).success;
+}
+
+// Crush's `MCPChannelReply` (v0.97.0): Go decodes it into a typed struct, so
+// a malformed value (a route that is not an object, or one without `tool`)
+// would fail the whole crush.json load rather than just this server.
+// https://github.com/charmbracelet/crush/blob/v0.98.1/internal/config/config.go
+const CrushChannelReplyRouteSchema = z.looseObject({
+  tool: z.string(),
+  target_param: z.optional(z.string()),
+  target_meta: z.optional(z.string()),
+});
+export const CrushChannelReplySchema = z.looseObject({
+  user: z.optional(CrushChannelReplyRouteSchema),
+  group: z.optional(CrushChannelReplyRouteSchema),
+  message_param: z.optional(z.string()),
+  suppress_tools: z.optional(z.array(z.string())),
+});
+
 export const McpServerSchema = z.looseObject({
   // `streamable-http` is the MCP spec's transport name and an accepted alias for
   // `http` (Claude Code), so configs copied from server docs work unchanged.
@@ -64,6 +103,14 @@ export const McpServerSchema = z.looseObject({
   // stripped by `RulesyncMcp.getMcpServers()`, like `envVars`.
   // https://learn.chatgpt.com/docs/extend/mcp
   experimentalEnvironment: z.optional(z.string()),
+  // Codex CLI-specific: per-tool settings keyed by tool name, written as
+  // Codex's `[mcp_servers.<name>.tools.<tool>]` tables. Namespaced because the
+  // canonical `tools` is a string array, while Codex reads `tools` as this
+  // table (see the collision rule on `enabledTools` below). Stripped by
+  // `RulesyncMcp.getMcpServers()` so it does not leak into other tools'
+  // configs, like `envVars`.
+  // https://learn.chatgpt.com/docs/config-file/config-reference
+  codexcliTools: z.optional(z.record(z.string(), CodexcliMcpToolConfigSchema)),
   disabled: z.optional(z.boolean()),
   networkTimeout: z.optional(z.number()),
   timeout: z.optional(z.number()),
@@ -91,9 +138,11 @@ export const McpServerSchema = z.looseObject({
   // case where naming the file that holds the typo beats passing it along.
   // https://dev.meta.ai/docs/muse-code/extending.md
   musecodeMode: z.optional(z.enum(["required", "optional"])),
-  // Rovo Dev-specific: opts this server's initialization-response instructions
-  // into the agent's system prompt. Absent or `false` means Rovo Dev ignores
-  // them as untrusted; Atlassian's own built-in servers are enabled without it.
+  // Rovo Dev-specific: decides whether this server's initialization-response
+  // instructions join the agent's system prompt. A tri-state: absent or `true`
+  // surfaces them, `false` suppresses them. Atlassian inverted this default on
+  // 2026-09-02 — it used to be opt-in — so `false` is the value that carries a
+  // trust decision and must survive both directions.
   // Written as `enable_instructions` by `rovodev-mcp.ts` and stripped by
   // `RulesyncMcp.getMcpServers()`, like `envVars` — and here the strip is the
   // point rather than tidiness: the key decides whether a third-party server's
@@ -101,6 +150,42 @@ export const McpServerSchema = z.looseObject({
   // not writing about.
   // https://support.atlassian.com/rovo/docs/connect-to-an-mcp-server-in-rovo-dev-cli/
   rovodevEnableInstructions: z.optional(z.boolean()),
+  // Crush-specific: the OAuth 2.1 flow Crush runs for an HTTP server
+  // (`oauth`, `oauth_client_id`, `oauth_client_secret`, `oauth_callback_port`)
+  // its `sessionless` marker for a server that issues no `Mcp-Session-Id`,
+  // and its Claude Channels keys (`channel_enabled`, `channel_reply`, since
+  // v0.97.0), which only matter for a server that implements channels.
+  // Written under Crush's own names by `crush-mcp.ts` and
+  // stripped by `RulesyncMcp.getMcpServers()`, like `envVars`: the client
+  // secret in particular must not be copied into every other tool's config.
+  // Namespaced because the canonical `oauth` key already carries Claude
+  // Code's `{ clientId }` object, which Codex CLI reads.
+  // https://github.com/charmbracelet/crush/blob/main/internal/config/config.go
+  crushOauth: z.optional(z.boolean()),
+  crushOauthClientId: z.optional(z.string()),
+  crushOauthClientSecret: z.optional(z.string()),
+  crushOauthCallbackPort: z.optional(z.int()),
+  crushSessionless: z.optional(z.boolean()),
+  crushChannelEnabled: z.optional(z.boolean()),
+  crushChannelReply: z.optional(CrushChannelReplySchema),
+  // ZCode-specific: the per-server `oauth` ZCode runs for an http/sse server,
+  // `{ type: "client_credentials", clientId, clientSecret, clientName?, scope? }`
+  // or `{ type: "authorization_code", clientId?, clientSecret?, clientName?,
+  // redirectPath?, scope? }` (read off the 3.14.3/3.15.3 runtime schema).
+  // Written as `oauth` by `zcode-mcp.ts` and stripped by
+  // `RulesyncMcp.getMcpServers()`, like the `crush*` OAuth keys: the client
+  // secret must not be copied into every other tool's config, and the
+  // canonical `oauth` key already carries Claude Code's `{ clientId }` object.
+  // Any object is accepted here: `zcode-mcp.ts` drops one that names no ZCode
+  // flow with a warning instead of failing the whole file.
+  zcodeOauth: z.optional(z.looseObject({})),
+  // Pool-specific: the per-server `allow` list of tool-name glob patterns Pool's
+  // approval layer auto-approves (`deny` wins over it). Written as `allow` by
+  // `pool-mcp.ts` and stripped by `RulesyncMcp.getMcpServers()`, like
+  // `envVars`: the key is an approval decision only Pool reads, and a bare
+  // `allow` would otherwise be copied verbatim into every other tool's config.
+  // https://docs.poolside.ai/settings-file-reference
+  poolAllow: z.optional(z.array(z.string())),
   headers: z.optional(z.record(z.string(), z.string())),
   /**
    * The canonical per-server tool allowlist.
@@ -119,7 +204,8 @@ export const McpServerSchema = z.looseObject({
    *   native one is dropped with a warning (`tools` in `copilotcli-mcp.ts`).
    * - Native key of the same name means something else entirely → **refuse the
    *   canonical value** rather than write a shape the tool misreads (`tools` in
-   *   `codexcli-mcp.ts`, where Codex reads it as a per-tool approval table).
+   *   `codexcli-mcp.ts`, where Codex reads it as a per-tool approval table;
+   *   that table is authored through the namespaced `codexcliTools` instead).
    */
   enabledTools: z.optional(z.array(z.string())),
   disabledTools: z.optional(z.array(z.string())),

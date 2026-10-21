@@ -11,7 +11,10 @@ import {
   AUGMENTCODE_TO_CANONICAL_EVENT_NAMES,
   CANONICAL_TO_AUGMENTCODE_EVENT_NAMES,
 } from "../../types/hooks.js";
-import { readAugmentcodeSettingsWithLocalOverlay } from "../../utils/augmentcode-settings.js";
+import {
+  parseAugmentcodeSettingsDocument,
+  readAugmentcodeSettingsWithLocalOverlay,
+} from "../../utils/augmentcode-settings.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
@@ -48,13 +51,17 @@ const AUGMENTCODE_NO_MATCHER_EVENTS: ReadonlySet<string> = new Set([
 // `projectDirVar` is intentionally empty: Auggie exposes `AUGMENT_PROJECT_DIR`
 // only as a runtime environment variable, not as an inline command substitution,
 // so commands are emitted verbatim without a directory prefix.
-const AUGMENTCODE_CONVERTER_CONFIG: ToolHooksConverterConfig = {
+export const AUGMENTCODE_CONVERTER_CONFIG: ToolHooksConverterConfig = {
   supportedEvents: AUGMENTCODE_HOOK_EVENTS,
   canonicalToToolEventNames: CANONICAL_TO_AUGMENTCODE_EVENT_NAMES,
   toolToCanonicalEventNames: AUGMENTCODE_TO_CANONICAL_EVENT_NAMES,
   projectDirVar: "",
   noMatcherEvents: AUGMENTCODE_NO_MATCHER_EVENTS,
   supportedHookTypes: new Set(["command"]),
+  // Auggie documents `timeout` as "Timeout in milliseconds (default: 60000ms)"
+  // (https://docs.augmentcode.com/cli/hooks) and passes the raw value to its
+  // timer, so the canonical seconds are converted both ways.
+  timeoutUnit: "milliseconds",
   // `metadata` is documented at https://docs.augmentcode.com/cli/hooks; `args`
   // appears only in the shipped CLI's validator (`@augmentcode/auggie` 0.33.0,
   // `augment.mjs`), which accepts it on a command hook. Both were previously
@@ -99,6 +106,7 @@ export class AugmentcodeHooks extends ToolHooks {
     outputRoot = process.cwd(),
     validate = true,
     global = false,
+    logger,
   }: ToolHooksFromFileParams): Promise<AugmentcodeHooks> {
     const paths = AugmentcodeHooks.getSettablePaths({ global });
     // On import, overlay the project-scope `.augment/settings.local.json`
@@ -112,6 +120,7 @@ export class AugmentcodeHooks extends ToolHooks {
       baseFileName: paths.relativeFilePath,
       baseFallbackContent: '{"hooks":{}}',
       includeLocalOverlay: !global,
+      logger,
     });
     return new AugmentcodeHooks({
       outputRoot,
@@ -135,6 +144,35 @@ export class AugmentcodeHooks extends ToolHooks {
     const paths = AugmentcodeHooks.getSettablePaths({ global });
     const filePath = join(outputRoot, paths.relativeDirPath, paths.relativeFilePath);
     const existingContent = (await readFileContentOrNull(filePath)) ?? JSON.stringify({}, null, 2);
+
+    // The `hooks` key is owned wholesale by this feature (see
+    // SHARED_CONFIG_OWNERSHIP for `.augment/settings.json`), so
+    // `applySharedConfigPatch` below replaces the entire object. Auggie also
+    // recognizes several undocumented event keys beyond the ones rulesync's
+    // canonical model maps to (e.g. `afterFileEdit`, lowercase `stop`) — see
+    // https://github.com/dyoshikawa/rulesync/issues/2670. Preserve any such
+    // key that isn't one rulesync itself authors, so hand-authored entries
+    // under those keys survive regeneration instead of being silently erased.
+    // Malformed existing content is left for `applySharedConfigPatch` below to
+    // reject with its own consistent parse-error message; here it is treated
+    // as having no preservable hooks.
+    let existingHooks: Record<string, unknown> = {};
+    try {
+      const candidate = parseAugmentcodeSettingsDocument({
+        fileContent: existingContent,
+        configPath: join(paths.relativeDirPath, paths.relativeFilePath),
+      }).hooks;
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+        existingHooks = candidate as Record<string, unknown>;
+      }
+    } catch {
+      existingHooks = {};
+    }
+    const nativeEventKeys = new Set(Object.values(CANONICAL_TO_AUGMENTCODE_EVENT_NAMES));
+    const preservedHooks = Object.fromEntries(
+      Object.entries(existingHooks).filter(([key]) => !nativeEventKeys.has(key)),
+    );
+
     const config = rulesyncHooks.getJson();
     const augmentHooks = canonicalToToolHooks({
       config,
@@ -146,8 +184,9 @@ export class AugmentcodeHooks extends ToolHooks {
       fileKey: sharedConfigFileKey(paths),
       feature: "hooks",
       existingContent,
-      patch: { hooks: augmentHooks },
+      patch: { hooks: { ...preservedHooks, ...augmentHooks } },
       filePath,
+      logger,
     });
     return new AugmentcodeHooks({
       outputRoot,
@@ -161,7 +200,10 @@ export class AugmentcodeHooks extends ToolHooks {
   toRulesyncHooks({ logger }: { logger?: Logger } = {}): RulesyncHooks {
     let settings: { hooks?: unknown };
     try {
-      settings = JSON.parse(this.getFileContent());
+      settings = parseAugmentcodeSettingsDocument({
+        fileContent: this.getFileContent(),
+        configPath: join(this.getRelativeDirPath(), this.getRelativeFilePath()),
+      });
     } catch (error) {
       throw new Error(
         `Failed to parse AugmentCode hooks content in ${join(this.getRelativeDirPath(), this.getRelativeFilePath())}: ${formatError(error)}`,

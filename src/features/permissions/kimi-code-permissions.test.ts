@@ -32,6 +32,139 @@ function generate({
   return smolToml.parse(permissions.getFileContent()) as Record<string, unknown>;
 }
 
+describe("KimiCodePermissions [permission] section", () => {
+  it("should preserve hand-written siblings of rules when the table is regenerated", () => {
+    // The gateway replaces the owned `permission` key wholesale and rulesync only
+    // authors `rules`, so `dangerous_command_guard` (Kimi Code 0.40.0) must not
+    // be deleted — losing it silently re-enables the guard.
+    const config = generate({
+      json: { permission: { bash: { "git status": "allow" } } },
+      existingContent:
+        '[permission]\ndangerous_command_guard = false\n\n[[permission.rules]]\ndecision = "allow"\npattern = "Read"\n',
+    });
+
+    expect(config.permission).toEqual({
+      dangerous_command_guard: false,
+      rules: [{ decision: "allow", pattern: "Bash(git status)", scope: "user" }],
+    });
+  });
+
+  it("should still replace the rules list rather than merging it", () => {
+    const config = generate({
+      json: { permission: {} },
+      existingContent: '[[permission.rules]]\ndecision = "allow"\npattern = "Read"\n',
+    });
+
+    expect(config.permission).toEqual({ rules: [] });
+  });
+
+  it("should write only the rules table when the existing file has no permission table", () => {
+    const config = generate({ json: { permission: {} } });
+
+    expect(config.permission).toEqual({ rules: [] });
+  });
+
+  it("should write dangerous_command_guard from the kimi-code override", () => {
+    const config = generate({
+      json: { permission: {}, "kimi-code": { dangerousCommandGuard: false } },
+    });
+
+    expect(config.permission).toEqual({ dangerous_command_guard: false, rules: [] });
+  });
+
+  it("should let the authored dangerous_command_guard override the existing value", () => {
+    const config = generate({
+      json: { permission: {}, "kimi-code": { dangerousCommandGuard: true } },
+      existingContent: "[permission]\ndangerous_command_guard = false\n",
+    });
+
+    expect(config.permission).toEqual({ dangerous_command_guard: true, rules: [] });
+  });
+
+  it("should lift a boolean dangerous_command_guard into the kimi-code override on import", () => {
+    const permissions = new KimiCodePermissions({
+      outputRoot: ".",
+      fileContent: "[permission]\ndangerous_command_guard = false\nrules = []\n",
+      global: true,
+    });
+    const imported = JSON.parse(permissions.toRulesyncPermissions().getFileContent());
+
+    expect(imported["kimi-code"]).toEqual({ dangerousCommandGuard: false });
+  });
+
+  it("should not lift a non-boolean dangerous_command_guard on import", () => {
+    const permissions = new KimiCodePermissions({
+      outputRoot: ".",
+      fileContent: '[permission]\ndangerous_command_guard = "no"\nrules = []\n',
+      global: true,
+    });
+    const imported = JSON.parse(permissions.toRulesyncPermissions().getFileContent());
+
+    expect(imported["kimi-code"]).toBeUndefined();
+  });
+});
+
+describe("KimiCodePermissions rule import", () => {
+  function importRules(fileContent: string): unknown {
+    const permissions = new KimiCodePermissions({ outputRoot: ".", fileContent, global: true });
+    return JSON.parse(permissions.toRulesyncPermissions().getFileContent())["kimi-code"]?.rules;
+  }
+
+  it("should fold rules that name the tool separately into Tool(arg) patterns", () => {
+    const rules = importRules(
+      [
+        "[[permission.rules]]",
+        'decision = "deny"',
+        'tool = "Bash"',
+        'match = "rm -rf*"',
+        "",
+        "[[permission.rules]]",
+        'decision = "ask"',
+        'tool = "Read"',
+        'pattern = "/etc/**"',
+        'reason = "system files"',
+        "",
+        "[[permission.rules]]",
+        'decision = "allow"',
+        'tool = "Grep"',
+        "",
+        "[[permission.rules]]",
+        'decision = "allow"',
+        'pattern = "Glob"',
+        "",
+      ].join("\n"),
+    );
+
+    expect(rules).toEqual([
+      { decision: "deny", pattern: "Bash(rm -rf*)" },
+      { decision: "ask", pattern: "Read(/etc/**)", reason: "system files" },
+      { decision: "allow", pattern: "Grep" },
+      { decision: "allow", pattern: "Glob" },
+    ]);
+  });
+
+  it("should prefer match over pattern when a rule carries both, as Kimi does", () => {
+    const rules = importRules(
+      '[[permission.rules]]\ndecision = "deny"\ntool = "Bash"\nmatch = "rm *"\npattern = "ls *"\n',
+    );
+
+    expect(rules).toEqual([{ decision: "deny", pattern: "Bash(rm *)" }]);
+  });
+
+  it("should regenerate folded rules in the pattern form Kimi reads identically", () => {
+    const permissions = new KimiCodePermissions({
+      outputRoot: ".",
+      fileContent: '[[permission.rules]]\ndecision = "deny"\ntool = "Bash"\nmatch = "rm -rf*"\n',
+      global: true,
+    });
+    const json = JSON.parse(permissions.toRulesyncPermissions().getFileContent());
+
+    expect(generate({ json }).permission).toEqual({
+      rules: [{ decision: "deny", pattern: "Bash(rm -rf*)" }],
+    });
+  });
+});
+
 describe("KimiCodePermissions [tools] section", () => {
   it("should write the authored enable and disable lists", () => {
     const config = generate({

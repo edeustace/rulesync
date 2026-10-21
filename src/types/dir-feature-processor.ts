@@ -1,26 +1,39 @@
 import { dirname, join, relative, resolve } from "node:path";
 
 import { RULESYNC_RELATIVE_DIR_PATH } from "../constants/rulesync-paths.js";
+import type { DeletedPath } from "../lib/orphan-sweep.js";
 import {
   companionFileContentsEquivalent,
   fileContentsEquivalent,
 } from "../utils/content-equivalence.js";
-import { stripControlCharacters } from "../utils/control-characters.js";
+import { quoteForLog, stripControlCharacters } from "../utils/control-characters.js";
+import { formatError } from "../utils/error.js";
 import {
   addTrailingNewline,
+  applyFileMode,
+  assertWritablePathInsideRoot,
   ensureDir,
+  listFilePathsRecursively,
   pathEscapesRoot,
   readFileBufferOrNull,
   readFileContentOrNull,
   removeDirectory,
   removeFile,
+  restoreMissingExecutableBit,
+  toPosixPath,
   writeFileBuffer,
   writeFileContent,
 } from "../utils/file.js";
 import { stringifyFrontmatter } from "../utils/frontmatter.js";
-import type { Logger } from "../utils/logger.js";
+import { type Logger, warnOnceWithFallback } from "../utils/logger.js";
 import type { WriteResult } from "../utils/result.js";
+import { hasIncompleteCarriedFiles } from "../utils/warned-once.js";
 import { AiDir, AiDirFile } from "./ai-dir.js";
+import {
+  caseFoldIdentity,
+  refusesAnyWriteOutsideRoot,
+  refusesDirWriteOntoRoot,
+} from "./feature-processor.js";
 import { RulesyncSourceConsumer } from "./rulesync-source-consumer.js";
 import { ToolTarget } from "./tool-targets.js";
 
@@ -85,6 +98,11 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
   protected readonly dryRun: boolean;
   protected readonly avoidBlockScalars: boolean;
   protected readonly logger: Logger;
+  /**
+   * Paths the orphan sweeps deleted (or, under `--dry-run`, would delete),
+   * relative to the output root like the paths `writeAiDirs` reports.
+   */
+  private readonly removedPaths: DeletedPath[] = [];
   constructor({
     outputRoot = process.cwd(),
     inputRoots,
@@ -146,6 +164,33 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
   }
 
   /**
+   * Whether {@link writeAiDirs} has to hold `aiDir` back: a link on the way to
+   * any path it writes leads out of the output root, or its directory lands on
+   * the root itself. Each refusal is warned about.
+   */
+  private async refusesDirWrite({
+    aiDir,
+    writtenPaths,
+  }: {
+    aiDir: AiDir;
+    writtenPaths: readonly string[];
+  }): Promise<boolean> {
+    const rootPath = aiDir.getOutputRoot();
+    return (
+      (await refusesAnyWriteOutsideRoot({
+        logger: this.logger,
+        rootPath,
+        targetPaths: writtenPaths,
+      })) ||
+      (await refusesDirWriteOntoRoot({
+        logger: this.logger,
+        rootPath,
+        dirPath: aiDir.getDirPath(),
+      }))
+    );
+  }
+
+  /**
    * Once converted to rulesync/tool dirs, write them to the filesystem.
    * Returns the number of directories written.
    *
@@ -158,10 +203,25 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
     const changedPaths: string[] = [];
     for (const aiDir of aiDirs) {
       const dirPath = aiDir.getDirPath();
+      const mainFile = aiDir.getMainFile();
+      const otherFiles: AiDirFile[] = aiDir.getOtherFiles();
+      // A directory that is a link out of the root would send every file
+      // written below it out of the root, and so would any one file that is
+      // a link of its own — the main file and the companions alike. The
+      // directory is written as a unit, so one such file holds back the whole
+      // directory; the check happens before anything is read or written. A
+      // directory linked onto the root itself is held back the same way.
+      const writtenPaths = [
+        dirPath,
+        ...(mainFile ? [join(dirPath, mainFile.name)] : []),
+        ...otherFiles.map((file) => join(dirPath, file.relativeFilePathToDirPath)),
+      ];
+      if (await this.refusesDirWrite({ aiDir, writtenPaths })) {
+        continue;
+      }
       let dirHasChanges = false;
 
       // Compute content for main file
-      const mainFile = aiDir.getMainFile();
       let mainFileContent: string | undefined;
       if (mainFile) {
         const mainFilePath = join(dirPath, mainFile.name);
@@ -187,7 +247,6 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
       // whose body and frontmatter rulesync composes, nothing about them is
       // rulesync's to normalize. Sending them through a UTF-8 round-trip with
       // trailing-newline normalization silently rewrote their bytes.
-      const otherFiles: AiDirFile[] = aiDir.getOtherFiles();
       for (const file of otherFiles) {
         // Detection only; the write loop below covers every file once the
         // directory is known to have changed.
@@ -209,6 +268,21 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
       }
 
       if (!dirHasChanges) {
+        // The bytes are already right, but a mode may not be: a copy that
+        // dropped the executable bit, or an output from a version that never
+        // carried one, and the write that would restore it is the one being
+        // skipped here. Only a *missing* executable bit is restored, so a user
+        // who tightened the mode keeps it.
+        if (!this.dryRun) {
+          for (const file of otherFiles) {
+            if (file.fileMode !== undefined) {
+              await restoreMissingExecutableBit(
+                join(dirPath, file.relativeFilePathToDirPath),
+                file.fileMode,
+              );
+            }
+          }
+        }
         continue;
       }
 
@@ -242,6 +316,9 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
         for (const file of otherFiles) {
           const filePath = join(dirPath, file.relativeFilePathToDirPath);
           await writeFileBuffer(filePath, file.fileBuffer);
+          if (file.fileMode !== undefined) {
+            await applyFileMode(filePath, file.fileMode);
+          }
           changedPaths.push(join(relativeDir, file.relativeFilePathToDirPath));
         }
       }
@@ -256,11 +333,15 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
    * This only deletes directories that are no longer in the rulesync source, not directories that will be overwritten.
    */
   async removeOrphanAiDirs(existingDirs: AiDir[], generatedDirs: AiDir[]): Promise<number> {
-    const generatedPaths = new Set(generatedDirs.map((d) => d.getDirPath()));
+    // Case-folded for the same reason as `removeOrphanAiFiles`: on a
+    // case-insensitive filesystem, renaming a directory only by case still
+    // writes into the existing directory, and comparing paths exactly would
+    // otherwise classify it as an orphan and delete what was just generated.
+    const generatedPaths = new Set(generatedDirs.map((d) => caseFoldIdentity(d.getDirPath())));
     // A set, so two candidates that report the same directory delete it once
     // and are counted once.
     const orphanPaths = new Set<string>();
-    const quotedOutputRoot = JSON.stringify(stripControlCharacters(this.outputRoot));
+    const quotedOutputRoot = quoteForLog(this.outputRoot);
 
     for (const aiDir of existingDirs) {
       // Read once, and check and delete that one value: `getDirPath()` is a
@@ -272,8 +353,8 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
       // came off disk, and while the strip rules out forging a whole line, an
       // unquoted path like `Deleted directory: /home/you/important` still reads
       // as one. The root is quoted with it so one line reads consistently.
-      const quotedDirPath = JSON.stringify(stripControlCharacters(dirPath));
-      const quotedRoot = JSON.stringify(stripControlCharacters(root));
+      const quotedDirPath = quoteForLog(dirPath);
+      const quotedRoot = quoteForLog(root);
 
       // Reported before anything about the directory's position, because a root
       // that is not in the directory this run writes to makes that position
@@ -297,7 +378,7 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
         if (verdict === "equal") {
           this.logger.debug(
             `Skipping orphan sweep for ` +
-              `${JSON.stringify(stripControlCharacters(aiDir.getDirName()))}: ` +
+              `${quoteForLog(aiDir.getDirName())}: ` +
               `${quotedDirPath} is a shared root, not a directory of its own`,
           );
         } else {
@@ -326,12 +407,217 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
         continue;
       }
 
-      if (!generatedPaths.has(dirPath)) {
+      if (!generatedPaths.has(caseFoldIdentity(dirPath))) {
         orphanPaths.add(dirPath);
       }
     }
 
     return await this.deleteOrphanPaths({ paths: orphanPaths, kind: "directory" });
+  }
+
+  /**
+   * Remove the files left inside a directory this run still generates, but
+   * which the run no longer writes.
+   *
+   * The directory sweep above cannot see them: it removes a directory that no
+   * longer corresponds to any generated entry, and never looks inside one that
+   * does. So deleting a companion file from a source directory that is
+   * otherwise kept left the generated copy in place — and, because change
+   * detection compares only the files the run will write, the run reported
+   * itself up to date while an agent went on reading the stale file. The same
+   * gap left any file that was never rulesync's sitting inside a directory the
+   * user now believes rulesync owns.
+   *
+   * Only a directory that owns its whole tree is swept, and only when this run
+   * generated it. That is the same claim the directory sweep already acts on,
+   * one level down: a directory whose entry disappears is deleted outright,
+   * companion files and all, so a file inside one whose entry is still here and
+   * which no source produces is stale by exactly the same reasoning.
+   *
+   * Two kinds of file are left alone:
+   *
+   * - **Hidden entries.** The loader does carry a hidden companion — a
+   *   `.env.example` beside the script that reads it is skill content — so a
+   *   hidden file here may be rulesync's. But a hidden name is also where a
+   *   user's own files live: a `.gitkeep`, a `.env` with real values in it. The
+   *   sweep cannot tell the two apart by name, and deleting the user's is the
+   *   worse mistake, so a stale hidden companion is the one leftover it
+   *   knowingly keeps.
+   * - **Symbolic links**, which the writer never creates. The walk neither
+   *   follows nor reports them, so a link is never removed and never resolved
+   *   into a deletion somewhere outside the tree.
+   *
+   * Nothing is swept at all by a run that could not read its sources in full.
+   * `AiDir` drops a companion file it cannot open, and stops short of a subtree
+   * it is denied or that runs past one of its bounds -- warning each time, but
+   * carrying on, because a skill that is short one file is still worth writing.
+   * The output copy of such a file is then indistinguishable here from a file
+   * whose source was deleted, and the wrong guess deletes something the next
+   * readable run would put straight back. So a shortfall anywhere in the run
+   * calls the whole sweep off: it is the sweeps that are optional, not the
+   * files.
+   *
+   * @param isClaimed - Whether some other target or feature in this run wrote
+   *   this exact path. A shared output root -- `.agents/skills/`, written by
+   *   several targets at once -- is a directory whose entry here lists only
+   *   *this* target's files, so without the run's own record a sibling's fresh
+   *   output reads as an orphan. Asked per path rather than per tree: a tree
+   *   claim covers the directory this sweep is looking inside of, and would
+   *   answer yes to every file in it.
+   */
+  async removeOrphanFilesInAiDirs({
+    generatedDirs,
+    isClaimed,
+  }: {
+    generatedDirs: AiDir[];
+    isClaimed: (path: string) => boolean | Promise<boolean>;
+  }): Promise<number> {
+    if (hasIncompleteCarriedFiles()) {
+      // Once per run, not once per target: the message is about the sources,
+      // which every target of the run reads alike.
+      warnOnceWithFallback(
+        this.logger,
+        "Not sweeping the files inside generated directories: this run could not read every " +
+          "file its sources carry, so a file it did not write may still be one it wants. " +
+          "The warnings above name what it could not read.",
+      );
+      return 0;
+    }
+
+    const orphanPaths = new Set<string>();
+    const quotedOutputRoot = quoteForLog(this.outputRoot);
+
+    for (const aiDir of generatedDirs) {
+      // Read once and act on that one value, as the sweeps around this one do:
+      // `getDirPath()` is a method a subclass supplies, and a second call could
+      // answer differently from the one the checks below ruled on.
+      const dirPath = aiDir.getDirPath();
+      const { verdict, root } = locateInOwnRoot({ aiDir, dirPath, outputRoot: this.outputRoot });
+      const quotedDirPath = quoteForLog(dirPath);
+      const quotedRoot = quoteForLog(root);
+
+      // Asked before anything else, in the order the directory sweep asks it: a
+      // root that is not in the directory this run writes to makes every
+      // position inside it meaningless.
+      if (verdict === "root-outside") {
+        this.logger.warn(
+          `Refusing to sweep ${quotedDirPath}: the root ${quotedRoot} it was found in is not ` +
+            `inside ${quotedOutputRoot}, the directory this run writes to`,
+        );
+        continue;
+      }
+
+      if (!aiDir.ownsDirTree()) {
+        // False for two different shapes, as it is one sweep up. A tool that
+        // flattens into a shared root reports that root here: expected, and
+        // quiet, since its files are swept by `removeOrphanFlatFiles` — which
+        // sweeps only the ones it can name — and everything else in a shared
+        // root belongs to somebody else. Anything else is a `getDirPath()`
+        // override out of agreement with `ownsDirTree()`, and passing that over
+        // in silence is how a contract mismatch goes unnoticed.
+        if (verdict === "equal") {
+          this.logger.debug(
+            `Skipping orphan sweep for ` +
+              `${quoteForLog(aiDir.getDirName())}: ` +
+              `${quotedDirPath} is a shared root, not a directory of its own`,
+          );
+        } else {
+          this.logger.warn(
+            `Refusing to sweep ${quotedDirPath}: it does not own that directory, and it is not ` +
+              `the shared root ${quotedRoot} it was found in either`,
+          );
+        }
+        continue;
+      }
+
+      if (verdict !== "inside") {
+        this.logger.warn(
+          `Refusing to sweep ${quotedDirPath}: it is not a directory inside ${quotedRoot}, the ` +
+            `root it was found in`,
+        );
+        continue;
+      }
+
+      // The verdict above is lexical. The walk below reads the directory
+      // through whatever `dirPath` really is, and a skill directory that is a
+      // symbolic link — to a vendored checkout, say — reads back a tree this
+      // run never wrote and unlinks through the link into it. The other sweeps
+      // never meet one: their candidates come from an enumeration that does not
+      // follow links. This one's come from the sources, so it asks here — of
+      // the root as well, under the same guard the directory sweep puts on it:
+      // a root that is itself a link, such as a dotfiles checkout linked from
+      // the home directory, has its sweep skipped there, and a directory
+      // inside it must not be swept through the link here either.
+      try {
+        await assertWritablePathInsideRoot({ rootPath: this.outputRoot, targetPath: root });
+        await assertWritablePathInsideRoot({ rootPath: this.outputRoot, targetPath: dirPath });
+      } catch (error) {
+        this.logger.warn(
+          `Refusing to sweep ${quotedDirPath}: ${stripControlCharacters(formatError(error))}`,
+        );
+        continue;
+      }
+
+      const generatedNames = new Set<string>();
+      const mainFile = aiDir.getMainFile();
+      if (mainFile) {
+        generatedNames.add(toPosixPath(mainFile.name));
+      }
+      for (const file of aiDir.getOtherFiles()) {
+        generatedNames.add(toPosixPath(file.relativeFilePathToDirPath));
+      }
+      // Folded alongside the exact names for the same reason the flat-file
+      // sweep folds its paths: on a case-insensitive filesystem a companion
+      // renamed from `Ref.md` to `ref.md` is written through the directory
+      // entry that is still spelled `Ref.md`, and the name read back would
+      // otherwise match nothing this run wrote and be swept as an orphan.
+      const generatedNamesFolded = new Set(
+        [...generatedNames].map((name) => caseFoldIdentity(name)),
+      );
+
+      // A subdirectory this run cannot read is refused the same way as the
+      // rest, not thrown: every file has been written by now, and a sweep is
+      // not worth failing the run over. The source side treats an unreadable
+      // subtree the same way, as a warning and a stand-down.
+      let existingNames: string[];
+      try {
+        existingNames = await listFilePathsRecursively(dirPath, {
+          followSymbolicLinks: false,
+          includeHidden: false,
+        });
+      } catch (error) {
+        this.logger.warn(
+          `Refusing to sweep ${quotedDirPath}: ${stripControlCharacters(formatError(error))}`,
+        );
+        continue;
+      }
+      for (const existingName of existingNames) {
+        const posixName = toPosixPath(existingName);
+        if (generatedNames.has(posixName)) {
+          continue;
+        }
+        const filePath = join(dirPath, existingName);
+        if (generatedNamesFolded.has(caseFoldIdentity(posixName))) {
+          // Reported rather than skipped in silence, as the flat-file sweep
+          // reports it: on a case-sensitive filesystem the two names really are
+          // two files, and the one this run did not write is stale — exactly
+          // what this sweep exists to remove. Refusing it is the safe half of
+          // the guess; saying so is what lets the other half be corrected.
+          this.logger.warn(
+            `Refusing to delete ${quoteForLog(filePath)}: this run ` +
+              `wrote a file whose path differs from it only in case, which on a case-insensitive ` +
+              `filesystem is the very file it wrote`,
+          );
+          continue;
+        }
+        if (await isClaimed(filePath)) {
+          continue;
+        }
+        orphanPaths.add(filePath);
+      }
+    }
+
+    return await this.deleteOrphanPaths({ paths: orphanPaths, kind: "file" });
   }
 
   /**
@@ -348,16 +634,29 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
     kind: "directory" | "file";
   }): Promise<number> {
     for (const targetPath of paths) {
-      const loggedPath = JSON.stringify(stripControlCharacters(targetPath));
+      const loggedPath = quoteForLog(targetPath);
       if (this.dryRun) {
         this.logger.info(`[DRY RUN] Would delete ${kind}: ${loggedPath}`);
       } else {
         await (kind === "directory" ? removeDirectory(targetPath) : removeFile(targetPath));
         this.logger.info(`Deleted ${kind}: ${loggedPath}`);
       }
+      this.removedPaths.push({
+        path: toPosixPath(relative(resolve(this.outputRoot), resolve(targetPath))),
+        kind,
+      });
     }
 
     return paths.size;
+  }
+
+  /**
+   * The paths the orphan sweeps deleted, or would have deleted under
+   * `--dry-run`, so a preview and the run it previews report the same list.
+   * A deleted directory is listed once, by its own path.
+   */
+  getRemovedPaths(): readonly DeletedPath[] {
+    return this.removedPaths;
   }
 
   /**
@@ -411,12 +710,12 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
     // enumeration reads back never matches the path this run wrote and the
     // file the run just produced would be swept as an orphan.
     const generatedPathsFolded = new Set(
-      [...generatedPaths].map((generatedPath) => generatedPath.toLowerCase()),
+      [...generatedPaths].map((generatedPath) => caseFoldIdentity(generatedPath)),
     );
     // A set, for the same reason the directory sweep uses one: two candidates
     // that report the same file delete it once and are counted once.
     const orphanPaths = new Set<string>();
-    const quotedOutputRoot = JSON.stringify(stripControlCharacters(this.outputRoot));
+    const quotedOutputRoot = quoteForLog(this.outputRoot);
 
     for (const aiDir of existingFlatFiles) {
       // Read once and delete that one value, as in the directory sweep: both
@@ -425,7 +724,7 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
       const filePath = aiDir.getFlatFilePath();
       if (filePath === undefined) {
         this.logger.warn(
-          `Refusing to sweep ${JSON.stringify(stripControlCharacters(aiDir.getDirName()))}: it ` +
+          `Refusing to sweep ${quoteForLog(aiDir.getDirName())}: it ` +
             `owns a directory of its own, or names no file directly under the root it was found in`,
         );
         continue;
@@ -435,8 +734,8 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
       const { verdict, root } = locateInOwnRoot({ aiDir, dirPath, outputRoot: this.outputRoot });
       // Quoted for the same reason the directory sweep quotes: the last segment
       // of the path is a name that came off disk.
-      const quotedFilePath = JSON.stringify(stripControlCharacters(filePath));
-      const quotedRoot = JSON.stringify(stripControlCharacters(root));
+      const quotedFilePath = quoteForLog(filePath);
+      const quotedRoot = quoteForLog(root);
 
       if (verdict === "root-outside") {
         this.logger.warn(
@@ -475,7 +774,7 @@ export abstract class DirFeatureProcessor extends RulesyncSourceConsumer {
       if (generatedPaths.has(filePath)) {
         continue;
       }
-      if (generatedPathsFolded.has(filePath.toLowerCase())) {
+      if (generatedPathsFolded.has(caseFoldIdentity(filePath))) {
         this.logger.warn(
           `Refusing to delete ${quotedFilePath}: this run wrote a file whose path differs from ` +
             `it only in case, which on a case-insensitive filesystem is the very file it wrote`,

@@ -3,16 +3,11 @@ import { join, posix } from "node:path";
 
 import { Semaphore } from "es-toolkit/promise";
 
+import { SKILL_FILE_NAME } from "../constants/general.js";
 import {
+  FEATURE_SOURCE_TREE_ENTRIES,
   FETCH_CONCURRENCY_LIMIT,
   MAX_FILE_SIZE,
-  RULESYNC_AIIGNORE_FILE_NAME,
-  RULESYNC_HOOKS_FILE_NAME,
-  RULESYNC_HOOKS_LEGACY_FILE_NAME,
-  RULESYNC_MCP_FILE_NAME,
-  RULESYNC_MCP_LEGACY_FILE_NAME,
-  RULESYNC_PERMISSIONS_FILE_NAME,
-  RULESYNC_PERMISSIONS_LEGACY_FILE_NAME,
   RULESYNC_RELATIVE_DIR_PATH,
 } from "../constants/rulesync-paths.js";
 import { ChecksProcessor } from "../features/checks/checks-processor.js";
@@ -23,6 +18,10 @@ import { McpProcessor } from "../features/mcp/mcp-processor.js";
 import { RulesProcessor } from "../features/rules/rules-processor.js";
 import { SkillsProcessor } from "../features/skills/skills-processor.js";
 import { SubagentsProcessor } from "../features/subagents/subagents-processor.js";
+import {
+  caseFoldIdentity,
+  groupSpellingsByCaseFoldedIdentity,
+} from "../types/feature-processor.js";
 import type { Feature } from "../types/features.js";
 import { ALL_FEATURES } from "../types/features.js";
 import type { FetchTarget } from "../types/fetch-targets.js";
@@ -35,37 +34,36 @@ import type {
   ParsedSource,
 } from "../types/fetch.js";
 import type { ToolTarget } from "../types/tool-targets.js";
-import { stripControlCharacters } from "../utils/control-characters.js";
+import { describeConfusableNames, readingFormOf } from "../utils/confusable-names.js";
+import {
+  hasDeceptiveHiddenCharacters,
+  quoteForLog,
+  stripControlCharacters,
+  stripHiddenCharacters,
+} from "../utils/control-characters.js";
 import { formatError } from "../utils/error.js";
 import {
+  applyFileMode,
   checkPathTraversal,
   createTempDirectory,
+  directoryExists,
   fileExists,
   isFileNotFoundError,
+  isFileSystemError,
   removeTempDirectory,
   toPosixPath,
   writeFileContent,
 } from "../utils/file.js";
 import type { Logger } from "../utils/logger.js";
 import { GitHubClient, GitHubClientError } from "./github-client.js";
-import { listDirectoryRecursive, MAX_RECURSION_DEPTH, withSemaphore } from "./github-utils.js";
+import {
+  listDirectoryRecursive,
+  MAX_RECURSION_DEPTH,
+  resolveExecutablePaths,
+  withSemaphore,
+} from "./github-utils.js";
 import { isInteractiveTerminal, promptSkillSelection } from "./skill-prompt.js";
 import { parseSource } from "./source-parser.js";
-
-/**
- * Feature to path mapping for filtering (rulesync format)
- */
-const FEATURE_PATHS: Record<Feature, string[]> = {
-  rules: ["rules"],
-  commands: ["commands"],
-  subagents: ["subagents"],
-  skills: ["skills"],
-  checks: ["checks"],
-  ignore: [RULESYNC_AIIGNORE_FILE_NAME],
-  mcp: [RULESYNC_MCP_FILE_NAME, RULESYNC_MCP_LEGACY_FILE_NAME],
-  hooks: [RULESYNC_HOOKS_FILE_NAME, RULESYNC_HOOKS_LEGACY_FILE_NAME],
-  permissions: [RULESYNC_PERMISSIONS_FILE_NAME, RULESYNC_PERMISSIONS_LEGACY_FILE_NAME],
-};
 
 /**
  * Check if target is a tool target (not rulesync)
@@ -81,7 +79,10 @@ function isToolTarget(target: FetchTarget): target is ToolTarget {
 function validateFileSize(relativePath: string, size: number): void {
   if (size > MAX_FILE_SIZE) {
     throw new GitHubClientError(
-      `File "${relativePath}" exceeds maximum size limit (${(size / 1024 / 1024).toFixed(2)}MB > ${MAX_FILE_SIZE / 1024 / 1024}MB)`,
+      // The path comes from the remote repository, and this message is read in
+      // a terminal, so it is quoted and stripped like every other remote path
+      // this command prints.
+      `File ${quoteForLog(relativePath)} exceeds maximum size limit (${(size / 1024 / 1024).toFixed(2)}MB > ${MAX_FILE_SIZE / 1024 / 1024}MB)`,
     );
   }
 }
@@ -269,34 +270,167 @@ type CollectedFeatureFiles = {
  * - `non-skill` — outside skills/, or a flat file directly under it. Skills are
  *   directory-based (skills/<name>/SKILL.md), so such a file belongs to no
  *   skill and selection does not apply to it.
- * - `unsafe-name` — under a skills/ directory whose name does not survive
- *   control-character stripping. It cannot be offered honestly, so it is never
- *   selectable.
+ * - `unsafe-name` — under a skills/ directory whose name cannot be written
+ *   as the name it reads as. `reason: "hidden"` is a name that does not survive
+ *   having its control characters and its invisible characters stripped, so it
+ *   cannot be offered honestly. `reason: "foldable"` is a name Windows resolves
+ *   to a different directory, so it cannot be written where it says. Neither is
+ *   ever selectable.
  * - `skill` — belongs to the named skill.
  */
 type SkillPathClass =
-  | { kind: "non-skill" }
-  | { kind: "unsafe-name"; raw: string; display: string }
-  | { kind: "skill"; name: string };
+  | { readonly kind: "non-skill" }
+  | {
+      readonly kind: "unsafe-name";
+      readonly raw: string;
+      readonly display: string;
+      readonly reason: UnsafeSkillNameReason;
+    }
+  | { readonly kind: "skill"; readonly name: string };
 
-const NON_SKILL_PATH: SkillPathClass = { kind: "non-skill" };
+/** Why a skill directory name is turned away; see `SkillPathClass`. */
+type UnsafeSkillNameReason = "hidden" | "foldable";
+
+/** Where a skill directory sits, under the output base path and in the remote. */
+const SKILLS_DIR_NAME = "skills";
+/** The same directory as the head of a POSIX path, for prefix comparisons. */
+const SKILLS_DIR_PREFIX = `${SKILLS_DIR_NAME}/`;
+
+/**
+ * The one `non-skill` verdict, shared by every caller that reaches it. It is
+ * frozen because it is shared: a verdict is a value, and one handed out this
+ * many times must not be something a later caller can edit for the rest.
+ */
+const NON_SKILL_PATH: SkillPathClass = Object.freeze({ kind: "non-skill" });
+
+/** A name with no character in it that draws anything of its own. */
+const NOTHING_DRAWN_PATTERN = /^[\s\p{M}]*$/u;
+/**
+ * The marks a name begins with. A mark is drawn over the character before it,
+ * and a name has nothing before it of its own: a leading one is drawn over
+ * whatever the terminal printed last — the checkbox, the quote around a name
+ * in a warning — while the name reads as if it began with its first letter.
+ */
+const LEADING_MARKS_PATTERN = /^\p{M}+/u;
+
+/**
+ * A name ending in a dot or an ASCII space, which Win32 strips before it opens
+ * the path. Only the plain space (U+0020): Win32 keeps every other trailing
+ * blank, so a name ending in a no-break or an ideographic space is written
+ * where it says, and is left to the whitespace note of the confusable-name
+ * check rather than dropped here with Windows named as the reason.
+ */
+const TRAILING_DOT_OR_SPACE_PATTERN = /[. ]$/;
+/** A name ending in the `NAME~1` shape of a Windows 8.3 short name, extension included. */
+const SHORT_NAME_ALIAS_PATTERN = /~\d+(?:\.[^.]*)?$/;
+/**
+ * A name Win32 reserves for a device — `CON`, `PRN`, `AUX`, `NUL`, `CONIN$`,
+ * `CONOUT$`, `COM1`–`COM9`, `LPT1`–`LPT9` — in any case and with any
+ * extension: `nul.md` is the null device too, since the reservation is decided
+ * on the part before the first dot, with any spaces before that dot dropped
+ * first, so `nul .md` is the null device as well. The port digit may also be
+ * one of the superscript digits ¹ ² ³, which Win32 reads as 1, 2 and 3
+ * (`RtlIsDosDeviceName_U`; CPython's `ntpath.isreserved` follows the same
+ * rules).
+ */
+const RESERVED_DEVICE_NAME_PATTERN =
+  /^(?:CON|PRN|AUX|NUL|CONIN\$|CONOUT\$|COM[1-9\u00B9\u00B2\u00B3]|LPT[1-9\u00B9\u00B2\u00B3]) *(?:\..*)?$/i;
+
+/**
+ * Whether Windows resolves a path segment to something other than the entry it
+ * reads as.
+ *
+ * Win32 drops a trailing dot or ASCII space when it resolves a path, so a remote
+ * `skills/deploy.` is the existing `skills/deploy` there. A name ending in the
+ * `NAME~1` shape is the same class of problem: on a volume that generates
+ * short names, it opens whatever long name it stands for. The shape only
+ * means that at the end of a name, so `data~2parser` and `v1.0` are ordinary
+ * names. A reserved device name is the extreme case: `nul` and `nul.md` are
+ * not entries in any directory but the null device itself, so a write to one
+ * lands nowhere, and a directory of that name cannot be created at all.
+ *
+ * The predicate is asked of every segment of a written path — the skill
+ * directory, but equally a nested `references/notes. ` or a `scripts/con.sh`
+ * — since a folded segment anywhere in a path lands the file beside, or on top
+ * of, a sibling the repository never published. The check is not gated on the
+ * platform: the same repository is checked out on several of them, and a name
+ * that lands somewhere else on any one of them is one this tool would rather
+ * turn away everywhere than write differently depending on where it runs.
+ */
+function hasWindowsFoldableName(name: string): boolean {
+  return (
+    TRAILING_DOT_OR_SPACE_PATTERN.test(name) ||
+    SHORT_NAME_ALIAS_PATTERN.test(name) ||
+    RESERVED_DEVICE_NAME_PATTERN.test(name)
+  );
+}
+
+/**
+ * The first segment of a remote path, other than the skill directory itself,
+ * that `hasWindowsFoldableName` turns away — or `undefined` when every one is
+ * written where it says.
+ *
+ * The skill directory segment is left to `classifySkillPath`, which reports it
+ * under its own reason so the warning can say that a whole skill was left out
+ * rather than one file of it. Every other segment — a rules file, a directory
+ * inside a skill, the file at the end — is checked here, since a fetched path
+ * is written segment by segment and each one is a place Windows can fold.
+ */
+function findWindowsFoldableSegment(relativePath: string): string | undefined {
+  const segments = relativePath.split("/");
+  const isSkillPath = relativePath.startsWith(SKILLS_DIR_PREFIX) && segments.length >= 3;
+  // A `.` or `..` segment ends in a dot too, but it is not a name Windows
+  // folds: it is a path that walks out of the tree, which
+  // `validateRemoteRelativePath` refuses outright rather than skips. A path
+  // carrying one is left whole for that validator, whatever its other
+  // segments look like, so that it is refused rather than quietly skipped.
+  if (segments.some((segment) => segment === "." || segment === "..")) {
+    return undefined;
+  }
+  return segments.find(
+    (segment, index) => !(isSkillPath && index === 1) && hasWindowsFoldableName(segment),
+  );
+}
 
 /**
  * Classify a collected file's path relative to the skills directory.
  *
- * A directory name is only usable when it is already free of control
- * characters. Stripping them for display and then matching on the stripped
- * form would let a remote repository publish `skills/<U+200E>/` — invisible in
- * the prompt — or `skills/go<U+200E>od/`, which displays as an existing skill
- * and would ride along with it. Names like that are reported as `unsafe-name`
- * so callers can leave them out instead of writing a skill the user never saw.
+ * A directory name is only usable when it is already free of characters that do
+ * not show. Stripping them for display and then matching on the stripped form
+ * would let a remote repository publish `skills/<U+200E>/` — invisible in the
+ * prompt — or `skills/go<U+200E>od/`, which displays as an existing skill and
+ * would ride along with it. The zero-width characters go with the control ones:
+ * `skills/pd<U+200B>f/` is drawn exactly like `skills/pdf/`, and nothing later
+ * in the prompt could tell the two apart. A name that draws as nothing but
+ * blank space, or as nothing but marks with no letter to sit on, goes the same
+ * way, since an empty row is no easier to pick out than an invisible one, and
+ * so does a name that begins with a mark: it is drawn over whatever the
+ * terminal printed before the name, and reads as the letters after it. Names
+ * like that are reported as `unsafe-name` so callers can leave them out instead
+ * of writing a skill the user never saw.
+ *
+ * What is not turned away is a zero-width joiner or variation selector standing
+ * where its own script puts one: a Persian or Indic name is written with ZWNJ
+ * in it and an emoji name is a chain of ZWJ, and both are ordinary names rather
+ * than disguises. `hasDeceptiveHiddenCharacters` draws that line.
+ *
+ * A name Windows folds onto another — a trailing dot or ASCII space, the `NAME~1`
+ * shape of a short name, or a reserved device name such as `NUL` — is turned
+ * away as well, and for a reason of the same kind: it reads as one directory
+ * and is written into another, or into no directory at all, so with the
+ * default `--conflict overwrite` a remote `skills/deploy.` replaces the files
+ * of a local `deploy` that the repository never published. Such a name is
+ * reported as `unsafe-name` with its own reason, since it can be printed as it
+ * is; `hasWindowsFoldableName` says which names those are. Only the skill
+ * directory is judged here; the segments below it are turned away one file at
+ * a time by `dropAmbiguousRemotePaths`, before this function sees the path.
  */
 function classifySkillPath(relativePath: string): SkillPathClass {
   // Split on "/" alone. A remote path is POSIX, so a backslash in one is an
   // ordinary character in a name, and normalizing it to a separator first would
   // read `skills/other\evil/SKILL.md` as the skill `other` — handing the prune
   // below a directory this run never wrote.
-  if (!relativePath.startsWith("skills/")) {
+  if (!relativePath.startsWith(SKILLS_DIR_PREFIX)) {
     return NON_SKILL_PATH;
   }
   const segments = relativePath.split("/");
@@ -313,9 +447,24 @@ function classifySkillPath(relativePath: string): SkillPathClass {
   if (name === "." || name === ".." || name.includes("\\")) {
     return NON_SKILL_PATH;
   }
-  const display = stripControlCharacters(name);
-  if (display !== name) {
-    return { kind: "unsafe-name", raw: name, display };
+  const stripped = stripHiddenCharacters(name);
+  // A name of nothing but blank space is shown as the empty string, the same as
+  // one that strips down to nothing: both draw as a row with no name on it. So
+  // is a name of nothing but combining marks, which have no character of their
+  // own to sit on and draw as a smear over whatever the terminal puts beside
+  // them. A name that merely begins with a mark is dropped for the same
+  // reason, and shown without it: the mark sits on nothing the name owns.
+  const beginsWithMark = LEADING_MARKS_PATTERN.test(stripped);
+  const display = NOTHING_DRAWN_PATTERN.test(stripped)
+    ? ""
+    : stripped.replace(LEADING_MARKS_PATTERN, "");
+  if (display === "" || beginsWithMark || hasDeceptiveHiddenCharacters(name)) {
+    return { kind: "unsafe-name", raw: name, display, reason: "hidden" };
+  }
+  // Checked after the hidden characters, so a name that is both is reported
+  // by the reason that keeps its raw form off the terminal.
+  if (hasWindowsFoldableName(name)) {
+    return { kind: "unsafe-name", raw: name, display, reason: "foldable" };
   }
   return { kind: "skill", name };
 }
@@ -333,21 +482,38 @@ function validateRemoteRelativePath(relativePath: string): void {
   const segments = relativePath.split("/");
   if (segments.some((segment) => segment === "." || segment === "..")) {
     throw new Error(
-      `Unsafe path in the remote repository: ${JSON.stringify(relativePath)}. A fetched path ` +
+      `Unsafe path in the remote repository: ${quoteForLog(relativePath)}. A fetched path ` +
         `must be a plain POSIX path, without "." and ".." segments.`,
     );
   }
 }
 
+/** The characters a path segment means something else with on Windows. */
+const AMBIGUOUS_PATH_CHARACTERS_PATTERN = /[\\:]/u;
+
 /**
  * Keep only the files whose remote path means one local path.
  *
- * A remote path is POSIX, so a backslash in one is an ordinary character in a
- * name — but the local side is not always POSIX, and every layer below reads
- * such a name differently: `skills/a\b/SKILL.md` is one file in a directory
- * named `a\b` here and two directories deep on Windows, and the prune would be
- * handed a directory this run never wrote. A name nobody agrees on is worth far
- * less than the rest of the fetch, so the file is dropped and the run goes on.
+ * A remote path is POSIX, so a backslash or a colon in one is an ordinary
+ * character in a name — but the local side is not always POSIX, and every layer
+ * below reads such a name differently. `skills/a\b/SKILL.md` is one file in a
+ * directory named `a\b` here and two directories deep on Windows. A colon is
+ * worse: on Windows `skills/pdf::$INDEX_ALLOCATION` is not a directory of its
+ * own at all but another way of writing `skills/pdf`, so a name carrying one
+ * reads as a skill this run never fetched while the prune, comparing names,
+ * sees two — and empties the one the user already had.
+ *
+ * A segment Windows folds onto another name — a trailing dot or ASCII space,
+ * the `NAME~1` shape of a short name, a reserved device name — is the same
+ * problem one level down: `skills/deploy/references/notes. ` is its own file
+ * here and the existing `notes` on Windows, so under `--conflict overwrite` it
+ * would replace a file the repository never published, and `scripts/nul.sh`
+ * is not a file there at all. The skill directory segment is not judged here
+ * but by `classifySkillPath`, which drops the whole skill under a warning of
+ * its own; every other segment of every fetched path is judged here.
+ *
+ * A name nobody agrees on is worth far less than the rest of the fetch, so the
+ * file is dropped and the run goes on.
  */
 function dropAmbiguousRemotePaths(params: {
   files: CollectedFile[];
@@ -357,7 +523,24 @@ function dropAmbiguousRemotePaths(params: {
   const { files, incompleteRemoteDirs, logger } = params;
   const kept: CollectedFile[] = [];
   for (const file of files) {
-    if (toPosixPath(file.relativePath) === file.relativePath) {
+    let reason: string | undefined;
+    if (AMBIGUOUS_PATH_CHARACTERS_PATTERN.test(file.relativePath)) {
+      reason =
+        `its path contains a backslash or a colon, which names one file on some systems and ` +
+        `a directory, or part of another file, on others.`;
+    } else {
+      const foldable = findWindowsFoldableSegment(file.relativePath);
+      if (foldable !== undefined) {
+        // Quoted as it is: a trailing space is the whole reason the segment
+        // was turned away, and bare it would not show.
+        reason =
+          `the path segment ${quoteForLog(foldable)} is one Windows resolves to a different ` +
+          `name. A segment ending in a dot or an ASCII space, one shaped like a NAME~1 short ` +
+          `name, or a reserved device name such as NUL or COM1 is written somewhere other than ` +
+          `where it reads as there, so the file is not fetched on any platform.`;
+      }
+    }
+    if (reason === undefined) {
       kept.push(file);
       continue;
     }
@@ -367,10 +550,7 @@ function dropAmbiguousRemotePaths(params: {
     // reason a truncated listing is: a local file the remote still ships is no
     // longer distinguishable from one it dropped.
     incompleteRemoteDirs.add(posix.dirname(toPosixPath(file.remotePath)));
-    logger.warn(
-      `Skipping ${JSON.stringify(file.remotePath)}: its path contains a backslash, which names ` +
-        `one file on some systems and a directory on others.`,
-    );
+    logger.warn(`Skipping ${quoteForLog(file.remotePath)}: ${reason}`);
   }
   return kept;
 }
@@ -425,108 +605,357 @@ async function applySkillSelection(params: {
   files: CollectedFile[];
   requestedSkills: string[];
   interactive: boolean;
+  outputBasePath: string;
   logger: Logger;
 }): Promise<CollectedFile[]> {
-  const { files, requestedSkills, interactive, logger } = params;
+  const { files, requestedSkills, interactive, outputBasePath, logger } = params;
 
-  if (requestedSkills.length === 0 && !interactive) {
-    return files;
-  }
+  // Without --skills and without --interactive there is no selection to apply:
+  // every skill the repository publishes is fetched. The unsafe names are still
+  // dropped on that path, because writing one would put a directory on disk
+  // that no line of the summary can tell apart from the name it imitates — or,
+  // for a name Windows folds, would write into a directory the summary does
+  // not name at all.
+  const selectsEverything = requestedSkills.length === 0 && !interactive;
 
   const availableSkills = listAvailableSkills(files);
+  // Read before anything is written, so the comparison is against the skills
+  // the user had rather than against the ones this run is about to add.
+  const localSkillNames = await localSkillNamesToCompare({
+    outputBasePath,
+    localNames: await readSkillRootNames(outputBasePath),
+    listedNames: availableSkills,
+  });
 
-  if (requestedSkills.length > 0) {
-    const unknownSkills = requestedSkills.filter((name) => !availableSkills.includes(name));
-    if (unknownSkills.length > 0) {
-      const availableText =
-        availableSkills.length > 0 ? availableSkills.join(", ") : "(no skills found)";
-      throw new Error(
-        `Unknown skill(s): ${unknownSkills.join(", ")}. Available skills: ${availableText}`,
-      );
+  let selectedSkills: string[] = [];
+  if (!selectsEverything) {
+    if (requestedSkills.length > 0) {
+      const unknownSkills = requestedSkills.filter((name) => !availableSkills.includes(name));
+      if (unknownSkills.length > 0) {
+        // Both sides are quoted: the requested names came from the command line
+        // and the available ones from the remote repository, and a name holding
+        // a comma would otherwise read as two.
+        const availableText =
+          availableSkills.length > 0
+            ? availableSkills.map((name) => JSON.stringify(name)).join(", ")
+            : "(no skills found)";
+        throw new Error(
+          `Unknown skill(s): ${unknownSkills.map((name) => JSON.stringify(name)).join(", ")}. ` +
+            `Available skills: ${availableText}`,
+        );
+      }
     }
-  }
 
-  let selectedSkills = requestedSkills;
-  if (interactive) {
-    if (availableSkills.length === 0) {
-      logger.warn("No skills found in the source repository to select from.");
-      selectedSkills = [];
-    } else {
-      selectedSkills = await promptSkillSelection({
-        availableSkills,
-        preselectedSkills: requestedSkills,
-      });
-      if (selectedSkills.length === 0) {
-        logger.warn("No skills were selected in the interactive prompt; skipping all skills.");
+    selectedSkills = requestedSkills;
+    if (interactive) {
+      if (availableSkills.length === 0) {
+        logger.warn("No skills found in the source repository to select from.");
+        selectedSkills = [];
+      } else {
+        selectedSkills = await promptSkillSelection({
+          availableSkills,
+          preselectedSkills: requestedSkills,
+          localSkillNames,
+        });
+        if (selectedSkills.length === 0) {
+          logger.warn("No skills were selected in the interactive prompt; skipping all skills.");
+        }
       }
     }
   }
 
   const selectedSet = new Set(selectedSkills);
-  const droppedUnsafeNames = new Map<string, string>();
+  const droppedHiddenNames = new Map<string, string>();
+  const droppedFoldableNames = new Map<string, string>();
   const selected = files.filter((file) => {
     const skill = classifySkillPath(file.relativePath);
     if (skill.kind === "non-skill") {
       return true;
     }
-    // A name the prompt could not show truthfully was never on offer, so it
-    // cannot have been selected. Dropping it keeps the guarantee the selection
-    // makes: only skills the user saw and picked are written.
+    // A name the prompt could not show truthfully, or could not write where
+    // it says, was never on offer, so it cannot have been selected. Dropping
+    // it keeps the guarantee the selection makes: only skills the user saw and
+    // picked are written, and each lands in the directory it names.
     if (skill.kind === "unsafe-name") {
       // Keyed by the raw name so two directories that both strip down to
       // nothing still count as two.
-      droppedUnsafeNames.set(skill.raw, skill.display);
+      const dropped = skill.reason === "hidden" ? droppedHiddenNames : droppedFoldableNames;
+      dropped.set(skill.raw, skill.display);
       return false;
     }
-    return selectedSet.has(skill.name);
+    return selectsEverything || selectedSet.has(skill.name);
   });
 
-  if (droppedUnsafeNames.size > 0) {
-    logger.warn(formatDroppedSkillsWarning(droppedUnsafeNames));
+  if (droppedHiddenNames.size > 0) {
+    logger.warn(formatDroppedSkillsWarning(droppedHiddenNames));
+  }
+  if (droppedFoldableNames.size > 0) {
+    logger.warn(formatFoldableSkillsWarning(droppedFoldableNames));
+  }
+
+  // The prompt says this in the row itself, so it is said here only when there
+  // was no prompt. Without it the whole check would live on the one path a
+  // scripted fetch never takes, and a name written to look like another would
+  // be written to disk with nothing said about it at all.
+  if (!interactive) {
+    const confusable = formatConfusableSkillsWarning({
+      fetched: listAvailableSkills(selected),
+      available: availableSkills,
+      localSkillNames,
+    });
+    if (confusable !== undefined) {
+      logger.warn(confusable);
+    }
   }
 
   return selected;
 }
 
 /**
- * Describe the skill directories dropped for having control characters in their
+ * How many skill names a single warning line spells out before counting the
+ * rest, shared by every warning that lists them.
+ *
+ * How many directories a repository publishes is the repository's choice, and a
+ * warning that scrolls the screen is a warning nobody reads.
+ */
+const MAX_LISTED_SKILL_NAMES = 10;
+
+/**
+ * Spell out the first of `items` and count the rest, so that the cap and the
+ * way the remainder is worded are the same in every warning that lists names.
+ */
+function formatCappedList(params: { items: string[]; separator: string }): string {
+  const { items, separator } = params;
+  const listed = items.slice(0, MAX_LISTED_SKILL_NAMES);
+  const remaining = items.length - listed.length;
+  return `${listed.join(separator)}${remaining > 0 ? `${separator}and ${remaining} more` : ""}`;
+}
+
+/**
+ * Say which of the fetched skill names may be taken for another, or `undefined`
+ * when none of them may be.
+ *
+ * The same notes the interactive prompt puts beside a row, for the runs that
+ * have no prompt to put them beside — judged the way the prompt judges them,
+ * against every name the repository publishes and every skill already in the
+ * output directory, rather than against the few a `--skills` run picked out of
+ * them. It changes nothing about what is fetched: a name that reads like
+ * another is still a name the user asked for, on a path where there is nobody
+ * to ask.
+ */
+function formatConfusableSkillsWarning(params: {
+  fetched: string[];
+  available: string[];
+  localSkillNames: string[];
+}): string | undefined {
+  const { fetched, available, localSkillNames } = params;
+  // Judged against everything the repository publishes, listed for what this
+  // run writes. A name is confusable with another name, and the other one need
+  // not have been selected: `--skills c0py` fetches one directory, and that the
+  // repository also publishes `copy` is exactly what the user has to be told.
+  const fetchedNames = new Set(fetched);
+  const notes = new Map(
+    [...describeConfusableNames({ names: available, localNames: localSkillNames })].filter(
+      ([name]) => fetchedNames.has(name),
+    ),
+  );
+  if (notes.size === 0) {
+    return undefined;
+  }
+  const described = [...notes]
+    .toSorted(([a], [b]) => (a < b ? -1 : 1))
+    .map(([name, note]) => `${quoteForLog(name)} (${note})`);
+  return (
+    `Some fetched skill names may not be told apart on sight from what they appear to be \u2014 ` +
+    `from another name the source repository publishes, which this run may not have fetched, ` +
+    `from a skill already in the output directory, or from the plainer name the row itself ` +
+    `reads as: ` +
+    `${formatCappedList({ items: described, separator: "; " })}. ` +
+    `Check that each is the skill you meant to fetch.`
+  );
+}
+
+/**
+ * Describe the skill directories dropped for having hidden characters in their
  * name, keyed raw name to stripped name.
  *
- * The stripped form is all there is to show — the raw name is unprintable, which
- * is the whole reason the directory was dropped — and it can be empty or read
- * exactly like a skill the user did fetch. So a name that survives stripping is
- * quoted, to mark it as the sanitized form rather than a claim about what was
- * skipped, and a name that does not survive is counted instead of printed.
+ * "Hidden" covers both halves of the drop: the control characters, which forge
+ * and reorder what is printed, and the zero-width ones, which show nothing at
+ * all. The stripped form is all there is to show — the raw name cannot be
+ * printed as it is, which is the whole reason the directory was dropped — and
+ * it can be empty or read exactly like a skill the user did fetch. So a name
+ * that survives stripping is quoted, to mark it as the sanitized form rather
+ * than a claim about what was skipped, and a name that does not survive is
+ * counted instead of printed. The list is capped, as every list of names here
+ * is.
  */
 function formatDroppedSkillsWarning(droppedUnsafeNames: ReadonlyMap<string, string>): string {
   const displays = [...droppedUnsafeNames.values()];
   // Deduplicated, because two raw names can strip down to the same text and
   // listing it twice reads as a rendering bug. The count above stays keyed on
   // the raw names, so it still says how many directories were dropped.
-  const shown = [...new Set(displays.filter((display) => display !== ""))]
-    .toSorted()
-    .map((display) => JSON.stringify(display))
-    .join(", ");
+  const printable = [...new Set(displays.filter((display) => display !== ""))].toSorted();
+  const shown = formatCappedList({
+    items: printable.map((display) => JSON.stringify(display)),
+    separator: ", ",
+  });
   const unprintable = displays.filter((display) => display === "").length;
 
   const plural = droppedUnsafeNames.size !== 1;
   const lead =
     `Skipping ${plural ? `${droppedUnsafeNames.size} skill directories whose names contain` : "one skill directory whose name contains"} ` +
-    `control characters. Such a name cannot be listed truthfully, so it is never offered for ` +
-    `selection.`;
+    `hidden characters. Such a name cannot be shown truthfully, so it is neither offered for ` +
+    `selection nor fetched.`;
 
-  if (shown === "") {
+  if (printable.length === 0) {
     return (
-      `${lead} Nothing is left of ${plural ? "those names" : "the name"} once the control ` +
+      `${lead} Nothing is left of ${plural ? "those names" : "the name"} once the hidden ` +
       `characters are removed, so there is nothing to show here.`
     );
   }
 
   return (
-    `${lead} Shown here with the control characters removed, which is why a name may look ` +
+    `${lead} Shown here with the hidden characters removed, which is why a name may look ` +
     `like one you did select: ${shown}` +
     `${unprintable > 0 ? `, plus ${unprintable} with nothing left once they are removed` : ""}.`
   );
+}
+
+/**
+ * Describe the skill directories dropped for having a name Windows resolves
+ * to a different directory, keyed raw name to stripped name.
+ *
+ * These names passed the hidden-character check, so the stripped form is the
+ * name as it reads and is safe to print. It is still quoted: a trailing space
+ * is the whole reason one of these was dropped, and bare it would not show. The
+ * list is capped, as every list of names here is.
+ */
+function formatFoldableSkillsWarning(droppedFoldableNames: ReadonlyMap<string, string>): string {
+  const shown = formatCappedList({
+    items: [...droppedFoldableNames.values()].toSorted().map((display) => JSON.stringify(display)),
+    separator: ", ",
+  });
+  const plural = droppedFoldableNames.size !== 1;
+  return (
+    `Skipping ${plural ? `${droppedFoldableNames.size} skill directories whose names Windows resolves` : "one skill directory whose name Windows resolves"} ` +
+    `to a different directory: ${shown}. A name ending in a dot or an ASCII space, one shaped like ` +
+    `a NAME~1 short name, or a reserved device name such as NUL or COM1 is written into a ` +
+    `directory other than the one it reads as there, or into none at all, so it is neither ` +
+    `offered for selection nor fetched, on any platform.`
+  );
+}
+
+/**
+ * The names the local skills directory holds, or none when it is not there.
+ *
+ * Read only to compare names against each other: what is on disk is how a
+ * case-insensitive filesystem shows itself, since a write to `skills/PDF` lands
+ * in an existing `skills/pdf` and leaves the old name behind in the listing.
+ *
+ * Read twice per fetch, and the two readings are of different moments on
+ * purpose: the comparison reads before anything is written, so that it sees the
+ * skills the user already had rather than the ones this run is adding, and the
+ * prune reads after the writes, so that it sees what the run left behind.
+ *
+ * A symlink standing where a skill directory would be counts as one. `readdir`
+ * reports the link rather than what it points at, and a skill kept as a link
+ * into a shared tree — an ordinary arrangement in a monorepo — is a skill the
+ * user has. The link is counted without asking what is behind it, so a link to
+ * a file is counted too: both callers only ever read the names, and a name too
+ * many can only make the comparison mention a pair it need not have, or keep
+ * the prune from deleting something. Nothing here follows a link, and the prune
+ * walk's own guard is what keeps a delete from reaching through one.
+ */
+async function readSkillRootNames(outputBasePath: string): Promise<string[]> {
+  try {
+    const entries = await readdir(join(outputBasePath, SKILLS_DIR_NAME), {
+      withFileTypes: true,
+    });
+    // Directories and every symlink, whatever it points at: nothing here
+    // follows a link, so what is behind one cannot be asked about, and a name
+    // counted that turns out to be a link to a file only ever makes the
+    // comparison say more than it had to. Sorted so that the one of these names
+    // a run reports — the prune's variant warning below picks the first that
+    // matches — is the same name on every filesystem.
+    return entries
+      .filter((entry) => entry.isDirectory() || entry.isSymbolicLink())
+      .map((entry) => entry.name)
+      .toSorted();
+  } catch {
+    // No skills directory, or one that cannot be read: nothing to compare
+    // against, and a prune that cannot read the tree fails on its
+    // own terms below rather than being stopped short here.
+    return [];
+  }
+}
+
+/**
+ * The local skill names an incoming listing is worth being compared against.
+ *
+ * A name the fetch would write into is the skill being refreshed rather than
+ * one imitating it, and marking it would put a note on a row that is doing
+ * exactly what the user asked. An identical spelling is that case and
+ * `describeConfusableNames` drops it on its own. The spellings that differ only
+ * in case, or only in how the name is composed in Unicode, are the ones no
+ * comparison of names can settle: `skills/PDF` is `skills/pdf` on macOS and
+ * Windows and a second directory on Linux, so the same pair is a quiet refresh
+ * on one machine and two directories that read alike on another.
+ *
+ * So the filesystem is asked, once per ambiguous pair. A listed name that is
+ * absent from the listing but resolves to a directory anyway is a name this
+ * filesystem folds onto one of the entries, and the local name it folds onto is
+ * dropped; where it resolves to nothing, the two are separate directories and
+ * the local name stays in the comparison. Dropping it also asks that the two
+ * read alike, so that a local name a second entry imitates keeps its place on
+ * the comparison even while the first entry refreshes it. That the listed name comes from the
+ * remote repository is safe to join here without a further check: it case-folds
+ * onto a name `readdir` returned, and no separator survives being folded into
+ * one that holds none.
+ */
+async function localSkillNamesToCompare(params: {
+  outputBasePath: string;
+  localNames: string[];
+  listedNames: string[];
+}): Promise<string[]> {
+  const { outputBasePath, localNames, listedNames } = params;
+  const localSpellings = new Set(localNames);
+  const listedByIdentity = groupSpellingsByCaseFoldedIdentity(listedNames);
+
+  const kept: string[] = [];
+  for (const localName of localNames) {
+    // Only the spellings that differ: an identical one is the refresh case, and
+    // it is the listing's own business rather than the filesystem's.
+    const localReading = readingFormOf(localName);
+    const twins = (listedByIdentity.get(caseFoldIdentity(localName)) ?? []).filter(
+      (name) =>
+        name !== localName &&
+        // A twin that is on the local listing too is a directory of its own, so
+        // it says nothing about what this name folds onto.
+        !localSpellings.has(name) &&
+        // And it has to read alike as well as fold alike, or dropping the local
+        // name would hide more than the refresh: `API` folds onto a listed
+        // `api`, but it reads as `APl`, so a listing that also carried `AP1`
+        // would lose the only name that name imitates. Where the two forms
+        // agree — `pdf` beside `PDF`, a composed name beside its decomposed
+        // spelling — the local name has nothing left to say that the twin does
+        // not say in its place.
+        readingFormOf(name) === localReading,
+    );
+    // One at a time and stopping at the first yes: a listing is free to hold
+    // thousands of spellings of one name, and the first that resolves settles
+    // the question for all of them.
+    let folded = false;
+    for (const twin of twins) {
+      if (await directoryExists(join(outputBasePath, SKILLS_DIR_NAME, twin))) {
+        folded = true;
+        break;
+      }
+    }
+    if (!folded) {
+      kept.push(localName);
+    }
+  }
+  return kept;
 }
 
 /**
@@ -690,8 +1119,8 @@ async function pruneDirectory(params: {
     // enough that a fetched tree stays well inside it, since the remote walk
     // fails outright rather than truncating when it runs past its own.
     logger.warn(
-      `Not pruning below ${stripControlCharacters(relativeDirPath)}: it is more than ` +
-        `${MAX_RECURSION_DEPTH} directories deep.`,
+      `Not pruning below ${quoteForLog(relativeDirPath)}: it is ` +
+        `more than ${MAX_RECURSION_DEPTH} directories deep.`,
     );
     return "kept";
   }
@@ -703,8 +1132,9 @@ async function pruneDirectory(params: {
   // directory swapped for a link between the two reads.
   if (await isSymbolicLink(dirPath)) {
     logger.warn(
-      `Not pruning ${stripControlCharacters(relativeDirPath)}: it is a symbolic link, and its ` +
-        `target is outside what this fetch may delete from. Remove unwanted files by hand.`,
+      `Not pruning ${quoteForLog(relativeDirPath)}: it is a ` +
+        `symbolic link, and its target is outside what this fetch may delete from. Remove ` +
+        `unwanted files by hand.`,
     );
     return "kept";
   }
@@ -737,7 +1167,7 @@ async function pruneDirectory(params: {
       }
       await rm(entryPath, { force: true });
       deleted.push({ relativePath: entryRelativePath, status: "deleted" });
-      logger.debug(`Deleted stale skill entry: ${stripControlCharacters(entryRelativePath)}`);
+      logger.debug(`Deleted stale skill entry: ${quoteForLog(entryRelativePath)}`);
       continue;
     }
 
@@ -775,7 +1205,7 @@ async function pruneDirectory(params: {
         throw error;
       }
       deleted.push({ relativePath: `${entryRelativePath}/`, status: "deleted" });
-      logger.debug(`Removed stale skill directory: ${stripControlCharacters(entryRelativePath)}`);
+      logger.debug(`Removed stale skill directory: ${quoteForLog(entryRelativePath)}`);
       continue;
     }
 
@@ -795,7 +1225,7 @@ async function pruneDirectory(params: {
 
     await rm(entryPath, { force: true });
     deleted.push({ relativePath: entryRelativePath, status: "deleted" });
-    logger.debug(`Deleted stale skill file: ${stripControlCharacters(entryRelativePath)}`);
+    logger.debug(`Deleted stale skill file: ${quoteForLog(entryRelativePath)}`);
   }
 
   return survivors > 0 ? "kept" : "emptied";
@@ -892,11 +1322,13 @@ async function pruneStaleSkillFiles(params: {
     if (skill.kind !== "skill") {
       continue;
     }
-    const localSkillDir = `skills/${skill.name}`;
+    const localSkillDir = `${SKILLS_DIR_PREFIX}${skill.name}`;
     if (!skillDirs.has(localSkillDir)) {
       skillDirs.set(localSkillDir, remoteSkillDirPath({ file, localSkillDir }));
     }
   }
+
+  const localSkillNames = await readSkillRootNames(outputBasePath);
 
   const deleted: FetchFileResult[] = [];
   for (const [skillDir, remoteDir] of [...skillDirs].toSorted(([a], [b]) => (a < b ? -1 : 1))) {
@@ -906,43 +1338,75 @@ async function pruneStaleSkillFiles(params: {
     // from one upstream dropped — so nothing here is judged stale.
     if (remoteDir === undefined) {
       logger.warn(
-        `Not pruning ${stripControlCharacters(skillDir)}: the remote directory it was fetched ` +
-          `from could not be worked out, so there is nothing to judge the local files against. ` +
-          `Remove unwanted files by hand.`,
+        `Not pruning ${quoteForLog(skillDir)}: the remote ` +
+          `directory it was fetched from could not be worked out, so there is nothing to judge ` +
+          `the local files against. Remove unwanted files by hand.`,
       );
       continue;
     }
 
     if (hasPathAtOrUnder(incompleteRemoteDirs, remoteDir)) {
       logger.warn(
-        `Not pruning ${stripControlCharacters(skillDir)}: the remote listing for it came back ` +
-          `incomplete, so a stale local file cannot be told apart from one the listing left out. ` +
-          `Remove unwanted files by hand.`,
+        `Not pruning ${quoteForLog(skillDir)}: the remote listing ` +
+          `for it came back incomplete, so a stale local file cannot be told apart from one the ` +
+          `listing left out. Remove unwanted files by hand.`,
       );
       continue;
     }
 
-    // Windows drops a trailing dot or space when it resolves a path, so a
-    // remote `skills/my-docs.` is the existing `skills/my-docs` there. The write
-    // and the prune would agree with each other and disagree with the summary,
-    // which would then name a directory other than the one it emptied. Nothing
-    // reaches outside the output directory either way, but a deletion record
-    // that names the wrong directory is not one worth keeping.
-    // A name ending in the `NAME~1` shape is the same class of problem: on a
-    // Windows volume that generates short names, it opens whatever long name it
-    // stands for. The shape only means that at the end of a name, so `data~2parser`
-    // is an ordinary name and is pruned. The guard is not gated on the platform:
-    // the same repository is checked out on several of them, and a name that is
-    // ambiguous on any one of them is one this tool would rather leave alone
-    // everywhere than prune differently depending on where it runs.
-    // Only the skill root is guarded. A remote `skills/a/bar./x.md` writes into
-    // `bar` on Windows and the prune walks `bar`, which is safe because every
-    // file the fetch wrote there is matched by identity rather than by name.
-    if (/[.\s]$/.test(skillDir) || /~\d+(?:\.[^.]*)?$/.test(skillDir)) {
+    // A name Windows folds onto another directory — a trailing dot or ASCII
+    // space, the `NAME~1` shape of a short name, or a reserved device name —
+    // is turned away by `classifySkillPath` before anything is written, so no
+    // such directory reaches this loop through the fetched files. For a
+    // fetched name this branch is dead by construction: the name already
+    // passed the same predicate, so nothing between the two checks can make
+    // it match. Only the predicate's own tests exercise it. The guard stays as
+    // a backstop for the same reason it was written: the write and the prune
+    // would agree with each other and disagree with the summary, which would
+    // then name a directory other than the one it emptied. Nothing reaches
+    // outside the output directory either way, but a deletion record that
+    // names the wrong directory is not one worth keeping.
+    // Only the skill root is guarded. A remote `skills/a/bar./x.md` never
+    // gets this far: `dropAmbiguousRemotePaths` turns the file away and marks
+    // the skill's remote directory incomplete, which the check above honors.
+    const skillName = skillDir.slice(SKILLS_DIR_PREFIX.length);
+    if (hasWindowsFoldableName(skillName)) {
       logger.warn(
-        `Not pruning ${stripControlCharacters(skillDir)}: its name is one some systems resolve ` +
-          `to a different directory, so it may not be the directory this name reads as. Remove ` +
-          `unwanted files by hand.`,
+        `Not pruning ${quoteForLog(skillDir)}: its name is one ` +
+          `some systems resolve to a different directory, so it may not be the directory this ` +
+          `name reads as. Remove unwanted files by hand.`,
+      );
+      continue;
+    }
+
+    // The same class of problem, reached by case or by how the name is spelled
+    // in Unicode rather than by punctuation. macOS and Windows resolve
+    // `skills/PDF` to an existing `skills/pdf`, and macOS resolves a name
+    // written with a combining accent to the same directory as one written with
+    // the composed letter — so a remote skill named for such a variant of a
+    // local one writes into that directory, and a prune of it would judge the
+    // local skill's own files stale and delete them. Two entries that differ
+    // only this way cannot both be on a filesystem that folds them, so a
+    // listing that holds both says this one does not fold them; the guard is
+    // not gated on that, for the reason the guard above is not gated on the
+    // platform either. That also covers the twin this same fetch wrote: a
+    // remote free to publish `pdf` and `PDF` is free to publish them so that
+    // one lands inside the other, where a prune walking the pair by name would
+    // delete files the other half of the fetch had just written.
+    // `caseFoldIdentity` is the form the rest of the tool compares skill names
+    // in: the case dropped, since macOS and Windows ignore it, and the
+    // composition normalized, since macOS stores a name decomposed and hands
+    // back whichever form was written first.
+    const foldedSkillName = caseFoldIdentity(skillName);
+    const variant = localSkillNames.find(
+      (entry) => entry !== skillName && caseFoldIdentity(entry) === foldedSkillName,
+    );
+    if (variant !== undefined) {
+      logger.warn(
+        `Not pruning ${quoteForLog(skillDir)}: ` +
+          `${quoteForLog(`${SKILLS_DIR_PREFIX}${variant}`)} is also ` +
+          `there and differs only in ways some filesystems ignore, so this name may not be the ` +
+          `directory it reads as. Remove unwanted files by hand.`,
       );
       continue;
     }
@@ -968,15 +1432,19 @@ async function pruneStaleSkillFiles(params: {
       // could not do rather than throwing the fetch away over it. Only a
       // filesystem error is absorbed: anything else is a defect in the walk, and
       // one that turned into a warning would take a skipped prune with it
-      // quietly. The message is stripped too, since a filesystem error carries
-      // the local path it failed on.
+      // quietly. `isFileSystemError` recognizes an I/O failure by its `errno`
+      // code, so a `code` of another shape — the `UNKNOWN` libuv falls back to
+      // for a system error it cannot translate — is rethrown rather than warned
+      // about. That is the side to err on here: a prune silently skipped is
+      // worse than a fetch that says why it stopped. The message is stripped
+      // too, since a filesystem error carries the local path it failed on.
       if (!isFileSystemError(error)) {
         throw error;
       }
       // "Stopped partway", not "did not prune": entries deleted before the
       // failure are already recorded, and the summary lists them.
       logger.warn(
-        `Stopped partway through pruning ${stripControlCharacters(skillDir)}. ` +
+        `Stopped partway through pruning ${quoteForLog(skillDir)}. ` +
           `${stripControlCharacters(formatError(error))}`,
       );
     }
@@ -1004,15 +1472,6 @@ async function pruneStaleSkillFiles(params: {
  */
 function isSymbolicLinkLoopError(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ELOOP";
-}
-
-/**
- * Whether the error came from the filesystem rather than from the walk itself.
- * Node stamps every `fs` rejection with a `code`, so its presence is what tells
- * an I/O failure apart from a programming error raised in the same call.
- */
-function isFileSystemError(error: unknown): boolean {
-  return error instanceof Error && "code" in error && typeof error.code === "string";
 }
 
 /**
@@ -1065,6 +1524,18 @@ function isNotFoundError(error: unknown): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * Whether a fetched file is a skill's supporting file, the one kind of file
+ * whose executable bit matters: an agent is told to run `scripts/run.sh`,
+ * never a rule. Only such a file is worth a tree lookup or a chmod.
+ */
+function isSkillSupportingPath(relativePath: string): boolean {
+  return (
+    classifySkillPath(relativePath).kind === "skill" &&
+    posix.basename(relativePath) !== SKILL_FILE_NAME
+  );
 }
 
 /**
@@ -1126,6 +1597,8 @@ export async function fetchFiles(params: FetchParams): Promise<FetchSummary> {
     intendedRootDir: outputRoot,
   });
 
+  const outputBasePath = join(outputRoot, outputDir);
+
   // Initialize GitHub client
   const token = GitHubClient.resolveToken(options.token);
   const client = new GitHubClient({ token });
@@ -1142,7 +1615,10 @@ export async function fetchFiles(params: FetchParams): Promise<FetchSummary> {
 
   // Resolve ref to use
   const ref = resolvedRef ?? (await client.getDefaultBranch(parsed.owner, parsed.repo));
-  logger.debug(`Using ref: ${ref}`);
+  // A default branch name is chosen by the remote repository, and git allows
+  // characters in it that reorder a terminal line, so it is quoted for the log
+  // like every other remote-controlled string this command prints.
+  logger.debug(`Using ref: ${quoteForLog(ref)}`);
 
   // If target is a tool format, use conversion flow
   if (isToolTarget(target)) {
@@ -1181,6 +1657,7 @@ export async function fetchFiles(params: FetchParams): Promise<FetchSummary> {
     files: collectedFiles,
     requestedSkills,
     interactive,
+    outputBasePath,
     logger,
   });
 
@@ -1189,8 +1666,18 @@ export async function fetchFiles(params: FetchParams): Promise<FetchSummary> {
     return emptyFetchSummary({ source: `${parsed.owner}/${parsed.repo}`, ref });
   }
 
-  // Process files in parallel with concurrency control
-  const outputBasePath = join(outputRoot, outputDir);
+  // One tree listing per run, and only when a file that can carry a mode is
+  // being fetched: a rules-only fetch has nothing to chmod and gets no request
+  // and no truncation warning about scripts it never wrote.
+  const executablePaths = filesToFetch.some((file) => isSkillSupportingPath(file.relativePath))
+    ? await resolveExecutablePaths({
+        client,
+        owner: parsed.owner,
+        repo: parsed.repo,
+        ref,
+        logger,
+      })
+    : new Set<string>();
 
   // Validate paths and check file sizes first (synchronous checks)
   for (const { relativePath, size } of filesToFetch) {
@@ -1212,7 +1699,7 @@ export async function fetchFiles(params: FetchParams): Promise<FetchSummary> {
       const exists = await fileExists(localPath);
 
       if (exists && conflictStrategy === "skip") {
-        logger.debug(`Skipping existing file: ${stripControlCharacters(relativePath)}`);
+        logger.debug(`Skipping existing file: ${quoteForLog(relativePath)}`);
         return { relativePath, status: "skipped" as const };
       }
 
@@ -1220,9 +1707,12 @@ export async function fetchFiles(params: FetchParams): Promise<FetchSummary> {
         client.getFileContent(parsed.owner, parsed.repo, remotePath, ref),
       );
       await writeFileContent(localPath, content);
+      if (isSkillSupportingPath(relativePath) && executablePaths.has(remotePath)) {
+        await applyFileMode(localPath, 0o755);
+      }
 
       const status = exists ? ("overwritten" as const) : ("created" as const);
-      logger.debug(`Wrote: ${stripControlCharacters(relativePath)} (${status})`);
+      logger.debug(`Wrote: ${quoteForLog(relativePath)} (${status})`);
       return { relativePath, status };
     }),
   );
@@ -1286,7 +1776,7 @@ async function collectFeatureFiles(params: {
   }
 
   const tasks = enabledFeatures.flatMap((feature) =>
-    FEATURE_PATHS[feature].map((featurePath) => ({ feature, featurePath })),
+    FEATURE_SOURCE_TREE_ENTRIES[feature].map((featurePath) => ({ feature, featurePath })),
   );
 
   const results = await Promise.all(
@@ -1314,7 +1804,7 @@ async function collectFeatureFiles(params: {
           } catch (error) {
             // Only skip 404 errors (file not found), re-throw other errors
             if (isNotFoundError(error)) {
-              logger.debug(`File not found: ${fullPath}`);
+              logger.debug(`File not found: ${quoteForLog(fullPath)}`);
             } else {
               throw error;
             }
@@ -1354,7 +1844,7 @@ async function collectFeatureFiles(params: {
         // Check for 404 errors (feature not found)
         if (isNotFoundError(error)) {
           // Feature directory/file not found, skip silently
-          logger.debug(`Feature not found: ${fullPath}`);
+          logger.debug(`Feature not found: ${quoteForLog(fullPath)}`);
           return collected;
         }
         throw error;
@@ -1408,6 +1898,8 @@ async function fetchAndConvertToolFiles(params: {
     logger,
   } = params;
 
+  const outputBasePath = join(outputRoot, outputDir);
+
   // Create a unique temporary directory
   const tempDir = await createTempDirectory();
   logger.debug(`Created temp directory: ${tempDir}`);
@@ -1433,6 +1925,7 @@ async function fetchAndConvertToolFiles(params: {
       files: collectedFiles,
       requestedSkills,
       interactive,
+      outputBasePath,
       logger,
     });
 
@@ -1465,12 +1958,11 @@ async function fetchAndConvertToolFiles(params: {
           client.getFileContent(parsed.owner, parsed.repo, remotePath, ref),
         );
         await writeFileContent(localPath, content);
-        logger.debug(`Fetched to temp: ${toolRelativePath}`);
+        logger.debug(`Fetched to temp: ${quoteForLog(toolRelativePath)}`);
       }),
     );
 
     // Convert fetched files to rulesync format
-    const outputBasePath = join(outputRoot, outputDir);
     const { converted, convertedPaths } = await convertFetchedFilesToRulesync({
       tempDir,
       outputDir: outputBasePath,
@@ -1675,7 +2167,9 @@ function fetchStatusText(status: FetchFileResult["status"]): string {
 export function formatFetchSummary(summary: FetchSummary): string {
   const lines: string[] = [];
 
-  lines.push(`Fetched from ${summary.source}@${summary.ref}:`);
+  // The ref comes from the remote repository when it was not given on the
+  // command line, so it is stripped alongside the paths below.
+  lines.push(`Fetched from ${summary.source}@${stripControlCharacters(summary.ref)}:`);
 
   for (const file of summary.files) {
     const icon = fetchStatusIcon(file.status);
@@ -1684,6 +2178,12 @@ export function formatFetchSummary(summary: FetchSummary): string {
     // fetched one it never went through the checks on a remote path. An escape
     // sequence in it could rewrite or erase the lines around it, and the lines
     // around it are the record of what this command deleted.
+    // Not quoted, unlike the same paths in the log lines: this is a listing of
+    // one path per line rather than a sentence a name could prefix, and quoting
+    // every row would put a pair of marks on names that are almost always
+    // ordinary. The cost is that a name ending in something shaped like the
+    // status column can be misread as one — within its own row only, since the
+    // strip above leaves it nothing to end the line with.
     lines.push(`  ${icon} ${stripControlCharacters(file.relativePath)} ${statusText}`);
   }
 

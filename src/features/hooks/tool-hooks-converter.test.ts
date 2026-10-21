@@ -110,6 +110,18 @@ const COMMAND_ONLY_KINDS = [
     canonical: "env",
     value: { API_URL: "https://example.com" },
   },
+  {
+    kind: "object",
+    converterConfig: {
+      ...BASE_CONFIG,
+      objectPassthroughFields: [
+        { canonical: "source", tool: "source", commandOnly: true },
+      ] as const,
+    },
+    tool: "source",
+    canonical: "source",
+    value: { source: "github:org/hooks-repo/scripts/validate.sh", ref: "main" },
+  },
 ] as const;
 
 describe("toolHooksToCanonical", () => {
@@ -343,11 +355,37 @@ const CANONICALLY_INVALID_IMPORTS = [
     invalid: -1,
     valid: 0,
   },
+  {
+    kind: "an object missing a required key",
+    converterConfig: {
+      ...BASE_CONFIG,
+      objectPassthroughFields: [{ canonical: "source", tool: "source" }] as const,
+    },
+    tool: "source",
+    canonical: "source",
+    invalid: { ref: "main" },
+    valid: { source: "github:org/hooks-repo/scripts/validate.sh" },
+    // The warning names the offending key, since zod's own message for a
+    // missing key is the generic "Invalid input".
+    at: "source",
+  },
+  {
+    kind: "a control character inside an object field",
+    converterConfig: {
+      ...BASE_CONFIG,
+      objectPassthroughFields: [{ canonical: "source", tool: "source" }] as const,
+    },
+    tool: "source",
+    canonical: "source",
+    invalid: { source: "github:org/hooks-repo/scripts/validate.sh\nref: evil" },
+    valid: { source: "github:org/hooks-repo/scripts/validate.sh", ref: "v1.2.0" },
+    at: "source",
+  },
 ] as const;
 
 describe.each(CANONICALLY_INVALID_IMPORTS)(
   "toolHooksToCanonical with $kind",
-  ({ converterConfig, tool, canonical, invalid, valid }) => {
+  ({ converterConfig, tool, canonical, invalid, valid, ...entry }) => {
     it("skips the value and warns instead of importing it", () => {
       const { definition, logger } = importHook({
         hook: { type: "command", command: "./run.sh", [tool]: invalid },
@@ -357,8 +395,10 @@ describe.each(CANONICALLY_INVALID_IMPORTS)(
       expect(definition).not.toHaveProperty(canonical);
       // Only the sentence Rulesync writes is asserted; the tail comes from
       // zod's own message for the violated rule, which is locale-dependent.
+      // A scalar has no key to name, so its sentence ends right at the colon.
+      const at = "at" in entry ? ` at "${entry.at}"` : "";
       expect(logger.warn).toHaveBeenCalledWith(
-        expect.stringContaining(`it does not satisfy the canonical "${canonical}" field:`),
+        expect.stringContaining(`it does not satisfy the canonical "${canonical}" field${at}:`),
       );
     });
 
@@ -375,6 +415,38 @@ describe.each(CANONICALLY_INVALID_IMPORTS)(
 );
 
 describe("toolHooksToCanonical with a value rejected by the kind rather than the schema", () => {
+  it("skips a non-object in an object field and says so", () => {
+    const { definition, logger } = importHook({
+      hook: { type: "command", command: "bash", source: "github:org/hooks-repo/run.sh" },
+      converterConfig: {
+        ...BASE_CONFIG,
+        objectPassthroughFields: [{ canonical: "source", tool: "source" }],
+      },
+    });
+
+    expect(definition).not.toHaveProperty("source");
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining(`Dropping "source" while importing a hook: it must be an object.`),
+    );
+  });
+
+  it("quotes the header name it points at, since that key is user-written", () => {
+    const { definition, logger } = importHook({
+      hook: {
+        type: "http",
+        url: "https://hooks.example.com/pre",
+        headers: { "X-\u001b[2K\nEvil": "bad\nvalue" },
+      },
+      converterConfig: { ...BASE_CONFIG, supportedHookTypes: new Set(["http"]) },
+    });
+
+    expect(definition).not.toHaveProperty("headers");
+    const [message] = logger.warn.mock.calls[0] ?? [];
+    expect(message).toContain('field at "X-[2KEvil":');
+    // eslint-disable-next-line no-control-regex
+    expect(message).not.toMatch(/[\u0000-\u0009\u000b-\u001f]/);
+  });
+
   it("skips an empty string and says which rule rejected it", () => {
     const { definition, logger } = importHook({
       hook: { type: "command", command: "./run.sh", statusMessage: "" },
@@ -437,6 +509,24 @@ describe("toolHooksToCanonical for fields outside the passthrough kinds", () => 
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining(`Skipping a hook while importing: its "${field}"`),
     );
+  });
+
+  it("quotes only a bounded prefix of the rejected value", () => {
+    // The value names the entry so the reader can find it, but a command line
+    // is exactly the shape that carries a credential, and this diagnostic now
+    // travels into a `--json` document and an MCP result. Quote enough to
+    // recognize the hook and no more.
+    const secret = `curl -H "Authorization: Bearer ${"s".repeat(200)}"\nrm -rf /`;
+    const { definition, logger } = importHook({
+      hook: { type: "command", command: secret },
+      converterConfig: BASE_CONFIG,
+    });
+
+    expect(definition).toBeUndefined();
+    const warning = logger.warn.mock.calls[0]![0] as string;
+
+    expect(warning).toContain("…(truncated)");
+    expect(warning).not.toContain("s".repeat(200));
   });
 
   it("skips a command hook whose command is not a string at all", () => {
@@ -574,5 +664,161 @@ describe("ClaudecodeHooks.toRulesyncHooks", () => {
 
     expect(definition).toMatchObject(CLAUDE_COMMAND_ONLY_FIELDS);
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe("toolHooksToCanonical with an event named after an Object.prototype member (#2757)", () => {
+  it("carries a toString event through as a plain string key", () => {
+    const logger = createMockLogger();
+    // JSON.parse yields an own enumerable `toString` key, unlike an object
+    // literal whose `toString` the lookup map would inherit from
+    // Object.prototype.
+    const hooks: unknown = JSON.parse(
+      JSON.stringify({
+        PreToolUse: [{ hooks: [{ type: "command", command: "./guard.sh" }] }],
+        toString: [{ hooks: [{ type: "command", command: "./crafted.sh" }] }],
+      }),
+    );
+
+    const canonical = toolHooksToCanonical({ hooks, converterConfig: BASE_CONFIG, logger });
+
+    expect(canonical.preToolUse).toEqual([{ type: "command", command: "./guard.sh" }]);
+    // The unmapped name must fall through verbatim rather than resolving to
+    // Object.prototype.toString and landing under its stringified source.
+    expect(Object.keys(canonical)).toEqual(["preToolUse", "toString"]);
+    expect(canonical["toString"]).toEqual([{ type: "command", command: "./crafted.sh" }]);
+  });
+});
+
+describe("toolHooksToCanonical with two native names for one canonical event", () => {
+  it("appends the second key's hooks instead of overwriting the first", () => {
+    const converterConfig: ToolHooksConverterConfig = {
+      ...BASE_CONFIG,
+      toolToCanonicalEventNames: {
+        ...BASE_CONFIG.toolToCanonicalEventNames,
+        LegacyStop: "stop",
+        Stop: "stop",
+      },
+    };
+    const canonical = toolHooksToCanonical({
+      hooks: {
+        LegacyStop: [{ hooks: [{ type: "command", command: "./legacy.sh" }] }],
+        Stop: [{ hooks: [{ type: "command", command: "./new.sh" }] }],
+      },
+      converterConfig,
+    });
+
+    expect(canonical.stop).toEqual([
+      { type: "command", command: "./legacy.sh" },
+      { type: "command", command: "./new.sh" },
+    ]);
+  });
+});
+
+describe("timeoutUnit (tool timeouts in milliseconds)", () => {
+  const MS_CONFIG: ToolHooksConverterConfig = { ...BASE_CONFIG, timeoutUnit: "milliseconds" };
+
+  it("multiplies the canonical seconds by 1000 on generate", () => {
+    const { hook } = emitHook({
+      definition: { type: "command", command: "./guard.sh", timeout: 30 },
+      converterConfig: MS_CONFIG,
+    });
+
+    expect(hook).toEqual({ type: "command", command: "./guard.sh", timeout: 30000 });
+  });
+
+  it("rounds a fractional second to whole milliseconds", () => {
+    const { hook } = emitHook({
+      definition: { type: "command", command: "./guard.sh", timeout: 1.5005 },
+      converterConfig: MS_CONFIG,
+    });
+
+    expect(hook?.timeout).toBe(1501);
+  });
+
+  it("divides the tool milliseconds by 1000 on import", () => {
+    const { definition } = importHook({
+      hook: { type: "command", command: "./guard.sh", timeout: 5000 },
+      converterConfig: MS_CONFIG,
+    });
+
+    expect(definition).toEqual({ type: "command", command: "./guard.sh", timeout: 5 });
+  });
+
+  it("round-trips whole seconds and settles a fractional second at millisecond precision", () => {
+    const roundTrip = (timeout: number) => {
+      const { hook } = emitHook({
+        definition: { type: "command", command: "./guard.sh", timeout },
+        converterConfig: MS_CONFIG,
+      });
+      const { definition } = importHook({ hook: hook ?? {}, converterConfig: MS_CONFIG });
+      return definition?.timeout;
+    };
+
+    expect(roundTrip(30)).toBe(30);
+    // The generated file holds whole milliseconds, so sub-millisecond
+    // precision is lost once and then stable.
+    expect(roundTrip(1.5005)).toBe(1.501);
+  });
+
+  it("forwards the timeout verbatim when the unit is not set", () => {
+    const { hook } = emitHook({
+      definition: { type: "command", command: "./guard.sh", timeout: 30 },
+      converterConfig: BASE_CONFIG,
+    });
+    const { definition } = importHook({
+      hook: { type: "command", command: "./guard.sh", timeout: 30 },
+      converterConfig: BASE_CONFIG,
+    });
+
+    expect(hook?.timeout).toBe(30);
+    expect(definition?.timeout).toBe(30);
+  });
+});
+
+describe("hookTypeNames (a tool spelling of a canonical hook type, #3074)", () => {
+  const RENAMING_CONFIG: ToolHooksConverterConfig = {
+    ...BASE_CONFIG,
+    supportedHookTypes: new Set(["command", "http"]),
+    hookTypeNames: { http: "https" },
+  };
+
+  it("emits the canonical http type under the tool spelling", () => {
+    const { hook } = emitHook({
+      definition: { type: "http", url: "https://example.com/hook", timeout: 3 },
+      converterConfig: RENAMING_CONFIG,
+    });
+
+    expect(hook).toEqual({ type: "https", url: "https://example.com/hook", timeout: 3 });
+  });
+
+  it("leaves a type without a tool spelling under its canonical name", () => {
+    const { hook } = emitHook({
+      definition: { type: "command", command: "./run.sh" },
+      converterConfig: RENAMING_CONFIG,
+    });
+
+    expect(hook).toEqual({ type: "command", command: "./run.sh" });
+  });
+
+  it("imports the tool spelling back as the canonical type with its payload", () => {
+    const { definition } = importHook({
+      hook: { type: "https", url: "https://example.com/hook", timeout: 3 },
+      converterConfig: RENAMING_CONFIG,
+    });
+
+    expect(definition).toEqual({ type: "http", url: "https://example.com/hook", timeout: 3 });
+  });
+
+  it("does not read the shadowed canonical spelling as that type on import", () => {
+    // The tool calls its webhook handler `https`, so a bare `http` in its
+    // file is not a handler it has: it gets the unknown-type treatment
+    // (coerced to `command`) instead of being read as a webhook.
+    const { definition } = importHook({
+      hook: { type: "http", url: "https://example.com/hook", command: "./run.sh" },
+      converterConfig: RENAMING_CONFIG,
+    });
+
+    expect(definition).toEqual({ type: "command", command: "./run.sh" });
   });
 });

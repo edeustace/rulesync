@@ -4,9 +4,10 @@ import { z } from "zod/mini";
 
 import { KIRO_IDE_HOOKS_DIR_PATH, KIRO_IDE_HOOKS_FILE_NAME } from "../../constants/kiro-paths.js";
 import type { AiFileParams, ValidationResult } from "../../types/ai-file.js";
-import type { HookDefinition, HooksConfig } from "../../types/hooks.js";
+import type { HookConfirm, HookDefinition, HooksConfig } from "../../types/hooks.js";
 import {
   CANONICAL_TO_KIRO_IDE_EVENT_NAMES,
+  HookConfirmSchema,
   KIRO_IDE_HOOK_EVENTS,
   KIRO_IDE_TO_CANONICAL_EVENT_NAMES,
   KIRO_LEGACY_TO_KIRO_IDE_TRIGGER_NAMES,
@@ -14,7 +15,11 @@ import {
 } from "../../types/hooks.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
-import { isPrototypePollutionKey } from "../../utils/prototype-pollution.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
+import {
+  isPrototypePollutionKey,
+  omitPrototypePollutionKeysDeep,
+} from "../../utils/prototype-pollution.js";
 import type { RulesyncHooks } from "./rulesync-hooks.js";
 import { buildImportedHooksConfig } from "./tool-hooks-converter.js";
 import {
@@ -45,6 +50,10 @@ const KiroIdeHookEntrySchema = z.looseObject({
   action: z.optional(KiroIdeHookActionSchema),
   timeout: z.optional(z.number()),
   enabled: z.optional(z.boolean()),
+  // Confirmation prompt for `Stop`-trigger command hooks (with its optional
+  // nested `confirmCommand`); see `HookDefinitionSchema.confirm`. Passed
+  // through verbatim in both directions.
+  confirm: z.optional(HookConfirmSchema),
 });
 
 const KiroIdeHooksFileSchema = z.looseObject({
@@ -99,6 +108,7 @@ function buildKiroIdeEntriesForEvent(
       // Kiro defaults `enabled` to `true`; an imported `enabled: false` is
       // preserved so regenerating does not silently reactivate the hook.
       enabled: def.enabled ?? true,
+      ...(def.confirm !== undefined && { confirm: def.confirm }),
     });
   }
   return entries;
@@ -146,19 +156,42 @@ function canonicalToKiroIdeHooks(config: HooksConfig): KiroIdeHookEntry[] {
     // emitted verbatim, which would write a trigger this format does not
     // define. Anything else still passes through unchanged.
     const trigger =
-      CANONICAL_TO_KIRO_IDE_EVENT_NAMES[eventName] ??
-      KIRO_LEGACY_TO_KIRO_IDE_TRIGGER_NAMES[eventName] ??
+      lookupOwn({ record: CANONICAL_TO_KIRO_IDE_EVENT_NAMES, key: eventName }) ??
+      lookupOwn({ record: KIRO_LEGACY_TO_KIRO_IDE_TRIGGER_NAMES, key: eventName }) ??
       eventName;
     entries.push(...buildKiroIdeEntriesForEvent(trigger, definitions));
   }
   return entries;
 }
 
+/**
+ * Copies the optional per-hook fields (`enabled`, `confirm`) back onto the
+ * canonical definition.
+ */
+function copyOptionalHookFields({
+  entry,
+  def,
+}: {
+  entry: KiroIdeHookEntry;
+  def: HookDefinition;
+}): void {
+  // Only carry an explicit `false`: `true` is Kiro's default, so re-emitting
+  // it would add noise to every imported hook definition.
+  if (entry.enabled === false) def.enabled = false;
+  // The `confirm` block is user-authored JSON read from disk: zod already
+  // refuses a literal `__proto__` own key, and `constructor` / `prototype`
+  // keys (which `z.looseObject` passes through) are dropped at every depth.
+  if (entry.confirm !== undefined && entry.confirm !== null) {
+    def.confirm = omitPrototypePollutionKeysDeep(entry.confirm) as HookConfirm;
+  }
+}
+
 function kiroIdeHooksToCanonical(entries: KiroIdeHookEntry[]): HooksConfig["hooks"] {
   const canonical: HooksConfig["hooks"] = {};
   for (const entry of entries) {
     if (entry.trigger === undefined || entry.action === undefined) continue;
-    const eventName = KIRO_IDE_TO_CANONICAL_EVENT_NAMES[entry.trigger] ?? entry.trigger;
+    const eventName =
+      lookupOwn({ record: KIRO_IDE_TO_CANONICAL_EVENT_NAMES, key: entry.trigger }) ?? entry.trigger;
     // A crafted `trigger` (e.g. "__proto__") would otherwise make the
     // `canonical[eventName] ??= []` bracket access resolve to a prototype member
     // and throw; skip prototype-pollution keys defensively.
@@ -182,11 +215,11 @@ function kiroIdeHooksToCanonical(entries: KiroIdeHookEntry[]): HooksConfig["hook
       def.matcher = entry.matcher;
     }
     if (entry.timeout !== undefined && entry.timeout !== null) def.timeout = entry.timeout;
-    // Only carry an explicit `false`: `true` is Kiro's default, so re-emitting
-    // it would add noise to every imported hook definition.
-    if (entry.enabled === false) def.enabled = false;
+    copyOptionalHookFields({ entry, def });
 
-    (canonical[eventName] ??= []).push(def);
+    const list = lookupOwn({ record: canonical, key: eventName }) ?? [];
+    list.push(def);
+    canonical[eventName] = list;
   }
   return canonical;
 }

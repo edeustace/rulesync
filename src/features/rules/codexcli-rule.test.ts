@@ -5,7 +5,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { RULESYNC_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
-import { CodexcliRule } from "./codexcli-rule.js";
+import { CodexcliRule, readCodexcliProjectDocMaxBytes } from "./codexcli-rule.js";
 import { RulesyncRule } from "./rulesync-rule.js";
 
 describe("CodexcliRule", () => {
@@ -240,7 +240,7 @@ More detailed instructions here.`;
       expect(codexcliRule.getFileContent()).toBe(complexBody);
     });
 
-    it("should ignore subprojectPath and target root AGENTS.md (folding)", () => {
+    it("should write a directory-scoped rule to a nested AGENTS.md", () => {
       const rulesyncRule = new RulesyncRule({
         outputRoot: testDir,
         relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
@@ -263,8 +263,9 @@ More detailed instructions here.`;
       expect(codexcliRule.getFileContent()).toBe(
         "# Subproject CodexCLI\n\nContent for subproject.",
       );
-      expect(codexcliRule.getRelativeDirPath()).toBe(".");
+      expect(codexcliRule.getRelativeDirPath()).toBe(join("packages", "my-app"));
       expect(codexcliRule.getRelativeFilePath()).toBe("AGENTS.md");
+      expect(codexcliRule.isRoot()).toBe(false);
     });
 
     it("should ignore subprojectPath for root rules", () => {
@@ -317,7 +318,7 @@ More detailed instructions here.`;
       expect(codexcliRule.getRelativeFilePath()).toBe("AGENTS.md");
     });
 
-    it("should target root AGENTS.md even with complex nested subprojectPath", () => {
+    it("should write a deeply nested subprojectPath to its own AGENTS.md", () => {
       const rulesyncRule = new RulesyncRule({
         outputRoot: testDir,
         relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
@@ -340,7 +341,7 @@ More detailed instructions here.`;
       expect(codexcliRule.getFileContent()).toBe(
         "# Nested Subproject CodexCLI\n\nDeeply nested content.",
       );
-      expect(codexcliRule.getRelativeDirPath()).toBe(".");
+      expect(codexcliRule.getRelativeDirPath()).toBe(join("packages", "apps", "my-app", "src"));
       expect(codexcliRule.getRelativeFilePath()).toBe("AGENTS.md");
     });
 
@@ -410,6 +411,64 @@ More detailed instructions here.`;
       });
 
       expect(codexcliRule.getOutputRoot()).toBe(customOutputRoot);
+    });
+  });
+
+  describe("nested AGENTS.md", () => {
+    it("should fold a directory-scoped rule into the global root, which has no workspace to nest under", () => {
+      const rulesyncRule = new RulesyncRule({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "packages-api.md",
+        frontmatter: {
+          root: false,
+          targets: ["codexcli"],
+          agentsmd: { subprojectPath: "packages/api" },
+        },
+        body: "API package conventions.",
+      });
+
+      const codexcliRule = CodexcliRule.fromRulesyncRule({
+        outputRoot: testDir,
+        rulesyncRule,
+        global: true,
+      });
+
+      expect(codexcliRule.getRelativeDirPath()).toBe(".codex");
+      expect(codexcliRule.getRelativeFilePath()).toBe("AGENTS.md");
+    });
+
+    it("should import a nested AGENTS.md under the shared AGENTS.md-derived name", async () => {
+      await writeFileContent(
+        join(testDir, "packages", "api", "AGENTS.md"),
+        "API package conventions.",
+      );
+
+      const codexcliRule = await CodexcliRule.fromFile({
+        outputRoot: testDir,
+        relativeDirPath: join("packages", "api"),
+        relativeFilePath: "AGENTS.md",
+      });
+
+      expect(codexcliRule.isRoot()).toBe(false);
+
+      const rulesyncRule = codexcliRule.toRulesyncRule();
+
+      // Not suffixed with `-codexcli`: this is the AGENTS.md standard's own
+      // per-directory file, so importing it through any target that reads it
+      // must produce the same single rulesync rule.
+      expect(rulesyncRule.getRelativeFilePath()).toBe("packages-api.md");
+      expect(rulesyncRule.getFrontmatter().targets).toEqual(["*"]);
+      expect(rulesyncRule.getFrontmatter().agentsmd).toEqual({ subprojectPath: "packages/api" });
+      expect(rulesyncRule.getBody()).toBe("API package conventions.");
+    });
+
+    it("should exclude the root file and vendored trees from the nested scan", () => {
+      const patterns = CodexcliRule.getNestedFilePatterns();
+
+      expect(patterns.include).toEqual(["**/AGENTS.md"]);
+      expect(patterns.ignore).toContain("AGENTS.md");
+      expect(patterns.ignore).toContain("**/node_modules/**");
     });
   });
 
@@ -878,6 +937,55 @@ interface ApiResponse<T> {
       const rulesyncRule = rule.toRulesyncRule();
       expect(rulesyncRule.validate().success).toBe(true);
       expect(rulesyncRule.getBody()).toBe(rootContent);
+    });
+  });
+
+  describe("readCodexcliProjectDocMaxBytes", () => {
+    const writeConfig = (content: string) =>
+      writeFileContent(join(testDir, ".codex", "config.toml"), content);
+
+    it("should return the configured project_doc_max_bytes", async () => {
+      await writeConfig('model = "gpt-5"\nproject_doc_max_bytes = 131072\n');
+
+      await expect(readCodexcliProjectDocMaxBytes(testDir)).resolves.toBe(131072);
+    });
+
+    it("should return undefined when .codex/config.toml does not exist", async () => {
+      await expect(readCodexcliProjectDocMaxBytes(testDir)).resolves.toBeUndefined();
+    });
+
+    it("should return undefined when the key is not set", async () => {
+      await writeConfig('model = "gpt-5"\n');
+
+      await expect(readCodexcliProjectDocMaxBytes(testDir)).resolves.toBeUndefined();
+    });
+
+    it("should return undefined when the key is only set inside a table", async () => {
+      await writeConfig("[profiles.big]\nproject_doc_max_bytes = 131072\n");
+
+      await expect(readCodexcliProjectDocMaxBytes(testDir)).resolves.toBeUndefined();
+    });
+
+    it("should return 0 when project docs are disabled with project_doc_max_bytes = 0", async () => {
+      await writeConfig("project_doc_max_bytes = 0\n");
+
+      await expect(readCodexcliProjectDocMaxBytes(testDir)).resolves.toBe(0);
+    });
+
+    it.each([
+      ["a string", 'project_doc_max_bytes = "131072"\n'],
+      ["a negative number", "project_doc_max_bytes = -1\n"],
+      ["a float", "project_doc_max_bytes = 1.5\n"],
+    ])("should return undefined when the value is %s", async (_label, content) => {
+      await writeConfig(content);
+
+      await expect(readCodexcliProjectDocMaxBytes(testDir)).resolves.toBeUndefined();
+    });
+
+    it("should return undefined when the file is not valid TOML", async () => {
+      await writeConfig("project_doc_max_bytes = = 1\n");
+
+      await expect(readCodexcliProjectDocMaxBytes(testDir)).resolves.toBeUndefined();
     });
   });
 });

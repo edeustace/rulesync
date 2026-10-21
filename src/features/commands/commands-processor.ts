@@ -12,12 +12,18 @@ import {
   RULESYNC_COMMANDS_RELATIVE_DIR_PATH,
 } from "../../constants/rulesync-paths.js";
 import { AiFile } from "../../types/ai-file.js";
-import { FeatureProcessor, mergeByCaseInsensitiveIdentity } from "../../types/feature-processor.js";
+import {
+  ClaimedIdentities,
+  FeatureProcessor,
+  mergeByCaseInsensitiveIdentity,
+  refusesWriteOutsideRoot,
+} from "../../types/feature-processor.js";
 import type { FlattenedCommandNaming } from "../../types/features.js";
 import { RulesyncFile } from "../../types/rulesync-file.js";
 import { ToolFile } from "../../types/tool-file.js";
 import { commandsProcessorToolTargetTuple } from "../../types/tool-target-tuples.js";
 import type { ToolTarget } from "../../types/tool-targets.js";
+import { quoteForLog, stripControlCharacters } from "../../utils/control-characters.js";
 import { formatError } from "../../utils/error.js";
 import {
   checkPathTraversal,
@@ -33,14 +39,22 @@ import { AgentsmdCommand } from "./agentsmd-command.js";
 import { AntigravityCliCommand } from "./antigravity-cli-command.js";
 import { AntigravityIdeCommand } from "./antigravity-ide-command.js";
 import { AugmentcodeCommand } from "./augmentcode-command.js";
+import { AugmentcodePluginCommand } from "./augmentcode-plugin-command.js";
+import { BobCommand } from "./bob-command.js";
 import { ClaudecodeCommand } from "./claudecode-command.js";
 import { ClaudecodePluginCommand } from "./claudecode-plugin-command.js";
 import { ClineCommand } from "./cline-command.js";
+import { CodebuddyCommand } from "./codebuddy-command.js";
+import { CodewhaleCommand } from "./codewhale-command.js";
 import { CodexcliCommand } from "./codexcli-command.js";
+import { CommandcodeCommand } from "./commandcode-command.js";
+import { ContinueCommand } from "./continue-command.js";
 import { CopilotCommand } from "./copilot-command.js";
 import { CursorCommand } from "./cursor-command.js";
 import { DevinCommand } from "./devin-command.js";
 import { FactorydroidCommand } from "./factorydroid-command.js";
+import { FirebenderCommand } from "./firebender-command.js";
+import { GitlabduoCommand } from "./gitlabduo-command.js";
 import {
   getGooseSlashCommandsConfigContent,
   GooseCommand,
@@ -53,16 +67,23 @@ import {
 } from "./hermesagent-command.js";
 import { JunieCommand } from "./junie-command.js";
 import { KiloCommand } from "./kilo-command.js";
+import { KimiCodeCommand } from "./kimi-code-command.js";
+import { KimiCodePluginCommand } from "./kimi-code-plugin-command.js";
 import { KiroCliCommand } from "./kiro-cli-command.js";
 import { KiroCommand } from "./kiro-command.js";
 import { KiroIdeCommand } from "./kiro-ide-command.js";
+import { LettacodeCommand } from "./lettacode-command.js";
+import { MimocodeCommand } from "./mimocode-command.js";
+import { OmpCommand } from "./omp-command.js";
 import { OpenCodeCommand } from "./opencode-command.js";
 import { PiCommand } from "./pi-command.js";
+import { QoderCommand } from "./qoder-command.js";
 import { QwencodeCommand } from "./qwencode-command.js";
 import { ReasonixCommand } from "./reasonix-command.js";
 import { RooCommand } from "./roo-command.js";
 import { RovodevCommand } from "./rovodev-command.js";
 import { RulesyncCommand } from "./rulesync-command.js";
+import { TabnineCommand } from "./tabnine-command.js";
 import { TaktCommand } from "./takt-command.js";
 import {
   ToolCommand,
@@ -71,7 +92,10 @@ import {
   ToolCommandFromRulesyncCommandParams,
   ToolCommandSettablePaths,
 } from "./tool-command.js";
+import { TraeCommand } from "./trae-command.js";
 import { WarpCommand } from "./warp-command.js";
+import { ZcodeCommand } from "./zcode-command.js";
+import { ZcodePluginCommand } from "./zcode-plugin-command.js";
 import { ZoocodeCommand } from "./zoocode-command.js";
 
 /**
@@ -115,11 +139,27 @@ type ToolCommandFactory = {
       inputRoots: readonly string[];
       rulesyncCommands: RulesyncCommand[];
       logger: Logger;
+      global?: boolean;
     }): Promise<void> | void;
+    /**
+     * Optional per-command write gate: the reason this tool must not emit the
+     * given command, or `null` when it may. It runs on the command as it will
+     * be written — after flattening for tools without subdirectory support —
+     * so the check sees the name the tool would actually load. A blocked
+     * command is skipped with a warning; the rest of the run is unaffected.
+     * The reason is logged verbatim, so it must not embed anything read off
+     * disk. `inputRoots` lets a tool cross-reference other `.rulesync/`
+     * sources (e.g. a skill of the same name that owns the output path).
+     */
+    getWriteBlockReason?(params: {
+      rulesyncCommand: RulesyncCommand;
+      global: boolean;
+      inputRoots: readonly string[];
+    }): Promise<string | null> | string | null;
   };
   meta: {
     /** File extension for the command file */
-    extension: "json" | "md" | "toml" | "prompt.md" | "yaml";
+    extension: "json" | "md" | "mdc" | "toml" | "prompt.md" | "yaml";
     /** Whether the tool supports project-level commands */
     supportsProject: boolean;
     /** Whether the tool supports global (user-level) commands */
@@ -136,6 +176,21 @@ type ToolCommandFactory = {
      * or crashing on — files that feature (or the user) placed there.
      */
     skipToolFileScan?: boolean;
+    /**
+     * Whether the upstream tool reads the project commands from the
+     * **committed** repository through a root too generic to ignore (Letta
+     * Code's repository-root `.commands/`). The gitignore derivation skips such
+     * outputs: a recursive entry for `.commands/` would hide hand-authored
+     * prompts that belong in version control.
+     *
+     * The `--delete` orphan sweep also leaves such a project root alone: it
+     * routinely holds hand-authored commands that no `.rulesync/commands/`
+     * source accounts for, and nothing on disk tells them apart from a command
+     * rulesync generated earlier. Generation still overwrites the commands it
+     * emits; a stale generated command there has to be removed by hand. Global
+     * scope is swept as usual.
+     */
+    committedOutput?: boolean;
     failOnFlattenCollision?: boolean;
     /**
      * When true, a command from `loadAdditionalImportFiles` is treated as a
@@ -182,9 +237,10 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
     {
       class: AntigravityCliCommand,
       meta: {
-        // The Antigravity CLI (`agy`) reads workflow slash commands from the
-        // shared `.agents/workflows/` directory (project) and its own
-        // `~/.gemini/antigravity-cli/global_workflows/` tree (global).
+        // Antigravity retires workflows on 2026-10-19, so commands are emitted
+        // as skills (`.agents/skills/<name>/SKILL.md`, invoked as `/<name>`).
+        // The settable path stays the legacy workflows directory, so import
+        // and the `--delete` sweep still read previously generated workflows.
         extension: "md",
         supportsProject: true,
         supportsGlobal: true,
@@ -198,6 +254,7 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
     {
       class: AntigravityIdeCommand,
       meta: {
+        // Same skills-surface layout as `antigravity-cli` above.
         extension: "md",
         supportsProject: true,
         supportsGlobal: true,
@@ -222,6 +279,39 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
         // The secondary root is `.agents/commands/`, which rulesync writes for
         // `agentsmd` with namespaces flattened.
         matchAdditionalImportsByBasename: true,
+      },
+    },
+  ],
+  [
+    "augmentcode-plugin",
+    {
+      // `<plugin>/commands/`; Auggie namespaces nested directories with `:`
+      // under the plugin's own prefix. https://docs.augmentcode.com/cli/plugins
+      class: AugmentcodePluginCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: false,
+        isSimulated: false,
+        supportsSubdirectory: true,
+      },
+    },
+  ],
+  [
+    "bob",
+    {
+      class: BobCommand,
+      meta: {
+        // IBM Bob reads Markdown slash commands from `<project>/.bob/commands/`
+        // and `~/.bob/commands/`. Bob is Roo-derived and its docs recommend
+        // grouping related commands in subdirectories, so nested paths are
+        // kept like Roo's.
+        // https://bob.ibm.com/docs/ide/features/slash-commands
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: true,
       },
     },
   ],
@@ -278,12 +368,72 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
     },
   ],
   [
+    "codebuddy",
+    {
+      class: CodebuddyCommand,
+      meta: {
+        // CodeBuddy Code reads Markdown slash commands from
+        // `.codebuddy/commands/` (subdirectories become `/dir:name`) and
+        // `~/.codebuddy/commands/`.
+        // https://www.codebuddy.ai/docs/cli/slash-commands
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: true,
+      },
+    },
+  ],
+  [
+    "codewhale",
+    {
+      class: CodewhaleCommand,
+      meta: {
+        // Codewhale reads Markdown user commands from `.codewhale/commands/`
+        // (trusted workspaces only) and `~/.codewhale/commands/`, scanning
+        // each directory flat.
+        // https://github.com/Hmbown/Codewhale/blob/main/docs/architecture/command-dispatch.md
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: false,
+      },
+    },
+  ],
+  [
     "codexcli",
     {
       class: CodexcliCommand,
       meta: {
         extension: "md",
         supportsProject: false,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: false,
+      },
+    },
+  ],
+  [
+    "commandcode",
+    {
+      class: CommandcodeCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: true,
+      },
+    },
+  ],
+  [
+    "continue",
+    {
+      class: ContinueCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
         supportsGlobal: true,
         isSimulated: false,
         supportsSubdirectory: false,
@@ -333,6 +483,22 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
     },
   ],
   [
+    "firebender",
+    {
+      class: FirebenderCommand,
+      meta: {
+        // Firebender commands are `.mdc` files under .firebender/commands/
+        // (project) and ~/.firebender/commands/ (personal/global).
+        // https://docs.firebender.com/api-reference/commands
+        extension: "mdc",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: false,
+      },
+    },
+  ],
+  [
     "goose",
     {
       class: GooseCommand,
@@ -344,6 +510,23 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
         // Non-recursive: project recipes live flat in `.goose/recipes/`, while
         // legacy subagent sub-recipes of earlier rulesync versions may remain in `.goose/recipes/subagents/` and must not
         // be picked up by the command importer.
+        supportsSubdirectory: false,
+      },
+    },
+  ],
+  [
+    "gitlabduo",
+    {
+      class: GitlabduoCommand,
+      meta: {
+        // `.agents/commands/*.md` (project) / `~/.gitlab/duo/commands/*.md`
+        // (global). The scan is flat, so nested rulesync commands are
+        // flattened onto their basename.
+        // https://docs.gitlab.com/user/gitlab_duo_cli/customize/
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
         supportsSubdirectory: false,
       },
     },
@@ -406,6 +589,45 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
     },
   ],
   [
+    "kimi-code",
+    {
+      class: KimiCodeCommand,
+      meta: {
+        // Kimi Code registers every external Skill as a slash command
+        // (`/skill:<name>`, `/<name>` shorthand) with `$ARGUMENTS` substitution
+        // and has no other custom-command surface outside plugins, so commands
+        // are emitted as `.kimi-code/skills/<slug>/SKILL.md` (project) and
+        // `~/.kimi-code/skills/<slug>/SKILL.md` (global). The skills feature
+        // owns that tree, so import and generate-delete never scan it —
+        // mirrors the Devin, Warp and Hermes Agent commands targets.
+        // https://moonshotai.github.io/kimi-code/en/reference/slash-commands.html
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: false,
+        skipToolFileScan: true,
+      },
+    },
+  ],
+  [
+    "kimi-code-plugin",
+    {
+      // `<plugin>/commands/**/*.md`, registered as `/<plugin>:<name>` once the
+      // manifest declares `"commands": "./commands/"`. Kimi collects the
+      // directory recursively and names nested files by their relative path.
+      // https://github.com/MoonshotAI/kimi-code/blob/%40moonshot-ai/kimi-code%402.1.1/docs/en/customization/plugins.md
+      class: KimiCodePluginCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: false,
+        isSimulated: false,
+        supportsSubdirectory: true,
+      },
+    },
+  ],
+  [
     "kiro",
     {
       class: KiroCommand,
@@ -448,6 +670,54 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
     },
   ],
   [
+    "lettacode",
+    {
+      // Letta Code custom slash commands: `*.md` files discovered recursively
+      // under `.commands/` (project, at the working-directory root rather than
+      // under `.letta/`) and `~/.letta/commands/` (global). Commands are
+      // invoked by basename; subdirectories only organize files.
+      // https://docs.letta.com/platform/cli/slash-commands
+      class: LettacodeCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: true,
+        // The project `.commands/` is a generic repository-root directory that
+        // is committed and may hold hand-written prompts: not gitignored, and
+        // never swept by `--delete`.
+        committedOutput: true,
+      },
+    },
+  ],
+  [
+    "mimocode",
+    {
+      class: MimocodeCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: true,
+      },
+    },
+  ],
+  [
+    "omp",
+    {
+      class: OmpCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: false,
+      },
+    },
+  ],
+  [
     "opencode",
     {
       class: OpenCodeCommand,
@@ -470,6 +740,23 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
         supportsGlobal: true,
         isSimulated: false,
         supportsSubdirectory: false,
+      },
+    },
+  ],
+  [
+    "qoder",
+    {
+      // Qoder prompt commands are Markdown files under `.qoder/commands/`
+      // (project) / `~/.qoder/commands/` (global); subdirectories namespace
+      // the command (`git/commit.md` -> `/git:commit`).
+      // https://docs.qoder.com/en/cli/04-extending-qoder-cli/command
+      class: QoderCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: true,
       },
     },
   ],
@@ -557,6 +844,23 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
     },
   ],
   [
+    "tabnine",
+    {
+      class: TabnineCommand,
+      meta: {
+        // Tabnine CLI reads TOML slash commands from `<project>/.tabnine/agent/commands/`
+        // and `~/.tabnine/agent/commands/`; a nested path becomes a namespaced
+        // command (`ns/name.toml` -> `/ns:name`).
+        // https://docs.tabnine.com/main/getting-started/tabnine-cli/features/commands
+        extension: "toml",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: true,
+      },
+    },
+  ],
+  [
     "takt",
     {
       class: TaktCommand,
@@ -566,6 +870,23 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
         supportsGlobal: true,
         isSimulated: false,
         supportsSubdirectory: false,
+      },
+    },
+  ],
+  [
+    "trae",
+    {
+      // Trae custom commands are Markdown files under `.trae/commands/`
+      // (project, up to three nested directory levels) / `~/.trae/commands/`
+      // (global), with `name` / `description` frontmatter.
+      // https://docs.trae.ai/ide/slash-commands?_lang=en
+      class: TraeCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: true,
       },
     },
   ],
@@ -606,6 +927,36 @@ export const toolCommandFactories = new Map<CommandsProcessorToolTarget, ToolCom
         isSimulated: false,
         supportsSubdirectory: false,
         skipToolFileScan: true,
+      },
+    },
+  ],
+  [
+    "zcode",
+    {
+      class: ZcodeCommand,
+      meta: {
+        // ZCode reads Markdown slash commands from `<project>/.zcode/commands/`
+        // and `~/.zcode/commands/`. https://zcode.z.ai/en/docs/commands
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: true,
+        isSimulated: false,
+        supportsSubdirectory: false,
+      },
+    },
+  ],
+  [
+    "zcode-plugin",
+    {
+      // `<plugin>/commands/*.md`, parsed like `.zcode/commands/`.
+      // https://zcode.z.ai/en/docs/plugin
+      class: ZcodePluginCommand,
+      meta: {
+        extension: "md",
+        supportsProject: true,
+        supportsGlobal: false,
+        isSimulated: false,
+        supportsSubdirectory: false,
       },
     },
   ],
@@ -691,41 +1042,59 @@ export class CommandsProcessor extends FeatureProcessor {
       inputRoots: this.inputRoots,
       rulesyncCommands,
       logger: this.logger,
+      global: this.global,
     });
     const flattenedPathOrigins = new Map<string, string>();
 
-    const toolCommands = rulesyncCommands
-      .map((rulesyncCommand) => {
-        if (!factory.class.isTargetedByRulesyncCommand(rulesyncCommand)) {
-          return null;
-        }
-        const originalRelativePath = rulesyncCommand.getRelativeFilePath();
-        const commandToConvert = factory.meta.supportsSubdirectory
-          ? rulesyncCommand
-          : this.flattenRelativeFilePath(rulesyncCommand);
-        if (!factory.meta.supportsSubdirectory) {
-          const flattenedPath = commandToConvert.getRelativeFilePath();
-          const firstOrigin = flattenedPathOrigins.get(flattenedPath);
-          if (firstOrigin && firstOrigin !== originalRelativePath) {
-            if (factory.meta.failOnFlattenCollision) {
-              throw new Error(
-                `Command path collision detected while flattening for ${this.toolTarget}: "${firstOrigin}" and "${originalRelativePath}" both map to "${flattenedPath}".`,
-              );
-            }
-            this.logger.warn(
-              `Command path collision detected while flattening for ${this.toolTarget}: "${firstOrigin}" and "${originalRelativePath}" both map to "${flattenedPath}". Only the last processed command will be used.`,
+    const toolCommands: ToolCommand[] = [];
+    for (const rulesyncCommand of rulesyncCommands) {
+      if (!factory.class.isTargetedByRulesyncCommand(rulesyncCommand)) {
+        continue;
+      }
+      const originalRelativePath = rulesyncCommand.getRelativeFilePath();
+      const commandToConvert = factory.meta.supportsSubdirectory
+        ? rulesyncCommand
+        : this.flattenRelativeFilePath(rulesyncCommand);
+      const writeBlockReason = await factory.class.getWriteBlockReason?.({
+        rulesyncCommand: commandToConvert,
+        global: this.global,
+        inputRoots: this.inputRoots,
+      });
+      if (writeBlockReason !== undefined && writeBlockReason !== null) {
+        // Checked before the collision bookkeeping so a name the tool refuses
+        // is not also reported as colliding with itself. The path is quoted
+        // and stripped because whoever wrote the repository chose it.
+        this.logger.warn(
+          `Skipping command ${quoteForLog(originalRelativePath)} for ` +
+            `'${this.toolTarget}': ${writeBlockReason}`,
+        );
+        continue;
+      }
+      if (!factory.meta.supportsSubdirectory) {
+        const flattenedPath = commandToConvert.getRelativeFilePath();
+        const firstOrigin = flattenedPathOrigins.get(flattenedPath);
+        if (firstOrigin && firstOrigin !== originalRelativePath) {
+          if (factory.meta.failOnFlattenCollision) {
+            throw new Error(
+              `Command path collision detected while flattening for ${this.toolTarget}: "${firstOrigin}" and "${originalRelativePath}" both map to "${flattenedPath}".`,
             );
-          } else if (!firstOrigin) {
-            flattenedPathOrigins.set(flattenedPath, originalRelativePath);
           }
+          this.logger.warn(
+            `Command path collision detected while flattening for ${this.toolTarget}: "${firstOrigin}" and "${originalRelativePath}" both map to "${flattenedPath}". Only the last processed command will be used.`,
+          );
+        } else if (!firstOrigin) {
+          flattenedPathOrigins.set(flattenedPath, originalRelativePath);
         }
-        return factory.class.fromRulesyncCommand({
+      }
+      toolCommands.push(
+        factory.class.fromRulesyncCommand({
           outputRoot: this.outputRoot,
           rulesyncCommand: commandToConvert,
           global: this.global,
-        });
-      })
-      .filter((command): command is ToolCommand => command !== null);
+          logger: this.logger,
+        }),
+      );
+    }
 
     const auxiliaryFiles = await factory.class.getAuxiliaryFiles?.({
       toolCommands,
@@ -783,7 +1152,7 @@ export class CommandsProcessor extends FeatureProcessor {
     // symlink no longer resolves must not glob to nothing and read as "every
     // command was deleted".
     const rulesyncCommandPaths = (await directoryExistsStrict(basePath))
-      ? await findFilesByGlobs(join(basePath, "**", "*.md"))
+      ? await findFilesByGlobs("**/*.md", { cwd: basePath })
       : [];
 
     return await Promise.all(
@@ -822,6 +1191,23 @@ export class CommandsProcessor extends FeatureProcessor {
   }
 
   /**
+   * Whether {@link loadToolFiles} must not scan the tool's output tree at all.
+   * `skipToolFileScan` targets never scan it; a `committedOutput` target is not
+   * swept at project scope, because nothing on disk tells a hand-written
+   * command in such a committed root apart from one rulesync generated.
+   */
+  private skipsToolFileScan({
+    factory,
+    forDeletion,
+  }: {
+    factory: ToolCommandFactory;
+    forDeletion: boolean;
+  }): boolean {
+    if (factory.meta.skipToolFileScan) return true;
+    return forDeletion && factory.meta.committedOutput === true && !this.global;
+  }
+
+  /**
    * Implementation of abstract method from FeatureProcessor
    * Load tool-specific command configurations and parse them into ToolCommand instances
    */
@@ -831,22 +1217,25 @@ export class CommandsProcessor extends FeatureProcessor {
     forDeletion?: boolean;
   } = {}): Promise<ToolFile[]> {
     const factory = this.getFactory(this.toolTarget);
-    if (factory.meta.skipToolFileScan) {
+    if (this.skipsToolFileScan({ factory, forDeletion })) {
       return [];
     }
     const paths = factory.class.getSettablePaths({ global: this.global });
 
     const outputRootFull = join(this.outputRoot, paths.relativeDirPath);
-    const globPattern = factory.meta.supportsSubdirectory
-      ? join(outputRootFull, "**", `*.${factory.meta.extension}`)
-      : join(outputRootFull, `*.${factory.meta.extension}`);
     // Never follow a symlink while collecting deletion candidates: a
     // `.augment/commands/team -> ../../shared-prompts` link would otherwise put
     // files outside the project on the orphan list. Matches the subagents,
     // skills and rules processors.
-    const commandFilePaths = await findFilesByGlobs(globPattern, {
-      followSymbolicLinks: !forDeletion,
-    });
+    const commandFilePaths = await findFilesByGlobs(
+      factory.meta.supportsSubdirectory
+        ? `**/*.${factory.meta.extension}`
+        : `*.${factory.meta.extension}`,
+      {
+        cwd: outputRootFull,
+        followSymbolicLinks: !forDeletion,
+      },
+    );
 
     if (forDeletion) {
       const toolCommands = commandFilePaths
@@ -914,7 +1303,20 @@ export class CommandsProcessor extends FeatureProcessor {
         }
         return [key, basename(key)];
       };
-      const seen = new Set(toolCommands.flatMap((command) => keysOf(command)));
+      // Keys are compared case-insensitively: every command is written back
+      // into the one `.rulesync/commands/` tree, where `commit.md` and
+      // `Commit.md` are a single file on macOS and Windows, so a secondary
+      // copy that differs only in case would overwrite the primary one instead
+      // of yielding to it. The primary root's own keys are registered first so
+      // it keeps precedence.
+      const claimedKeys = new ClaimedIdentities();
+      const primarySource = paths.relativeDirPath;
+      const secondarySource = "a secondary source";
+      for (const command of toolCommands) {
+        for (const candidate of keysOf(command)) {
+          claimedKeys.claim({ identity: candidate, source: primarySource });
+        }
+      }
       const additionalCommands = await factory.class.loadAdditionalImportFiles({
         outputRoot: this.outputRoot,
         global: this.global,
@@ -922,15 +1324,38 @@ export class CommandsProcessor extends FeatureProcessor {
       });
       for (const command of additionalCommands) {
         const key = command.getRelativeFilePath();
-        if (keysOf(command, true).some((candidate) => seen.has(candidate))) {
-          this.logger.warn(
-            `Duplicate ${this.toolTarget} command "${key}" from a secondary source; ` +
-              `keeping the one already loaded.`,
-          );
+        // A flat command's own key already equals its basename, so
+        // `keysOf(command, true)` would otherwise yield the same candidate
+        // twice; claiming it once and then checking the second copy against
+        // the claim it just made would report a collision with itself.
+        const collision = [...new Set(keysOf(command, true))]
+          .map((candidate) => {
+            const claimed = claimedKeys.claim({ identity: candidate, source: secondarySource });
+            return claimed === null ? undefined : { candidate, claimed };
+          })
+          .find((hit) => hit !== undefined);
+        if (collision) {
+          const { candidate, claimed } = collision;
+          if (claimed.spelling === candidate) {
+            this.logger.warn(
+              `Duplicate ${this.toolTarget} command "${stripControlCharacters(key)}" from ` +
+                `${secondarySource}; keeping the one already loaded.`,
+            );
+          } else {
+            // The dropped copy is not the one the user would search for by
+            // name, and on a case-sensitive filesystem — where the two really
+            // are separate commands — this is the only sign one was dropped.
+            this.logger.warn(
+              `Case-insensitive ${this.toolTarget} command collision: "${stripControlCharacters(claimed.spelling)}" and ` +
+                `"${stripControlCharacters(candidate)}" resolve to the same command file. Keeping "${stripControlCharacters(claimed.spelling)}" ` +
+                `from ${claimed.source === secondarySource ? "earlier in the same source" : `the higher-precedence ${claimed.source}`} ` +
+                `and ignoring "${stripControlCharacters(key)}" from ${secondarySource}, which is not imported.`,
+            );
+          }
           continue;
         }
         for (const candidate of keysOf(command)) {
-          seen.add(candidate);
+          claimedKeys.claim({ identity: candidate, source: secondarySource });
         }
         toolCommands.push(command);
       }
@@ -953,11 +1378,24 @@ export class CommandsProcessor extends FeatureProcessor {
         relativeFilePath: HERMESAGENT_RULESYNC_COMMANDS_PLUGIN_OWNERSHIP_PATH,
       }),
     );
-    const shouldDisableHermesCommandsPlugin =
-      this.toolTarget === "hermesagent" &&
-      existingFiles.some((file) => file.getFilePath() === ownershipPath) &&
-      !generatedFiles.some((file) => file.getFilePath() === ownershipPath);
+    const ownershipMarker =
+      this.toolTarget === "hermesagent"
+        ? existingFiles.find((file) => file.getFilePath() === ownershipPath)
+        : undefined;
+    const removedBefore = this.getRemovedPaths().length;
     let changedCount = await super.removeOrphanAiFiles(existingFiles, generatedFiles);
+    // Decided after the base sweep, from what it actually removed (or would
+    // remove under `--check`): a marker it refused to delete — one reached
+    // through a link out of the root — stays in place, and disabling the
+    // plugin while its marker survives would leave the two out of step.
+    const shouldDisableHermesCommandsPlugin =
+      ownershipMarker !== undefined &&
+      this.getRemovedPaths()
+        .slice(removedBefore)
+        .some(
+          (removed) =>
+            removed.kind === "file" && removed.path === ownershipMarker.getRelativePathFromCwd(),
+        );
 
     changedCount += await this.retractGooseSlashCommands(generatedFiles);
 
@@ -969,6 +1407,15 @@ export class CommandsProcessor extends FeatureProcessor {
         relativeFilePath: HERMESAGENT_CONFIG_FILE_PATH,
       }),
     );
+    if (
+      await refusesWriteOutsideRoot({
+        logger: this.logger,
+        rootPath: this.outputRoot,
+        targetPath: configPath,
+      })
+    ) {
+      return changedCount;
+    }
     const currentContent = await readFileContentOrNull(configPath);
     if (currentContent === null) return changedCount;
     const nextContent = getDisabledHermesCommandsPluginConfigContent({
@@ -997,6 +1444,15 @@ export class CommandsProcessor extends FeatureProcessor {
     if (generatedFiles.some((file) => file instanceof GooseCommand)) return 0;
 
     const configPath = join(this.outputRoot, GOOSE_GLOBAL_DIR, GOOSE_MCP_FILE_NAME);
+    if (
+      await refusesWriteOutsideRoot({
+        logger: this.logger,
+        rootPath: this.outputRoot,
+        targetPath: configPath,
+      })
+    ) {
+      return 0;
+    }
     const currentContent = await readFileContentOrNull(configPath);
     // Rewriting a config that holds no managed registration would reformat the
     // user's file (dropping their comments) for no gain.

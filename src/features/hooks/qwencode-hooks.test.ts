@@ -5,6 +5,10 @@ import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { createMockLogger } from "../../test-utils/mock-logger.js";
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
+import {
+  HOOKS_OWNERSHIP_LOCK_FILE_NAME,
+  serializeHooksOwnershipLock,
+} from "./hooks-ownership-lock.js";
 import { QwencodeHooks } from "./qwencode-hooks.js";
 import { RulesyncHooks } from "./rulesync-hooks.js";
 
@@ -332,6 +336,36 @@ describe("QwencodeHooks", () => {
       expect(canonical.hooks).toEqual(config.hooks);
     });
 
+    it("should write command hook timeouts in seconds, or in milliseconds from 1000 seconds up", async () => {
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              preToolUse: [
+                { command: "echo short", timeout: 30 },
+                { command: "echo edge", timeout: 999 },
+                { command: "echo boundary", timeout: 1000 },
+                { command: "echo long", timeout: 1800 },
+                { type: "http", url: "https://example.com/hook", timeout: 1800 },
+                { type: "prompt", prompt: "Check $ARGUMENTS", timeout: 1800 },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const qwencodeHooks = await QwencodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+      });
+
+      const hooks = JSON.parse(qwencodeHooks.getFileContent()).hooks.PreToolUse[0].hooks;
+      expect(hooks.map((hook: { timeout?: number }) => hook.timeout)).toEqual([
+        30, 999, 1000000, 1800000, 1800, 1800,
+      ]);
+    });
+
     it("should preserve the http hook type and its url", async () => {
       const rulesyncHooks = new RulesyncHooks(
         createMockAiFileParams({
@@ -490,6 +524,165 @@ describe("QwencodeHooks", () => {
     });
   });
 
+  describe("fromRulesyncHooks - preserveUnowned", () => {
+    const settingsPath = () => join(testDir, ".qwen", "settings.json");
+    const lockPath = () => join(testDir, ".qwen", HOOKS_OWNERSHIP_LOCK_FILE_NAME);
+
+    const foreignSequentialGroup = {
+      matcher: "Bash",
+      sequential: true,
+      hooks: [{ type: "command", command: "echo foreign" }],
+    };
+
+    function rulesyncHooksWith(hooks: Record<string, unknown>) {
+      return new RulesyncHooks(
+        createMockAiFileParams({
+          outputRoot: testDir,
+          fileContent: JSON.stringify({ version: 1, hooks }),
+        }),
+      );
+    }
+
+    async function writeSettings(settings: Record<string, unknown>) {
+      await ensureDir(join(testDir, ".qwen"));
+      await writeFileContent(settingsPath(), JSON.stringify(settings, null, 2));
+    }
+
+    async function generate({
+      hooks,
+      preserveUnowned,
+    }: {
+      hooks: Record<string, unknown>;
+      preserveUnowned?: boolean;
+    }) {
+      const qwencodeHooks = await QwencodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks: rulesyncHooksWith(hooks),
+        validate: false,
+        preserveUnowned,
+      });
+      const lockFiles = await QwencodeHooks.getAuxiliaryFiles({ toolHooks: qwencodeHooks });
+      return { qwencodeHooks, lockFiles };
+    }
+
+    it("should support preserving unowned hooks", () => {
+      expect(QwencodeHooks.supportsPreserveUnowned()).toBe(true);
+    });
+
+    it("should keep unrelated settings and a foreign sequential group apart from the generated one", async () => {
+      await writeSettings({
+        model: { name: "unchanged" },
+        hooks: { PreToolUse: [foreignSequentialGroup] },
+      });
+
+      const { qwencodeHooks, lockFiles } = await generate({
+        hooks: { preToolUse: [{ command: "echo generated", matcher: "Bash" }] },
+        preserveUnowned: true,
+      });
+
+      const parsed = JSON.parse(qwencodeHooks.getFileContent());
+      expect(parsed.model).toEqual({ name: "unchanged" });
+      expect(parsed.hooks.PreToolUse).toEqual([
+        foreignSequentialGroup,
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo generated" }] },
+      ]);
+      expect(lockFiles).toHaveLength(1);
+      expect(lockFiles[0]?.getRelativeDirPath()).toBe(".qwen");
+      expect(lockFiles[0]?.getRelativeFilePath()).toBe(HOOKS_OWNERSHIP_LOCK_FILE_NAME);
+      expect(JSON.parse(lockFiles[0]!.getFileContent()).owned).toEqual([
+        { event: "PreToolUse", matcher: '"Bash"', identity: "command:echo generated" },
+      ]);
+    });
+
+    it("should retract a formerly generated hook recorded in the lock and keep the foreign one", async () => {
+      await writeSettings({
+        hooks: {
+          PreToolUse: [
+            { matcher: "Bash", hooks: [{ type: "command", command: "echo generated" }] },
+            foreignSequentialGroup,
+          ],
+        },
+      });
+      await writeFileContent(
+        lockPath(),
+        serializeHooksOwnershipLock([
+          { event: "PreToolUse", matcher: '"Bash"', identity: "command:echo generated" },
+        ]),
+      );
+
+      const { qwencodeHooks, lockFiles } = await generate({ hooks: {}, preserveUnowned: true });
+
+      const parsed = JSON.parse(qwencodeHooks.getFileContent());
+      expect(parsed.hooks.PreToolUse).toEqual([foreignSequentialGroup]);
+      expect(JSON.parse(lockFiles[0]!.getFileContent()).owned).toEqual([]);
+    });
+
+    it("should be idempotent across repeated generations", async () => {
+      await writeSettings({
+        model: { name: "unchanged" },
+        hooks: { PreToolUse: [foreignSequentialGroup] },
+      });
+      const hooks = { preToolUse: [{ command: "echo generated", matcher: "Bash" }] };
+
+      const first = await generate({ hooks, preserveUnowned: true });
+      await writeFileContent(settingsPath(), first.qwencodeHooks.getFileContent());
+      await writeFileContent(lockPath(), first.lockFiles[0]!.getFileContent());
+
+      const second = await generate({ hooks, preserveUnowned: true });
+      expect(second.qwencodeHooks.getFileContent()).toBe(first.qwencodeHooks.getFileContent());
+      expect(second.lockFiles[0]!.getFileContent()).toBe(first.lockFiles[0]!.getFileContent());
+    });
+
+    it("should preserve foreign hooks and write the lock under ~/.qwen in global mode", async () => {
+      // In global mode the output root is the home directory, so the settings
+      // and the lock live under `<home>/.qwen`.
+      await writeSettings({ hooks: { PreToolUse: [foreignSequentialGroup] } });
+
+      const qwencodeHooks = await QwencodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks: rulesyncHooksWith({
+          preToolUse: [{ command: "echo generated", matcher: "Bash" }],
+        }),
+        validate: false,
+        global: true,
+        preserveUnowned: true,
+      });
+      const lockFiles = await QwencodeHooks.getAuxiliaryFiles({ toolHooks: qwencodeHooks });
+
+      expect(qwencodeHooks.getRelativeDirPath()).toBe(".qwen");
+      expect(qwencodeHooks.getRelativeFilePath()).toBe("settings.json");
+      const parsed = JSON.parse(qwencodeHooks.getFileContent());
+      expect(parsed.hooks.PreToolUse).toEqual([
+        foreignSequentialGroup,
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo generated" }] },
+      ]);
+      expect(lockFiles).toHaveLength(1);
+      expect(lockFiles[0]?.getRelativeDirPath()).toBe(".qwen");
+      expect(lockFiles[0]?.getRelativeFilePath()).toBe(HOOKS_OWNERSHIP_LOCK_FILE_NAME);
+      expect(JSON.parse(lockFiles[0]!.getFileContent()).owned).toEqual([
+        { event: "PreToolUse", matcher: '"Bash"', identity: "command:echo generated" },
+      ]);
+    });
+
+    it("should replace existing hooks and write no lock when preservation is off", async () => {
+      await writeSettings({
+        model: { name: "unchanged" },
+        hooks: { PreToolUse: [foreignSequentialGroup] },
+      });
+
+      const { qwencodeHooks, lockFiles } = await generate({
+        hooks: { preToolUse: [{ command: "echo generated", matcher: "Bash" }] },
+      });
+
+      const parsed = JSON.parse(qwencodeHooks.getFileContent());
+      expect(parsed.model).toEqual({ name: "unchanged" });
+      expect(parsed.hooks.PreToolUse).toEqual([
+        { matcher: "Bash", hooks: [{ type: "command", command: "echo generated" }] },
+      ]);
+      expect(lockFiles).toEqual([]);
+    });
+  });
+
   describe("toRulesyncHooks", () => {
     it("should import prompt and model fields from prompt hooks", () => {
       const qwencodeHooks = new QwencodeHooks(
@@ -539,6 +732,32 @@ describe("QwencodeHooks", () => {
       expect(parsed.hooks.sessionDelete[0].matcher).toBeUndefined();
     });
 
+    it("should carry an event named toString through as a plain string key (#2757)", () => {
+      const qwencodeHooks = new QwencodeHooks(
+        createMockAiFileParams({
+          // JSON.parse yields an own enumerable `toString` key, unlike an
+          // object literal whose `toString` the lookup map would inherit from
+          // Object.prototype.
+          fileContent: JSON.stringify({
+            hooks: {
+              SessionStart: [{ hooks: [{ type: "command", command: "echo start" }] }],
+              toString: [{ hooks: [{ type: "command", command: "echo crafted" }] }],
+            },
+          }),
+        }),
+      );
+
+      const json = qwencodeHooks.toRulesyncHooks().getJson();
+      expect(json.hooks.sessionStart?.[0]?.command).toBe("echo start");
+      expect(Object.keys(json.hooks)).toEqual(["sessionStart"]);
+      // The unmapped name must fall through verbatim rather than resolving to
+      // Object.prototype.toString and landing under its stringified source.
+      const overrideHooks = (json as { qwencode?: { hooks?: Record<string, unknown[]> } }).qwencode
+        ?.hooks;
+      expect(Object.keys(overrideHooks ?? {})).toEqual(["toString"]);
+      expect(overrideHooks?.["toString"]?.[0]).toMatchObject({ command: "echo crafted" });
+    });
+
     it("should round-trip Qwen Code PascalCase back to canonical", () => {
       const qwencodeHooks = new QwencodeHooks(
         createMockAiFileParams({
@@ -572,7 +791,8 @@ describe("QwencodeHooks", () => {
       expect(parsed.hooks.preToolUse?.[0]).toEqual({
         type: "command",
         command: "echo pre",
-        timeout: 1000,
+        // Qwen Code reads a command hook timeout of 1000 or more as milliseconds.
+        timeout: 1,
         matcher: "Edit",
         name: "Pre Hook",
         description: "Runs before tool",
@@ -619,6 +839,88 @@ describe("QwencodeHooks", () => {
       expect(parsed.hooks.todoCreated?.[0]?.command).toBe("echo created");
       expect(parsed.hooks.todoCompleted?.[0]?.command).toBe("echo completed");
       expect(parsed.hooks.stopFailure?.[0]?.command).toBe("echo stop-failure");
+    });
+
+    it("should read command hook timeouts of 1000 or more as legacy milliseconds on import", () => {
+      const qwencodeHooks = new QwencodeHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              PreToolUse: [
+                {
+                  hooks: [
+                    { type: "command", command: "echo short", timeout: 30 },
+                    { type: "command", command: "echo legacy", timeout: 10000 },
+                    { type: "command", command: "echo fractional", timeout: 1500 },
+                    { type: "http", url: "https://example.com/hook", timeout: 10000 },
+                  ],
+                },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const parsed = qwencodeHooks.toRulesyncHooks().getJson();
+      expect(parsed.hooks.preToolUse?.map((hook) => hook.timeout)).toEqual([30, 10, 1.5, 10000]);
+    });
+
+    it("should accept a numeric-string timeout on import without dropping its matcher group (issue #2668)", () => {
+      const qwencodeHooks = new QwencodeHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: {
+              PreToolUse: [
+                {
+                  matcher: "Bash",
+                  hooks: [
+                    { type: "command", command: "echo legacy", timeout: "60000" },
+                    { type: "command", command: "echo seconds", timeout: " 30 " },
+                    { type: "command", command: "echo fractional", timeout: "1500" },
+                    { type: "http", url: "https://example.com/hook", timeout: "10" },
+                    { type: "command", command: "echo unusable", timeout: "abc" },
+                    { type: "command", command: "echo empty", timeout: "" },
+                    { type: "command", command: "echo sibling", timeout: 5 },
+                  ],
+                },
+              ],
+            },
+          }),
+        }),
+      );
+
+      const parsed = qwencodeHooks.toRulesyncHooks().getJson();
+      const hooks = parsed.hooks.preToolUse ?? [];
+      expect(hooks.map((hook) => hook.command ?? hook.url)).toEqual([
+        "echo legacy",
+        "echo seconds",
+        "echo fractional",
+        "https://example.com/hook",
+        "echo unusable",
+        "echo empty",
+        "echo sibling",
+      ]);
+      expect(hooks.map((hook) => hook.timeout)).toEqual([60, 30, 1.5, 10, undefined, undefined, 5]);
+      expect(hooks.every((hook) => hook.matcher === "Bash")).toBe(true);
+    });
+
+    it("should round-trip a command hook timeout of 1000 seconds or more", async () => {
+      const rulesyncHooks = new RulesyncHooks(
+        createMockAiFileParams({
+          fileContent: JSON.stringify({
+            hooks: { preToolUse: [{ command: "echo long", timeout: 1800 }] },
+          }),
+        }),
+      );
+
+      const qwencodeHooks = await QwencodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: true,
+      });
+
+      const parsed = qwencodeHooks.toRulesyncHooks().getJson();
+      expect(parsed.hooks.preToolUse?.[0]?.timeout).toBe(1800);
     });
 
     it("should preserve the http hook type and its url on import", () => {

@@ -12,6 +12,7 @@ import {
 import { setupTestDirectory } from "../../test-utils/test-directories.js";
 import { type ValidationResult } from "../../types/ai-file.js";
 import { ensureDir, writeFileContent } from "../../utils/file.js";
+import { droppedPollutionKeysError } from "../../utils/jsonc.js";
 import {
   mergeMcpJsonOverlays,
   RulesyncMcp,
@@ -332,6 +333,40 @@ describe("RulesyncMcp", () => {
   });
 
   describe("validate", () => {
+    // A server named after a prototype member is removed by the parser before
+    // the schema can see it, so it used to produce neither an error nor an
+    // entry in any generated file. These pin the report that replaced that
+    // silence.
+    it("should reject a server named after a prototype member", () => {
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: RULESYNC_MCP_FILE_NAME,
+        // Written as raw text: a `__proto__` key in an object literal sets the
+        // prototype instead of becoming a property, so it would never survive
+        // JSON.stringify to reach the parser under test.
+        fileContent: '{"mcpServers": {"__proto__": {"command": "node"}}}',
+        validate: false,
+      });
+
+      const result = rulesyncMcp.validate();
+
+      expect(result.success).toBe(false);
+      expect(result.error?.message).toContain("mcpServers.__proto__");
+      expect(result.error?.message).toContain("rename them");
+    });
+
+    it("should throw from the constructor when validation is enabled", () => {
+      expect(
+        () =>
+          new RulesyncMcp({
+            relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+            relativeFilePath: RULESYNC_MCP_FILE_NAME,
+            fileContent: '{"mcpServers": {"constructor": {"command": "node"}}}',
+            validate: true,
+          }),
+      ).toThrow("mcpServers.constructor");
+    });
+
     it("should return successful validation result", () => {
       const rulesyncMcp = new RulesyncMcp({
         relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
@@ -962,6 +997,36 @@ describe("RulesyncMcp", () => {
       expect(Object.keys(effective.getMcpServers())).toEqual(["other"]);
     });
 
+    it("should keep Qwen Code's server allow/deny lists for its own target only", () => {
+      const instance = makeInstance({
+        mcpServers: { shared: { command: "node" } },
+        qwencode: { allowed: ["shared"], excluded: ["legacy-*"] },
+      });
+
+      expect(instance.forTarget({ toolTarget: "qwencode" }).getJson()).toEqual({
+        mcpServers: { shared: { command: "node" } },
+        qwencode: { allowed: ["shared"], excluded: ["legacy-*"] },
+      });
+      expect(instance.forTarget({ toolTarget: "cursor" }).getJson()).toEqual({
+        mcpServers: { shared: { command: "node" } },
+      });
+    });
+
+    it("should not carry a tool block's other fields into the target view", () => {
+      const instance = makeInstance({
+        mcpServers: {},
+        "kimi-code": { startupTimeoutMs: 45000 },
+        qwencode: { mcpServers: { extra: { command: "uvx" } } },
+      });
+
+      expect(instance.forTarget({ toolTarget: "kimi-code" }).getJson()).toEqual({
+        mcpServers: {},
+      });
+      expect(instance.forTarget({ toolTarget: "qwencode" }).getJson()).toEqual({
+        mcpServers: { extra: { command: "uvx" } },
+      });
+    });
+
     it("should honor the deprecated targets filter and warn", () => {
       const logger = makeLogger();
       const instance = makeInstance({
@@ -1082,6 +1147,80 @@ describe("RulesyncMcp", () => {
       const effective = instance.forTarget({ toolTarget: "claudecode-legacy" });
 
       expect(Object.keys(effective.getMcpServers())).toEqual(["shared", "extra"]);
+    });
+
+    it("should apply the claudecode, codebuddy, commandcode and qoder blocks at project scope (shared .mcp.json)", () => {
+      const instance = makeInstance({
+        mcpServers: {
+          shared: { command: "node" },
+          forClaude: { command: "a", targets: ["claudecode"] },
+          forCodebuddy: { command: "d", targets: ["codebuddy"] },
+          forCommand: { command: "b", targets: ["commandcode"] },
+          forQoder: { command: "q", targets: ["qoder"] },
+          forOther: { command: "c", targets: ["cursor"] },
+        },
+        claudecode: {
+          mcpServers: { claudeExtra: { command: "uvx" }, both: { command: "claude" } },
+        },
+        codebuddy: { mcpServers: { codebuddyExtra: { command: "codebuddy" } } },
+        commandcode: { mcpServers: { both: { command: "command" } } },
+        qoder: { mcpServers: { qoderExtra: { command: "qoder" } } },
+      });
+
+      // All five targets write the project `.mcp.json`, so they must resolve
+      // to one deterministic server set: claudecode block first, then
+      // codebuddy, commandcode and qoder (a later block wins per server on
+      // conflict).
+      for (const toolTarget of [
+        "claudecode",
+        "claudecode-legacy",
+        "codebuddy",
+        "commandcode",
+        "qoder",
+      ] as const) {
+        const servers = instance.forTarget({ toolTarget, global: false }).getMcpServers();
+        expect(Object.keys(servers).toSorted()).toEqual([
+          "both",
+          "claudeExtra",
+          "codebuddyExtra",
+          "forClaude",
+          "forCodebuddy",
+          "forCommand",
+          "forQoder",
+          "qoderExtra",
+          "shared",
+        ]);
+        expect(servers.both).toEqual({ command: "command" });
+      }
+    });
+
+    it("should keep claudecode and commandcode independent at global scope (separate files)", () => {
+      const instance = makeInstance({
+        mcpServers: {
+          shared: { command: "node" },
+          forClaude: { command: "a", targets: ["claudecode"] },
+          forCommand: { command: "b", targets: ["commandcode"] },
+        },
+        claudecode: {
+          mcpServers: { claudeExtra: { command: "uvx" }, both: { command: "claude" } },
+        },
+        commandcode: { mcpServers: { both: { command: "command" } } },
+      });
+
+      const claude = instance.forTarget({ toolTarget: "claudecode", global: true }).getMcpServers();
+      expect(Object.keys(claude).toSorted()).toEqual([
+        "both",
+        "claudeExtra",
+        "forClaude",
+        "shared",
+      ]);
+      expect(claude.both).toEqual({ command: "claude" });
+
+      const command = instance
+        .forTarget({ toolTarget: "commandcode", global: true })
+        .getMcpServers();
+      expect(Object.keys(command).toSorted()).toEqual(["both", "forCommand", "shared"]);
+      expect(command.both).toEqual({ command: "command" });
     });
   });
 
@@ -1347,6 +1486,47 @@ describe("RulesyncMcp", () => {
       expect((servers.raw as any).command).toBe("uvx");
     });
 
+    it("should strip the codex-only codexcliTools from getMcpServers output", () => {
+      // Codex's per-tool approval table is re-merged by the codex generator from
+      // the raw server; no other tool reads it.
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "mcp.json",
+        fileContent: JSON.stringify({
+          mcpServers: {
+            pal: { command: "uvx", codexcliTools: { search: { approval_mode: "approve" } } },
+          },
+        }),
+      });
+
+      const servers = rulesyncMcp.getMcpServers();
+
+      expect((servers.pal as any).codexcliTools).toBeUndefined();
+      expect((servers.pal as any).command).toBe("uvx");
+    });
+
+    it("should validate codexcliTools entries against Codex's per-tool settings", () => {
+      const build = (codexcliTools: unknown) =>
+        new RulesyncMcp({
+          relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+          relativeFilePath: "mcp.json",
+          fileContent: JSON.stringify({
+            mcpServers: {},
+            codexcli: { mcpServers: { srv: { url: "https://example.com/mcp", codexcliTools } } },
+          }),
+        });
+
+      expect(
+        build({ a: { approval_mode: "approve" }, b: { output_token_limit: 2000 } }).validate()
+          .success,
+      ).toBe(true);
+      // An unknown approval mode or a zero token limit makes Codex reject the
+      // whole config.toml, so it is refused at load time instead.
+      expect(build({ a: { approval_mode: "always" } }).validate().success).toBe(false);
+      expect(build({ a: { output_token_limit: 0 } }).validate().success).toBe(false);
+      expect(build(["a"]).validate().success).toBe(false);
+    });
+
     it("should strip the musecode-only musecodeMode from getMcpServers output", () => {
       // Same arrangement as envVars: `musecodeMode` is written out only by the
       // musecode generator, which reads it back off getJson(). Leaving it in the
@@ -1366,6 +1546,47 @@ describe("RulesyncMcp", () => {
       expect((servers.pal as any).musecodeMode).toBeUndefined();
       expect((servers.pal as any).command).toBe("uvx");
       expect((rulesyncMcp.getJson().mcpServers.pal as any).musecodeMode).toBe("optional");
+    });
+
+    it("should strip the crush-only OAuth, sessionless and channel keys from getMcpServers output", () => {
+      // The crush generator re-merges them from getJson(); the client secret
+      // in particular must not be copied into every other tool's config. Both
+      // the `crush*` authoring keys and the raw Crush spellings are stripped.
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "mcp.json",
+        fileContent: JSON.stringify({
+          mcpServers: {
+            gh: {
+              url: "https://example.com/mcp",
+              crushOauth: true,
+              crushOauthClientId: "id",
+              crushOauthClientSecret: "client-secret-value",
+              crushOauthCallbackPort: 8765,
+              crushSessionless: true,
+              crushChannelEnabled: true,
+              crushChannelReply: { user: { tool: "reply", target_param: "user_id" } },
+            },
+            raw: {
+              url: "https://example.com/mcp",
+              oauth_client_id: "id",
+              oauth_client_secret: "client-secret-value",
+              oauth_callback_port: 8765,
+              sessionless: true,
+              channel_enabled: true,
+              channel_reply: { user: { tool: "reply", target_param: "user_id" } },
+            },
+          },
+        }),
+      });
+
+      const servers = rulesyncMcp.getMcpServers();
+
+      expect(servers.gh).toEqual({ url: "https://example.com/mcp" });
+      expect(servers.raw).toEqual({ url: "https://example.com/mcp" });
+      expect((rulesyncMcp.getJson().mcpServers.gh as any).crushOauthClientSecret).toBe(
+        "client-secret-value",
+      );
     });
 
     it("should strip the rovodev-only enable_instructions from getMcpServers output", () => {
@@ -1414,6 +1635,55 @@ describe("RulesyncMcp", () => {
 
       const fromJson = rulesyncMcp.getJson().mcpServers.pal;
       expect((fromJson as any).envVars).toEqual(["OPENAI_API_KEY"]);
+    });
+  });
+
+  describe("getRawMcpServer", () => {
+    it("returns an own server from the unfiltered source", () => {
+      const rulesyncMcp = makeInstance({
+        mcpServers: {
+          pal: { command: "uvx", envVars: ["OPENAI_API_KEY"] },
+        },
+      });
+
+      expect(rulesyncMcp.getRawMcpServer("pal")).toEqual({
+        command: "uvx",
+        envVars: ["OPENAI_API_KEY"],
+      });
+    });
+
+    it("does not resolve a server from the prototype chain", () => {
+      const rulesyncMcp = makeInstance({ mcpServers: {} });
+      Object.setPrototypeOf(rulesyncMcp.getJson().mcpServers, {
+        inherited: { command: "evil" },
+      });
+
+      expect(rulesyncMcp.getRawMcpServer("inherited")).toBeUndefined();
+    });
+
+    it.each(["__proto__", "constructor", "prototype"])(
+      "rejects the prototype-pollution key %s even when it is an own property",
+      (name) => {
+        const rulesyncMcp = makeInstance({ mcpServers: {} });
+        Object.defineProperty(rulesyncMcp.getJson().mcpServers, name, {
+          configurable: true,
+          enumerable: true,
+          value: { command: "evil" },
+        });
+
+        expect(rulesyncMcp.getRawMcpServer(name)).toBeUndefined();
+      },
+    );
+
+    it("returns undefined when the raw mcpServers value is not a record", () => {
+      const rulesyncMcp = new RulesyncMcp({
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "mcp.json",
+        fileContent: '{"mcpServers":[]}',
+        validate: false,
+      });
+
+      expect(rulesyncMcp.getRawMcpServer("pal")).toBeUndefined();
     });
   });
 
@@ -1685,6 +1955,38 @@ describe("RulesyncMcp.fromRoots", () => {
     );
   });
 
+  it("should report a prototype-member server the merge parse dropped from an overlay", async () => {
+    // The merge path re-serializes from the parsed records, so without its own
+    // report the dropped server would vanish and the merged file would look
+    // like the user never wrote it.
+    const baseRoot = join(testDir, RULESYNC_RELATIVE_DIR_PATH);
+    const overlayRoot = join(testDir, ".rulesync.local");
+    await writeFileContent(
+      join(baseRoot, RULESYNC_MCP_FILE_NAME),
+      JSON.stringify({ mcpServers: { base: { command: "base" } } }),
+    );
+    await writeFileContent(
+      join(overlayRoot, RULESYNC_MCP_FILE_NAME),
+      '{"mcpServers": {"__proto__": {"command": "node"}}}',
+    );
+
+    const error = await RulesyncMcp.fromRoots({ inputRoots: [baseRoot, overlayRoot] }).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+
+    // Named once, cwd-relative, the same way `validate()` names it on the
+    // single-root path — not wrapped in the parse-failure message as well.
+    expect(String((error as Error).message)).toBe(
+      droppedPollutionKeysError({
+        // Posix separators, matching how `validate()` names the same file on
+        // the single-root path.
+        sourcePath: `.rulesync.local/${RULESYNC_MCP_FILE_NAME}`,
+        droppedKeys: ["mcpServers.__proto__"],
+      }).message,
+    );
+  });
+
   it("should reject an overlay MCP file whose JSON is not an object", async () => {
     const baseRoot = join(testDir, RULESYNC_RELATIVE_DIR_PATH);
     const overlayRoot = join(testDir, ".rulesync.local");
@@ -1761,6 +2063,15 @@ describe("mergeMcpJsonOverlays", () => {
           local: { command: "local-only" },
         },
       },
+    });
+  });
+
+  it("merges the pi tool-scoped mcpServers map by server name", () => {
+    const base = { pi: { mcpServers: { a: { command: "a" } } } };
+    const overlay = { pi: { mcpServers: { b: { command: "b" } } } };
+
+    expect(mergeMcpJsonOverlays({ base, overlay })).toEqual({
+      pi: { mcpServers: { a: { command: "a" }, b: { command: "b" } } },
     });
   });
 

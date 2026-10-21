@@ -281,6 +281,95 @@ describe("AugmentcodeHooks", () => {
       expect(parsed.hooks.PreToolUse).toBeDefined();
     });
 
+    it("should preserve undocumented AugmentCode hook event keys when regenerating", async () => {
+      await ensureDir(join(testDir, ".augment"));
+      await writeFileContent(
+        join(testDir, ".augment", "settings.json"),
+        JSON.stringify({
+          hooks: {
+            afterFileEdit: [{ hookType: "command", command: "echo edited" }],
+            stop: [{ hookType: "command", command: "echo lowercase-stop" }],
+            PreToolUse: [{ matcher: "Bash", hooks: [{ hookType: "command", command: "stale" }] }],
+          },
+        }),
+      );
+
+      const config = {
+        version: 1,
+        hooks: { preToolUse: [{ command: "echo fresh" }] },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const augmentcodeHooks = await AugmentcodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+
+      const parsed = JSON.parse(augmentcodeHooks.getFileContent());
+      // Undocumented keys not owned by rulesync's canonical model survive verbatim.
+      expect(parsed.hooks.afterFileEdit).toEqual([{ hookType: "command", command: "echo edited" }]);
+      expect(parsed.hooks.stop).toEqual([{ hookType: "command", command: "echo lowercase-stop" }]);
+      // The native, rulesync-owned key is replaced by the freshly generated hooks.
+      expect(
+        parsed.hooks.PreToolUse.some((entry: { hooks: Array<{ command: string }> }) =>
+          entry.hooks.some((hook) => hook.command === "stale"),
+        ),
+      ).toBe(false);
+      expect(
+        parsed.hooks.PreToolUse.some((entry: { hooks: Array<{ command: string }> }) =>
+          entry.hooks.some((hook) => hook.command === "echo fresh"),
+        ),
+      ).toBe(true);
+    });
+
+    it("should accept a JSONC settings.json and preserve its comments and other keys", async () => {
+      // https://docs.augmentcode.com/cli/config: settings files support JSON
+      // with Comments (comments and trailing commas).
+      await ensureDir(join(testDir, ".augment"));
+      await writeFileContent(
+        join(testDir, ".augment", "settings.json"),
+        `{
+  // MCP servers are owned by the mcp feature.
+  "mcpServers": { "fs": { "command": "fs", }, },
+  "hooks": { "SessionStart": [{ "command": "echo old" }], },
+}
+`,
+      );
+
+      const config = {
+        version: 1,
+        hooks: { preToolUse: [{ type: "command", command: "guard.sh" }] },
+      };
+      const rulesyncHooks = new RulesyncHooks({
+        outputRoot: testDir,
+        relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
+        relativeFilePath: "hooks.json",
+        fileContent: JSON.stringify(config),
+        validate: false,
+      });
+
+      const augmentcodeHooks = await AugmentcodeHooks.fromRulesyncHooks({
+        outputRoot: testDir,
+        rulesyncHooks,
+        validate: false,
+      });
+
+      const content = augmentcodeHooks.getFileContent();
+      expect(content).toContain("// MCP servers are owned by the mcp feature.");
+      const parsed = augmentcodeHooks.toRulesyncHooks().getJson();
+      expect(parsed.hooks.preToolUse).toHaveLength(1);
+      // Non-preserved AugmentCode-only events would be kept; here the old
+      // SessionStart entry is replaced by the rulesync-owned hooks.
+      expect(parsed.hooks.sessionStart).toBeUndefined();
+    });
+
     it("should throw a descriptive error when existing settings.json contains invalid JSON", async () => {
       await ensureDir(join(testDir, ".augment"));
       await writeFileContent(join(testDir, ".augment", "settings.json"), "invalid json {");
@@ -355,6 +444,27 @@ describe("AugmentcodeHooks", () => {
       expect(augmentcodeHooks).toBeInstanceOf(AugmentcodeHooks);
       const parsed = JSON.parse(augmentcodeHooks.getFileContent());
       expect(parsed.hooks.PreToolUse).toEqual([]);
+    });
+
+    it("should load a JSONC .augment/settings.json on import", async () => {
+      await ensureDir(join(testDir, ".augment"));
+      await writeFileContent(
+        join(testDir, ".augment", "settings.json"),
+        `{
+  // guard every MCP tool call
+  "hooks": {
+    "PreToolUse": [{ "matcher": "mcp:*", "hooks": [{ "command": "guard.sh" }], }],
+  },
+}`,
+      );
+
+      const augmentcodeHooks = await AugmentcodeHooks.fromFile({
+        outputRoot: testDir,
+        validate: false,
+      });
+      const json = augmentcodeHooks.toRulesyncHooks().getJson();
+      expect(json.hooks.preToolUse).toHaveLength(1);
+      expect(json.hooks.preToolUse?.[0]?.command).toContain("guard.sh");
     });
 
     it("should initialize empty hooks when .augment/settings.json does not exist", async () => {
@@ -713,5 +823,32 @@ describe("AugmentcodeHooks upstream additions", () => {
     });
 
     expect(events.Stop).toEqual([{ hooks: [{ type: "command", command: "./x.sh" }] }]);
+  });
+
+  it("writes the canonical seconds timeout as Auggie's milliseconds (issue #2959)", async () => {
+    // https://docs.augmentcode.com/cli/hooks: "Timeout in milliseconds
+    // (default: 60000ms)". A verbatim 30 would give the hook a 30 ms deadline.
+    const events = await generate({
+      version: 1,
+      hooks: { preToolUse: [{ type: "command", command: "./x.sh", matcher: "Bash", timeout: 30 }] },
+    });
+
+    expect(events.PreToolUse).toEqual([
+      { matcher: "Bash", hooks: [{ type: "command", command: "./x.sh", timeout: 30000 }] },
+    ]);
+  });
+
+  it("reads Auggie's milliseconds timeout back as canonical seconds (issue #2959)", () => {
+    const hooks = new AugmentcodeHooks({
+      outputRoot: testDir,
+      relativeDirPath: ".augment",
+      relativeFilePath: "settings.json",
+      fileContent: JSON.stringify({
+        hooks: { Stop: [{ hooks: [{ type: "command", command: "./x.sh", timeout: 5000 }] }] },
+      }),
+    });
+
+    const imported = JSON.parse(hooks.toRulesyncHooks().getFileContent());
+    expect(imported.hooks.stop).toEqual([{ type: "command", command: "./x.sh", timeout: 5 }]);
   });
 });

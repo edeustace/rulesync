@@ -1,9 +1,10 @@
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, relative } from "node:path";
 
 import { omit } from "es-toolkit/object";
 import { z } from "zod/mini";
 
 import {
+  RULESYNC_MCP_DEPRECATED_DOTFILE_NAME,
   RULESYNC_MCP_FILE_NAME,
   RULESYNC_MCP_LEGACY_FILE_NAME,
   RULESYNC_RELATIVE_DIR_PATH,
@@ -18,8 +19,8 @@ import {
 import { mcpProcessorToolTargetTuple } from "../../types/tool-target-tuples.js";
 import { RulesyncTargetsSchema, ToolTarget } from "../../types/tool-targets.js";
 import { formatError } from "../../utils/error.js";
-import { fileExistsStrict, readFileContent } from "../../utils/file.js";
-import { parseJsonc } from "../../utils/jsonc.js";
+import { fileExistsStrict, readFileContent, toPosixPath } from "../../utils/file.js";
+import { droppedPollutionKeysError, parseJsoncReportingDroppedKeys } from "../../utils/jsonc.js";
 import type { Logger } from "../../utils/logger.js";
 import { isPrototypePollutionKey } from "../../utils/prototype-pollution.js";
 import {
@@ -76,6 +77,20 @@ const kimiCodeScopedMcpSchema = z.extend(toolScopedMcpSchema, {
   toolTimeoutMs: z.optional(z.number()),
 });
 
+/**
+ * Qwen Code's tool-scoped block also carries the server-level allow/deny lists
+ * from `settings.json` (`mcp.allowed` / `mcp.excluded`): MCP server names or
+ * `*` / `?` globs over the `mcpServers` keys, with `excluded` winning when a
+ * server matches both. They gate every server, including ones rulesync did not
+ * write, so they live here rather than on a canonical server entry.
+ *
+ * @see https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/
+ */
+const qwencodeScopedMcpSchema = z.extend(toolScopedMcpSchema, {
+  allowed: z.optional(z.array(z.string())),
+  excluded: z.optional(z.array(z.string())),
+});
+
 export const RulesyncMcpFileSchema = z.looseObject({
   $schema: z.optional(z.string()),
   ...RulesyncMcpConfigSchema.shape,
@@ -83,21 +98,33 @@ export const RulesyncMcpFileSchema = z.looseObject({
   // deprecated `claudecode-legacy` target reads the `claudecode` block, and
   // the Kiro IDE/CLI targets read the `kiro` block (all three write the same
   // `.kiro/settings/mcp.json`, so per-variant blocks would make that shared
-  // file depend on generation order).
+  // file depend on generation order). In project mode `claudecode`,
+  // `codebuddy`, `commandcode` and `qoder` share the root `.mcp.json`, so all
+  // of them apply all four blocks there.
   amp: z.optional(toolScopedMcpSchema),
   "antigravity-cli": z.optional(toolScopedMcpSchema),
   "antigravity-ide": z.optional(toolScopedMcpSchema),
   aiassistant: z.optional(toolScopedMcpSchema),
   augmentcode: z.optional(toolScopedMcpSchema),
+  bob: z.optional(toolScopedMcpSchema),
   claudecode: z.optional(toolScopedMcpSchema),
   cline: z.optional(toolScopedMcpSchema),
+  codebuddy: z.optional(toolScopedMcpSchema),
+  codewhale: z.optional(toolScopedMcpSchema),
   codexcli: z.optional(toolScopedMcpSchema),
+  commandcode: z.optional(toolScopedMcpSchema),
+  continue: z.optional(toolScopedMcpSchema),
   copilot: z.optional(toolScopedMcpSchema),
   copilotcli: z.optional(toolScopedMcpSchema),
+  cortexcode: z.optional(toolScopedMcpSchema),
+  crush: z.optional(toolScopedMcpSchema),
   cursor: z.optional(toolScopedMcpSchema),
   deepagents: z.optional(toolScopedMcpSchema),
   devin: z.optional(toolScopedMcpSchema),
+  dsh: z.optional(toolScopedMcpSchema),
   factorydroid: z.optional(toolScopedMcpSchema),
+  firebender: z.optional(toolScopedMcpSchema),
+  gitlabduo: z.optional(toolScopedMcpSchema),
   goose: z.optional(toolScopedMcpSchema),
   grokcli: z.optional(toolScopedMcpSchema),
   hermesagent: z.optional(toolScopedMcpSchema),
@@ -105,14 +132,23 @@ export const RulesyncMcpFileSchema = z.looseObject({
   kilo: z.optional(toolScopedMcpSchema),
   "kimi-code": z.optional(kimiCodeScopedMcpSchema),
   kiro: z.optional(toolScopedMcpSchema),
+  mimocode: z.optional(toolScopedMcpSchema),
+  omp: z.optional(toolScopedMcpSchema),
+  openclaw: z.optional(toolScopedMcpSchema),
   opencode: z.optional(toolScopedMcpSchema),
-  qwencode: z.optional(toolScopedMcpSchema),
+  pi: z.optional(toolScopedMcpSchema),
+  qoder: z.optional(toolScopedMcpSchema),
+  qwencode: z.optional(qwencodeScopedMcpSchema),
   reasonix: z.optional(toolScopedMcpSchema),
   roo: z.optional(toolScopedMcpSchema),
   rovodev: z.optional(toolScopedMcpSchema),
+  tabnine: z.optional(toolScopedMcpSchema),
   takt: z.optional(toolScopedMcpSchema),
+  trae: z.optional(toolScopedMcpSchema),
   vibe: z.optional(toolScopedMcpSchema),
   warp: z.optional(toolScopedMcpSchema),
+  warpcli: z.optional(toolScopedMcpSchema),
+  xum: z.optional(toolScopedMcpSchema),
   zed: z.optional(toolScopedMcpSchema),
 });
 
@@ -130,7 +166,8 @@ export type RulesyncMcpSettablePaths = RulesyncSourceSettablePaths;
  * Derived from `RulesyncMcpFileSchema`'s own shape so this set can never drift
  * from the schema — every tool-scoped block declared above is treated as a
  * "merge servers by name" site by `mergeMcpJsonOverlays`, and everything else
- * (including `$schema` and top-level Kimi Code timeout fields) is replaced
+ * (including `$schema`, top-level Kimi Code timeout fields and Qwen Code's
+ * `allowed` / `excluded` lists) is replaced
  * atomically.
  */
 const TOOL_SCOPED_MCP_KEYS = new Set<string>(
@@ -287,13 +324,21 @@ export function mergeMcpJsonOverlays({
 
 export class RulesyncMcp extends RulesyncFile {
   private readonly json: RulesyncMcpConfig;
+  /**
+   * Prototype-pollution keys the parser removed. They are dropped before the
+   * schema ever sees them, so without this record a server named `__proto__`
+   * would produce neither an error nor an entry in any generated file.
+   */
+  private readonly droppedKeys: readonly string[];
 
   constructor(params: RulesyncMcpParams) {
     super(params);
 
     // Sources may be authored as JSONC (`mcp.jsonc`); plain JSON is valid
     // JSONC, so both variants parse through the same strict parser.
-    this.json = parseJsonc(this.fileContent) as RulesyncMcpConfig;
+    const { value, droppedKeys } = parseJsoncReportingDroppedKeys({ content: this.fileContent });
+    this.json = value as RulesyncMcpConfig;
+    this.droppedKeys = droppedKeys;
 
     if (params.validate) {
       const result = this.validate();
@@ -316,13 +361,22 @@ export class RulesyncMcp extends RulesyncFile {
         },
         {
           relativeDirPath: RULESYNC_RELATIVE_DIR_PATH,
-          relativeFilePath: ".mcp.json",
+          relativeFilePath: RULESYNC_MCP_DEPRECATED_DOTFILE_NAME,
         },
       ],
     };
   }
 
   validate(): ValidationResult {
+    if (this.droppedKeys.length > 0) {
+      return {
+        success: false,
+        error: droppedPollutionKeysError({
+          sourcePath: this.getRelativePathFromCwd(),
+          droppedKeys: this.droppedKeys,
+        }),
+      };
+    }
     const result = RulesyncMcpFileSchema.safeParse(this.json);
     if (!result.success) {
       return { success: false, error: result.error };
@@ -406,7 +460,7 @@ export class RulesyncMcp extends RulesyncFile {
 
       const { filePath, candidate } = found;
 
-      if (filePath.endsWith(".mcp.json")) {
+      if (filePath.endsWith(RULESYNC_MCP_DEPRECATED_DOTFILE_NAME)) {
         const recommendedPath = join(parent, treeName, paths.recommended.relativeFilePath);
 
         logger?.warn(
@@ -415,26 +469,46 @@ export class RulesyncMcp extends RulesyncFile {
       }
 
       const fileContent = await readFileContent(filePath);
-      let parsed: unknown;
+      let parsed: Record<string, unknown>;
+      let droppedKeys: readonly string[];
 
       try {
-        parsed = parseJsonc(fileContent);
+        // The reporting parse, not the plain one: a merged config is
+        // re-serialized from these records, so a `__proto__` server dropped
+        // here would vanish without the single-root path's report ever running.
+        const result = parseJsoncReportingDroppedKeys({ content: fileContent });
 
-        if (!isRecord(parsed)) {
+        if (!isRecord(result.value)) {
           throw new Error("Expected a JSON object.");
         }
 
-        if (validate) {
-          const result = RulesyncMcpFileSchema.safeParse(parsed);
-
-          if (!result.success) {
-            throw result.error;
-          }
-        }
+        parsed = result.value;
+        droppedKeys = result.droppedKeys;
       } catch (error) {
         throw new Error(`Invalid MCP source file '${filePath}': ${formatError(error)}`, {
           cause: error,
         });
+      }
+
+      if (validate) {
+        // Thrown outside the wrapper above: that message already names the
+        // file, and this one names it too. The path is made relative and posix
+        // to match how the single-root path reports the same problem, which
+        // goes through `getRelativePathFromCwd()`.
+        if (droppedKeys.length > 0) {
+          throw droppedPollutionKeysError({
+            sourcePath: toPosixPath(relative(process.cwd(), filePath)),
+            droppedKeys,
+          });
+        }
+
+        const result = RulesyncMcpFileSchema.safeParse(parsed);
+
+        if (!result.success) {
+          throw new Error(`Invalid MCP source file '${filePath}': ${formatError(result.error)}`, {
+            cause: result.error,
+          });
+        }
       }
 
       rootSources.push({
@@ -509,7 +583,7 @@ export class RulesyncMcp extends RulesyncFile {
         continue;
       }
 
-      if (candidate.relativeFilePath === ".mcp.json") {
+      if (candidate.relativeFilePath === RULESYNC_MCP_DEPRECATED_DOTFILE_NAME) {
         const recommendedPath = join(
           outputRoot,
           candidateDirPath,
@@ -542,6 +616,19 @@ export class RulesyncMcp extends RulesyncFile {
     throw new RulesyncSourceNotFoundError(`No ${recommendedPath} found.`);
   }
 
+  /**
+   * Return one server exactly as authored, before `getMcpServers()` strips
+   * rulesync- and tool-specific fields. Keep this lookup here so every target
+   * that re-merges one of those fields shares the same own-property and
+   * prototype-pollution guards.
+   */
+  getRawMcpServer(name: string): unknown {
+    if (isPrototypePollutionKey(name)) return undefined;
+
+    const mcpServers = isRecord(this.json) ? this.json.mcpServers : undefined;
+    return isRecord(mcpServers) && Object.hasOwn(mcpServers, name) ? mcpServers[name] : undefined;
+  }
+
   getMcpServers(): McpServers {
     // Tolerate missing/empty mcpServers (e.g., a RulesyncMcp constructed
     // from `{}` with validation disabled). Callers that previously read
@@ -558,7 +645,7 @@ export class RulesyncMcp extends RulesyncFile {
         // `forTarget()` merges into the shared map before this runs.
         .filter(([, serverConfig]) => serverConfig.enabled !== false)
         .map(([serverName, serverConfig]) => {
-          // `envVars` and `experimentalEnvironment` are codex-specific: the
+          // `envVars`, `experimentalEnvironment` and `codexcliTools` are codex-specific: the
           // codex generator reads them directly from the unfiltered source
           // JSON. Strip here so they do not leak into other tools' outputs —
           // including the raw `experimental_environment` spelling, which is
@@ -571,6 +658,14 @@ export class RulesyncMcp extends RulesyncFile {
           // others: it decides whether a third-party server's own instructions
           // are pasted into the agent's system prompt, so carrying it to a tool
           // the author never named would widen what steers the model.
+          // The `crush*` OAuth, sessionless and channel keys — and the raw Crush
+          // spellings someone copying a `crush.json` entry writes — are
+          // re-merged by the crush generator the same way; the client secret
+          // among them is the reason they must not reach any other tool.
+          // `poolAllow` is Pool's approval allowlist, re-merged by the pool
+          // generator the same way; it is an approval decision only Pool reads.
+          // `zcodeOauth` is ZCode's OAuth block, re-merged by the zcode
+          // generators the same way; it may carry a client secret.
           // `enabled` is stripped because OpenCode, Kilo, Grok CLI
           // and Goose have a NATIVE `enabled` field with different semantics a
           // leaked value would silently collide with.
@@ -583,9 +678,25 @@ export class RulesyncMcp extends RulesyncFile {
               "envVars",
               "experimentalEnvironment",
               "experimental_environment",
+              "codexcliTools",
               "musecodeMode",
               "rovodevEnableInstructions",
               "enable_instructions",
+              "crushOauth",
+              "crushOauthClientId",
+              "crushOauthClientSecret",
+              "crushOauthCallbackPort",
+              "crushSessionless",
+              "crushChannelEnabled",
+              "crushChannelReply",
+              "poolAllow",
+              "zcodeOauth",
+              "oauth_client_id",
+              "oauth_client_secret",
+              "oauth_callback_port",
+              "sessionless",
+              "channel_enabled",
+              "channel_reply",
               "enabled",
             ]),
           ];
@@ -632,12 +743,21 @@ export class RulesyncMcp extends RulesyncFile {
    * Targets that share one output file resolve identically so the shared
    * file's content never depends on which of them generates last — see
    * `resolveMcpTarget` for the alias groups (kiro trio, claudecode/-legacy,
-   * and the Antigravity pair).
+   * the Antigravity pair, and the project-scope Claude Code / Command Code
+   * pair, which is why the scope is part of the resolution).
    *
    * Returns the same instance when neither mechanism is used.
    */
-  forTarget({ toolTarget, logger }: { toolTarget: ToolTarget; logger?: Logger }): RulesyncMcp {
-    const { blockKeys, acceptedTargetNames } = resolveMcpTarget({ toolTarget });
+  forTarget({
+    toolTarget,
+    global = false,
+    logger,
+  }: {
+    toolTarget: ToolTarget;
+    global?: boolean;
+    logger?: Logger;
+  }): RulesyncMcp {
+    const { blockKeys, acceptedTargetNames } = resolveMcpTarget({ toolTarget, global });
     const json: Record<string, unknown> = this.json;
     const sharedServers = this.json.mcpServers ?? {};
 
@@ -696,12 +816,33 @@ export class RulesyncMcp extends RulesyncFile {
     const rest = Object.fromEntries(
       Object.entries(json).filter(([key]) => !MCP_TOOL_BLOCK_KEYS.has(key)),
     );
+    // Tool-wide fields the target's translator reads from its own block (e.g.
+    // Qwen Code's server allow/deny lists) are carried through under that
+    // block's key; every other field of the block has been resolved above.
+    const retainedBlocks: Record<string, Record<string, unknown>> = {};
+    for (const blockKey of blockKeys) {
+      const toolBlock = json[blockKey];
+      const retainedFields = MCP_TOOL_BLOCK_RETAINED_FIELDS[blockKey];
+      if (!isRecord(toolBlock) || retainedFields === undefined) continue;
+      const retained = Object.fromEntries(
+        retainedFields
+          .filter((field) => field in toolBlock)
+          .map((field) => [field, toolBlock[field]]),
+      );
+      if (Object.keys(retained).length > 0) {
+        retainedBlocks[blockKey] = retained;
+      }
+    }
 
     return new RulesyncMcp({
       outputRoot: this.outputRoot,
       relativeDirPath: this.relativeDirPath,
       relativeFilePath: this.relativeFilePath,
-      fileContent: JSON.stringify({ ...rest, mcpServers: effectiveServers }, null, 2),
+      fileContent: JSON.stringify(
+        { ...rest, ...retainedBlocks, mcpServers: effectiveServers },
+        null,
+        2,
+      ),
     });
   }
 
@@ -740,6 +881,16 @@ export class RulesyncMcp extends RulesyncFile {
 const MCP_TOOL_BLOCK_KEYS: ReadonlySet<string> = new Set(mcpProcessorToolTargetTuple);
 
 /**
+ * Tool-wide (not per-server) fields of a tool-scoped block that `forTarget`
+ * keeps for that tool's own translator instead of stripping with the rest of
+ * the block. Only fields a translator maps into the generated config belong
+ * here, so translators that spread the whole rulesync JSON never see them.
+ */
+const MCP_TOOL_BLOCK_RETAINED_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  qwencode: ["allowed", "excluded"],
+};
+
+/**
  * Targets whose `{toolname}.mcpServers` block key is ALWAYS another target's
  * key (at every scope): `claudecode-legacy` is a deprecated alias of
  * `claudecode`, and the Kiro IDE/CLI targets share the `kiro` block because
@@ -775,9 +926,41 @@ type McpTargetResolution = {
  *   `config`) — so both targets always apply both blocks in a fixed order
  *   (`antigravity-ide` first, `antigravity-cli` second — the CLI block wins
  *   per server on conflict).
+ * - `claudecode` (and its legacy alias), `codebuddy`, `commandcode` and `qoder`
+ *   share the root `.mcp.json` in PROJECT mode only (their global files
+ *   differ: `~/.claude.json`, `~/.codebuddy/.mcp.json`,
+ *   `~/.commandcode/mcp.json` and `~/.qoder/settings.json`), so in project
+ *   mode the five apply the `claudecode`, `codebuddy`, `commandcode` and
+ *   `qoder` blocks in that fixed order (a later block wins per server on
+ *   conflict); in global mode each reads its own block.
  */
-function resolveMcpTarget({ toolTarget }: { toolTarget: ToolTarget }): McpTargetResolution {
-  if (toolTarget === "claudecode" || toolTarget === "claudecode-legacy") {
+function resolveMcpTarget({
+  toolTarget,
+  global,
+}: {
+  toolTarget: ToolTarget;
+  global: boolean;
+}): McpTargetResolution {
+  const isClaudecode = toolTarget === "claudecode" || toolTarget === "claudecode-legacy";
+  if (
+    !global &&
+    (isClaudecode ||
+      toolTarget === "codebuddy" ||
+      toolTarget === "commandcode" ||
+      toolTarget === "qoder")
+  ) {
+    return {
+      blockKeys: ["claudecode", "codebuddy", "commandcode", "qoder"],
+      acceptedTargetNames: new Set([
+        "claudecode",
+        "claudecode-legacy",
+        "codebuddy",
+        "commandcode",
+        "qoder",
+      ]),
+    };
+  }
+  if (isClaudecode) {
     return {
       blockKeys: ["claudecode"],
       acceptedTargetNames: new Set(["claudecode", "claudecode-legacy"]),

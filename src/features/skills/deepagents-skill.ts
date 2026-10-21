@@ -9,8 +9,13 @@ import {
 import { SKILL_FILE_NAME } from "../../constants/general.js";
 import { RULESYNC_SKILLS_RELATIVE_DIR_PATH } from "../../constants/rulesync-paths.js";
 import { ValidationResult } from "../../types/ai-dir.js";
+import {
+  getDeepagentsRelativeDirPath,
+  getDeepagentsRulesyncOutputRoot,
+} from "../../utils/deepagents.js";
 import { formatError } from "../../utils/error.js";
 import { RulesyncSkill, RulesyncSkillFrontmatterInput, SkillFile } from "./rulesync-skill.js";
+import { resolveCompatibility, resolveLicense, resolveMetadata } from "./skills-utils.js";
 import {
   ToolSkill,
   ToolSkillForDeletionParams,
@@ -27,14 +32,17 @@ const DeepagentsSkillFrontmatterSchema = z.looseObject({
   // still accepted here for tolerant parsing of hand-written files, but on emit
   // rulesync always writes the space-delimited string form.
   "allowed-tools": z.optional(z.union([z.string(), z.array(z.string())])),
-  // Agent Skills spec fields read by dcode's `_parse_skill_metadata`.
-  // https://agentskills.io/specification
-  license: z.optional(z.string()),
-  // The Agent Skills spec defines `compatibility` as a free-form string
-  // (1–500 chars), which is what dcode actually reads; an object form is also
-  // tolerated for backward compatibility (matches the `agentsskills` adapter).
-  compatibility: z.optional(z.union([z.string(), z.looseObject({})])),
-  metadata: z.optional(z.looseObject({})),
+  // dcode's `_parse_skill_metadata` reads `license`, `compatibility`, and
+  // `metadata` (see langchain-ai/deepagents
+  // libs/deepagents/deepagents/middleware/skills.py), but it never hard-fails
+  // on an unexpected shape: values are coerced with `str()`, an overlong
+  // `compatibility` is truncated with a logged warning, and non-dict
+  // `metadata` is replaced with `{}` and a logged warning via
+  // `_validate_metadata`. Left untyped so rulesync never aborts on a value
+  // the underlying tool itself tolerates.
+  license: z.optional(z.unknown()),
+  compatibility: z.optional(z.unknown()),
+  metadata: z.optional(z.unknown()),
 });
 
 export type DeepagentsSkillFrontmatter = z.infer<typeof DeepagentsSkillFrontmatterSchema>;
@@ -84,10 +92,14 @@ export class DeepagentsSkill extends ToolSkill {
 
   static getSettablePaths({ global = false }: { global?: boolean } = {}): ToolSkillSettablePaths {
     // dcode discovers user-level skills in `~/.deepagents/<agent_name>/skills/`
-    // (default agent_name `deepagents`); the home directory is resolved by the
-    // processor through outputRoot in global mode.
+    // (default agent_name `agent`); the home directory is resolved by the
+    // processor through outputRoot in global mode, and `DEEPAGENTS_HOME`
+    // replaces the `.deepagents` segment when set.
     return {
-      relativeDirPath: global ? DEEPAGENTS_GLOBAL_SKILLS_DIR_PATH : DEEPAGENTS_SKILLS_DIR_PATH,
+      relativeDirPath: getDeepagentsRelativeDirPath({
+        global,
+        relativeDirPath: global ? DEEPAGENTS_GLOBAL_SKILLS_DIR_PATH : DEEPAGENTS_SKILLS_DIR_PATH,
+      }),
     };
   }
 
@@ -147,7 +159,10 @@ export class DeepagentsSkill extends ToolSkill {
     };
 
     return new RulesyncSkill({
-      outputRoot: this.outputRoot,
+      outputRoot: getDeepagentsRulesyncOutputRoot({
+        nativeOutputRoot: this.outputRoot,
+        global: this.global,
+      }),
       relativeDirPath: RULESYNC_SKILLS_RELATIVE_DIR_PATH,
       dirName: this.getDirName(),
       frontmatter: rulesyncFrontmatter,
@@ -172,15 +187,27 @@ export class DeepagentsSkill extends ToolSkill {
     // dcode only honors a space-delimited string; serialize the canonical array
     // into that form so the allowlist is not dropped at runtime.
     const allowedToolsString = Array.isArray(allowedTools) ? allowedTools.join(" ") : allowedTools;
+    // The Agent Skills standard fields fall back to the root-level rulesync
+    // value when the `deepagents` section omits them.
+    const license = resolveLicense({
+      rootFrontmatter: rulesyncFrontmatter,
+      section: deepagentsSection,
+    });
+    const compatibility = resolveCompatibility({
+      rootFrontmatter: rulesyncFrontmatter,
+      section: deepagentsSection,
+    });
+    const metadata = resolveMetadata({
+      rootFrontmatter: rulesyncFrontmatter,
+      section: deepagentsSection,
+    });
     const deepagentsFrontmatter: DeepagentsSkillFrontmatter = {
       name: rulesyncFrontmatter.name,
       description: rulesyncFrontmatter.description,
       ...(allowedToolsString && { "allowed-tools": allowedToolsString }),
-      ...(deepagentsSection?.license !== undefined && { license: deepagentsSection.license }),
-      ...(deepagentsSection?.compatibility !== undefined && {
-        compatibility: deepagentsSection.compatibility,
-      }),
-      ...(deepagentsSection?.metadata !== undefined && { metadata: deepagentsSection.metadata }),
+      ...(license !== undefined && { license }),
+      ...(compatibility !== undefined && { compatibility }),
+      ...(metadata !== undefined && { metadata }),
     };
 
     return new DeepagentsSkill({

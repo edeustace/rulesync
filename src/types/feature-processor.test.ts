@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { mkdir, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -39,10 +39,11 @@ vi.mock("../utils/file.js", async () => {
  */
 function createMockFile(
   filePath: string,
-  { fileContent = "content" }: { fileContent?: string } = {},
+  { fileContent = "content", outputRoot = "/" }: { fileContent?: string; outputRoot?: string } = {},
 ): AiFile {
   const file = {
     getFilePath: () => filePath,
+    getOutputRoot: () => outputRoot,
     getFileContent: () => fileContent,
     getRelativePathFromCwd: () => filePath,
     // Declared on the AiFile base class; defaults to false for non-merging files.
@@ -112,6 +113,29 @@ describe("FeatureProcessor", () => {
       expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining("kept.md"));
     });
 
+    it("should report the same removed paths on a dry run as on a real run", async () => {
+      const existingFiles = [
+        createMockFile("/path/to/orphan.md"),
+        createMockFile("/path/to/kept.md"),
+      ];
+      const generatedFiles = [createMockFile("/path/to/kept.md")];
+
+      const dryRunProcessor = new TestProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        dryRun: true,
+      });
+      await dryRunProcessor.removeOrphanAiFiles(existingFiles, generatedFiles);
+
+      const realProcessor = new TestProcessor({ logger: createMockLogger(), outputRoot: testDir });
+      await realProcessor.removeOrphanAiFiles(existingFiles, generatedFiles);
+
+      const expected = [{ path: "/path/to/orphan.md", kind: "file" }];
+      expect(dryRunProcessor.getRemovedPaths()).toEqual(expected);
+      expect(realProcessor.getRemovedPaths()).toEqual(expected);
+      expect(removeFile).toHaveBeenCalledExactlyOnceWith("/path/to/orphan.md");
+    });
+
     it("should strip control characters from the deletion log", async () => {
       const logger = createMockLogger();
       const processor = new TestProcessor({ logger, outputRoot: testDir });
@@ -138,6 +162,21 @@ describe("FeatureProcessor", () => {
         createMockFile("/path/to/file1.md"),
         createMockFile("/path/to/file2.md"),
       ];
+
+      const count = await processor.removeOrphanAiFiles(existingFiles, generatedFiles);
+
+      expect(count).toBe(0);
+      expect(removeFile).not.toHaveBeenCalled();
+    });
+
+    it("should not treat a case-only rename as an orphan", async () => {
+      const processor = new TestProcessor({ logger: createMockLogger(), outputRoot: testDir });
+
+      // On a case-insensitive filesystem, renaming `my-skill.md` to
+      // `My-Skill.md` writes the generated file over the existing one, so the
+      // existing path here is not actually a leftover from the old spelling.
+      const existingFiles = [createMockFile("/path/to/my-skill.md")];
+      const generatedFiles = [createMockFile("/path/to/My-Skill.md")];
 
       const count = await processor.removeOrphanAiFiles(existingFiles, generatedFiles);
 
@@ -188,6 +227,145 @@ describe("FeatureProcessor", () => {
       expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining("kept.md"));
     });
 
+    it.skipIf(process.platform === "win32")(
+      "should refuse to delete through a linked directory that leads out of the output root",
+      async () => {
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        const outside = join(testDir, "outside");
+        await mkdir(root, { recursive: true });
+        await mkdir(outside, { recursive: true });
+        // A checked-out repository can link a whole output directory elsewhere;
+        // the files listed through it belong to that directory, not the project.
+        await symlink(outside, join(root, ".tool"));
+        const processor = new TestProcessor({ logger, outputRoot: root });
+
+        const linkedPath = join(root, ".tool", "notes.md");
+        const orphanPath = join(root, "orphan.md");
+        const count = await processor.removeOrphanAiFiles(
+          [
+            createMockFile(linkedPath, { outputRoot: root }),
+            createMockFile(orphanPath, { outputRoot: root }),
+          ],
+          [],
+        );
+
+        expect(count).toBe(1);
+        expect(removeFile).toHaveBeenCalledExactlyOnceWith(orphanPath);
+        expect(processor.getRemovedPaths()).toEqual([{ path: orphanPath, kind: "file" }]);
+        expect(logger.warn).toHaveBeenCalledWith(
+          `Refusing to delete files in ${JSON.stringify(join(root, ".tool"))}: it resolves ` +
+            `outside ${JSON.stringify(root)} through a symbolic link`,
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should warn once per linked directory that leads out of the output root",
+      async () => {
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        const outside = join(testDir, "outside");
+        await mkdir(root, { recursive: true });
+        await mkdir(join(outside, "nested"), { recursive: true });
+        await symlink(outside, join(root, ".tool"));
+        const processor = new TestProcessor({ logger, outputRoot: root });
+
+        const count = await processor.removeOrphanAiFiles(
+          [
+            createMockFile(join(root, ".tool", "a.md"), { outputRoot: root }),
+            createMockFile(join(root, ".tool", "b.md"), { outputRoot: root }),
+            createMockFile(join(root, ".tool", "c.md"), { outputRoot: root }),
+            createMockFile(join(root, ".tool", "nested", "d.md"), { outputRoot: root }),
+          ],
+          [],
+        );
+
+        // One line per directory, not per file, so a large linked directory
+        // does not flood every `--check`.
+        expect(count).toBe(0);
+        expect(removeFile).not.toHaveBeenCalled();
+        expect(logger.warn).toHaveBeenCalledTimes(2);
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(`files in ${JSON.stringify(join(root, ".tool"))}:`),
+        );
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining(`files in ${JSON.stringify(join(root, ".tool", "nested"))}:`),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse a linked directory out of the output root before the dry-run report",
+      async () => {
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        const outside = join(testDir, "outside");
+        await mkdir(root, { recursive: true });
+        await mkdir(outside, { recursive: true });
+        await symlink(outside, join(root, ".tool"));
+        const processor = new TestProcessor({ logger, outputRoot: root, dryRun: true });
+
+        const count = await processor.removeOrphanAiFiles(
+          [createMockFile(join(root, ".tool", "notes.md"), { outputRoot: root })],
+          [],
+        );
+
+        // `--check` must not report a deletion a real run would refuse.
+        expect(count).toBe(0);
+        expect(processor.getRemovedPaths()).toEqual([]);
+        expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining("[DRY RUN]"));
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("through a symbolic link"),
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should still delete an orphan that is itself a link out of the output root",
+      async () => {
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        const outside = join(testDir, "outside.md");
+        await mkdir(join(root, ".tool"), { recursive: true });
+        await writeFile(outside, "outside");
+        // Removing the link unlinks it where it is spelled; its target is untouched.
+        const linkPath = join(root, ".tool", "linked.md");
+        await symlink(outside, linkPath);
+        const processor = new TestProcessor({ logger, outputRoot: root });
+
+        const count = await processor.removeOrphanAiFiles(
+          [createMockFile(linkPath, { outputRoot: root })],
+          [],
+        );
+
+        expect(count).toBe(1);
+        expect(removeFile).toHaveBeenCalledExactlyOnceWith(linkPath);
+        expect(logger.warn).not.toHaveBeenCalled();
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should delete through a linked directory that stays inside the output root",
+      async () => {
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        await mkdir(join(root, "dotfiles", ".tool"), { recursive: true });
+        await symlink(join(root, "dotfiles", ".tool"), join(root, ".tool"));
+        const processor = new TestProcessor({ logger, outputRoot: root });
+
+        const linkedPath = join(root, ".tool", "orphan.md");
+        const count = await processor.removeOrphanAiFiles(
+          [createMockFile(linkedPath, { outputRoot: root })],
+          [],
+        );
+
+        expect(count).toBe(1);
+        expect(removeFile).toHaveBeenCalledExactlyOnceWith(linkedPath);
+        expect(logger.warn).not.toHaveBeenCalled();
+      },
+    );
+
     it("should not remove any files when existing is empty", async () => {
       const processor = new TestProcessor({ logger: createMockLogger(), outputRoot: testDir });
 
@@ -212,6 +390,110 @@ describe("FeatureProcessor", () => {
       expect(result).toEqual({ count: 2, paths: ["/path/to/file1.md", "/path/to/file2.md"] });
       expect(writeFileContent).toHaveBeenCalledTimes(2);
     });
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse to write through a link that leads out of the output root",
+      async () => {
+        vi.mocked(readFileContentOrNull).mockResolvedValue(null);
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        const outside = join(testDir, "outside");
+        await mkdir(root, { recursive: true });
+        await mkdir(outside, { recursive: true });
+        // A checked-out repository can carry this link; the write must not land
+        // in the directory it points to.
+        await symlink(outside, join(root, ".tool"));
+        const processor = new TestProcessor({ logger, outputRoot: root });
+
+        const linkedPath = join(root, ".tool", "rules.md");
+        const result = await processor.writeAiFiles([
+          createMockFile(linkedPath, { outputRoot: root }),
+          createMockFile(join(root, "kept.md"), { outputRoot: root }),
+        ]);
+
+        expect(result).toEqual({ count: 1, paths: [join(root, "kept.md")] });
+        expect(writeFileContent).toHaveBeenCalledTimes(1);
+        expect(writeFileContent).not.toHaveBeenCalledWith(linkedPath, expect.anything());
+        expect(readFileContentOrNull).not.toHaveBeenCalledWith(linkedPath);
+        expect(logger.warn).toHaveBeenCalledWith(
+          `Refusing to write ${JSON.stringify(linkedPath)}: it resolves outside ` +
+            `${JSON.stringify(root)} through a symbolic link`,
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should write through a link that stays inside the output root",
+      async () => {
+        vi.mocked(readFileContentOrNull).mockResolvedValue(null);
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        await mkdir(join(root, "dotfiles", ".tool"), { recursive: true });
+        await symlink(join(root, "dotfiles", ".tool"), join(root, ".tool"));
+        const processor = new TestProcessor({ logger, outputRoot: root });
+
+        const linkedPath = join(root, ".tool", "rules.md");
+        const result = await processor.writeAiFiles([
+          createMockFile(linkedPath, { outputRoot: root }),
+        ]);
+
+        expect(result).toEqual({ count: 1, paths: [linkedPath] });
+        expect(writeFileContent).toHaveBeenCalledWith(linkedPath, "content\n");
+        expect(logger.warn).not.toHaveBeenCalled();
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse to create a file through a dangling link that leads out of the output root",
+      async () => {
+        vi.mocked(readFileContentOrNull).mockResolvedValue(null);
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        await mkdir(root, { recursive: true });
+        // The target does not exist yet (`~/.zshenv` on a machine without one),
+        // so resolving the link's real path cannot tell where the write lands.
+        await symlink(join(testDir, "not-yet"), join(root, "AGENTS.md"));
+        const processor = new TestProcessor({ logger, outputRoot: root });
+
+        const linkedPath = join(root, "AGENTS.md");
+        const result = await processor.writeAiFiles([
+          createMockFile(linkedPath, { outputRoot: root }),
+        ]);
+
+        expect(result).toEqual({ count: 0, paths: [] });
+        expect(writeFileContent).not.toHaveBeenCalled();
+        expect(logger.warn).toHaveBeenCalledWith(
+          `Refusing to write ${JSON.stringify(linkedPath)}: it resolves outside ` +
+            `${JSON.stringify(root)} through a symbolic link`,
+        );
+      },
+    );
+
+    it.skipIf(process.platform === "win32")(
+      "should refuse a link out of the output root before the dry-run report",
+      async () => {
+        vi.mocked(readFileContentOrNull).mockResolvedValue(null);
+        const logger = createMockLogger();
+        const root = join(testDir, "root");
+        const outside = join(testDir, "outside");
+        await mkdir(root, { recursive: true });
+        await mkdir(outside, { recursive: true });
+        await symlink(outside, join(root, ".tool"));
+        const processor = new TestProcessor({ logger, outputRoot: root, dryRun: true });
+
+        const linkedPath = join(root, ".tool", "rules.md");
+        const result = await processor.writeAiFiles([
+          createMockFile(linkedPath, { outputRoot: root }),
+        ]);
+
+        // A dry run reports what a real run would do, and a real run skips it.
+        expect(result).toEqual({ count: 0, paths: [] });
+        expect(logger.info).not.toHaveBeenCalledWith(expect.stringContaining("[DRY RUN]"));
+        expect(logger.warn).toHaveBeenCalledWith(
+          expect.stringContaining("through a symbolic link"),
+        );
+      },
+    );
 
     it("should skip unchanged files and return 0", async () => {
       vi.mocked(readFileContentOrNull).mockResolvedValue("content\n");
@@ -314,6 +596,28 @@ describe("FeatureProcessor", () => {
 
       expect(result).toEqual({ count: 1, paths: [".antigravity/settings.json"] });
       expect(writeFileContent).toHaveBeenCalledTimes(1);
+    });
+
+    it("should report the owned keys a shared config write changes, in dry-run mode too", async () => {
+      vi.mocked(readFileContentOrNull).mockResolvedValue(
+        'model = "gpt-5"\n\n[mcp_servers.foo]\ncommand = "foo"\n',
+      );
+      const processor = new TestProcessor({
+        logger: createMockLogger(),
+        outputRoot: testDir,
+        dryRun: true,
+      });
+
+      const files = [createMockFile(".codex/config.toml", { fileContent: 'model = "gpt-5"\n' })];
+
+      const result = await processor.writeAiFiles(files);
+
+      expect(result).toEqual({
+        count: 1,
+        paths: [".codex/config.toml"],
+        keyOperations: [{ action: "delete", path: ".codex/config.toml", key: "mcp_servers" }],
+      });
+      expect(writeFileContent).not.toHaveBeenCalled();
     });
 
     it("should create a missing rulesync-owned file even when the payload is empty", async () => {

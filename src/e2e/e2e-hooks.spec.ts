@@ -1,14 +1,16 @@
 import { join } from "node:path";
 
+import { load } from "js-yaml";
 import * as smolToml from "smol-toml";
 import { describe, expect, it } from "vitest";
 
+import { CLAUDECODE_SETTINGS_SCHEMA_URL } from "../constants/claudecode-paths.js";
 import {
   RULESYNC_HOOKS_RELATIVE_FILE_PATH,
   RULESYNC_RELATIVE_DIR_PATH,
 } from "../constants/rulesync-paths.js";
 import { HooksProcessor } from "../features/hooks/hooks-processor.js";
-import { fileExists, readFileContent, writeFileContent } from "../utils/file.js";
+import { fileExists, readFileContent, removeFile, writeFileContent } from "../utils/file.js";
 import { getHermesagentGlobalDir } from "../utils/hermesagent.js";
 import {
   assertGenerateMatrixCoversTargets,
@@ -33,6 +35,110 @@ function assertHookCommandsPreserved(parsed: { hooks?: unknown }): void {
   expect(serialized).toContain(".rulesync/hooks/audit.sh");
 }
 
+// Targets that emit a Claude-shaped `{ hooks: { <Event>: [...] } }` document
+// and differ only in how they spell the canonical `sessionStart` / `stop`
+// events. Every one of them writes hook commands verbatim (no
+// `$CLAUDE_PROJECT_DIR` prefix — that is Claude Code's own convention).
+// See the CANONICAL_TO_<TOOL>_EVENT_NAMES maps in src/types/hooks.ts.
+const hooksKeyedEventNames: Record<string, { sessionStart: string; stop: string }> = {
+  // Cursor uses camelCase event names.
+  cursor: { sessionStart: "sessionStart", stop: "stop" },
+  // Firebender follows Cursor's `{ version, hooks }` layout and event names.
+  firebender: { sessionStart: "sessionStart", stop: "stop" },
+  // Copilot and Copilot CLI use camelCase event names and both map the
+  // canonical `stop` event to `agentStop`.
+  copilot: { sessionStart: "sessionStart", stop: "agentStop" },
+  copilotcli: { sessionStart: "sessionStart", stop: "agentStop" },
+  // AugmentCode mirrors Claude's PascalCase event names but emits commands
+  // verbatim (AUGMENT_PROJECT_DIR is a runtime env var, not an inline prefix).
+  augmentcode: { sessionStart: "SessionStart", stop: "Stop" },
+  // IBM Bob stores Claude-style PascalCase events under the top-level `hooks`
+  // key of .bob/settings.json.
+  bob: { sessionStart: "SessionStart", stop: "Stop" },
+  // Qwen Code uses Claude-style PascalCase event names under the `hooks` key
+  // of .qwen/settings.json, but its mapping differs from Gemini CLI:
+  // `stop` → `Stop` (NOT Gemini's AfterAgent).
+  qwencode: { sessionStart: "SessionStart", stop: "Stop" },
+  // Tabnine CLI stores PascalCase events under the `hooks` key of
+  // .tabnine/agent/settings.json: `stop` → `AfterAgent`; hook timeouts are
+  // written in milliseconds.
+  tabnine: { sessionStart: "SessionStart", stop: "AfterAgent" },
+  // Snowflake Cortex Code stores Claude-style PascalCase events under the
+  // `hooks` key of .cortex/settings.json (project) and
+  // ~/.snowflake/cortex/hooks.json (global); commands are anchored with
+  // $CORTEX_PROJECT_DIR only when they start with `./`.
+  cortexcode: { sessionStart: "SessionStart", stop: "Stop" },
+  // CodeBuddy Code stores Claude-style PascalCase events under the `hooks`
+  // key of .codebuddy/settings.json in both scopes; dot-relative commands are
+  // anchored with $CODEBUDDY_PROJECT_DIR.
+  codebuddy: { sessionStart: "SessionStart", stop: "Stop" },
+  // Command Code stores Claude-style PascalCase events under the `hooks` key
+  // of .commandcode/settings.json in both scopes; commands are anchored with
+  // $COMMANDCODE_PROJECT_DIR only when they start with `./`.
+  commandcode: { sessionStart: "SessionStart", stop: "Stop" },
+  // Continue stores Claude-style PascalCase events under the `hooks` key of
+  // .continue/settings.json in both scopes; commands are anchored with
+  // $CONTINUE_PROJECT_DIR only when they start with `./`.
+  continue: { sessionStart: "SessionStart", stop: "Stop" },
+  // Letta Code stores Claude-style PascalCase events under the `hooks` key of
+  // .letta/settings.json in both scopes; hooks run with the project directory
+  // as their working directory, so commands are written verbatim.
+  lettacode: { sessionStart: "SessionStart", stop: "Stop" },
+  // Qoder stores Claude-style PascalCase events under the `hooks` key of
+  // .qoder/settings.json in both scopes; commands are anchored with
+  // $QODER_PROJECT_DIR only when they start with `./`.
+  qoder: { sessionStart: "SessionStart", stop: "Stop" },
+};
+
+function assertHooksKeyedEvents({
+  target,
+  parsed,
+}: {
+  target: string;
+  parsed: { hooks?: Record<string, unknown> };
+}): void {
+  const eventNames = hooksKeyedEventNames[target];
+  expect(eventNames).toBeDefined();
+  expect(parsed.hooks).toBeDefined();
+  expect(parsed.hooks?.[eventNames?.sessionStart ?? ""]).toBeDefined();
+  expect(parsed.hooks?.[eventNames?.stop ?? ""]).toBeDefined();
+  const serialized = JSON.stringify(parsed.hooks);
+  expect(serialized).toContain(".rulesync/hooks/session-start.sh");
+  expect(serialized).toContain(".rulesync/hooks/audit.sh");
+  expect(serialized).not.toContain("$CLAUDE_PROJECT_DIR");
+}
+
+function isPiExtensionTarget(target: string): target is "pi" | "omp" {
+  return target === "pi" || target === "omp";
+}
+
+/**
+ * Pi and its fork oh-my-pi emit a TypeScript extension subscribing to
+ * snake_case extension events (sessionStart → session_start). Pi maps stop to
+ * agent_before_settle; oh-my-pi has no agent_before_settle and maps stop to
+ * its own session_stop event instead.
+ */
+function assertPiExtensionHooks({
+  target,
+  generatedContent,
+}: {
+  target: "pi" | "omp";
+  generatedContent: string;
+}): void {
+  expect(generatedContent).toContain('pi.on("session_start"');
+  expect(generatedContent).toContain(".rulesync/hooks/session-start.sh");
+  if (target === "pi") {
+    expect(generatedContent).toContain('from "@earendil-works/pi-coding-agent"');
+    expect(generatedContent).toContain('pi.on("agent_before_settle"');
+    expect(generatedContent).toContain(".rulesync/hooks/audit.sh");
+  } else {
+    expect(generatedContent).toContain('from "@oh-my-pi/pi-coding-agent"');
+    expect(generatedContent).not.toContain("agent_before_settle");
+    expect(generatedContent).toContain('pi.on("session_stop"');
+    expect(generatedContent).toContain(".rulesync/hooks/audit.sh");
+  }
+}
+
 // Tools whose event mapping/serialization needs a
 // bespoke assertion (vibe, devin, reasonix) live in their own standalone `it`s
 // below; `hooksProjectStandaloneTargets` lists them so the completeness check
@@ -43,10 +149,14 @@ const hooksGenerateTargets = [
   { target: "amp", outputPath: join(".amp", "plugins", "rulesync-hooks.ts") },
   { target: "claudecode", outputPath: join(".claude", "settings.json") },
   { target: "claudecode-plugin", outputPath: join("hooks", "hooks.json") },
+  { target: "zcode-plugin", outputPath: join("hooks", "hooks.json") },
   { target: "cursor", outputPath: join(".cursor", "hooks.json") },
+  { target: "firebender", outputPath: join(".firebender", "hooks.json") },
+  { target: "mimocode", outputPath: join(".mimocode", "plugins", "rulesync-hooks.js") },
   { target: "opencode", outputPath: join(".opencode", "plugins", "rulesync-hooks.js") },
   { target: "kilo", outputPath: join(".kilo", "plugins", "rulesync-hooks.js") },
   { target: "pi", outputPath: join(".pi", "extensions", "rulesync-hooks.ts") },
+  { target: "omp", outputPath: join(".omp", "extensions", "rulesync-hooks.ts") },
   { target: "codexcli", outputPath: join(".codex", "hooks.json") },
   { target: "qwencode", outputPath: join(".qwen", "settings.json") },
   {
@@ -64,12 +174,32 @@ const hooksGenerateTargets = [
   { target: "antigravity-plugin", outputPath: "hooks.json" },
   { target: "antigravity-cli", outputPath: join(".agents", "hooks.json") },
   { target: "augmentcode", outputPath: join(".augment", "settings.json") },
+  { target: "augmentcode-plugin", outputPath: join("hooks", "hooks.json") },
+  { target: "bob", outputPath: join(".bob", "settings.json") },
+  { target: "tabnine", outputPath: join(".tabnine", "agent", "settings.json") },
+  { target: "cortexcode", outputPath: join(".cortex", "settings.json") },
+  { target: "codebuddy", outputPath: join(".codebuddy", "settings.json") },
+  { target: "commandcode", outputPath: join(".commandcode", "settings.json") },
+  { target: "continue", outputPath: join(".continue", "settings.json") },
+  { target: "lettacode", outputPath: join(".letta", "settings.json") },
+  { target: "qoder", outputPath: join(".qoder", "settings.json") },
+  { target: "gitlabduo", outputPath: join(".gitlab", "duo", "hooks.json") },
   { target: "grokcli", outputPath: join(".grok", "hooks", "rulesync.json") },
   { target: "cline", outputPath: join(".clinerules", "hooks", "rulesync-hooks.json") },
+  { target: "zcode", outputPath: join(".zcode", "config.json") },
 ] as const;
 
 // Targets exercised by dedicated `it`s (bespoke per-tool serialization).
-const hooksProjectStandaloneTargets = ["vibe", "devin", "reasonix"] as const;
+const hooksProjectStandaloneTargets = [
+  "vibe",
+  "vibe-plugin",
+  "devin-plugin",
+  "codewhale",
+  "devin",
+  "reasonix",
+  "crush",
+  "pool",
+] as const;
 
 describe("E2E: hooks", () => {
   const { getTestDir } = useTestDirectory();
@@ -109,8 +239,8 @@ describe("E2E: hooks", () => {
       expect(generatedContent).toContain('amp.on("agent.end"');
       expect(generatedContent).toContain(".rulesync/hooks/session-start.sh");
       expect(generatedContent).toContain(".rulesync/hooks/audit.sh");
-    } else if (target === "opencode") {
-      // OpenCode generates a JavaScript plugin file, not JSON
+    } else if (target === "opencode" || target === "mimocode") {
+      // OpenCode (and its MiMo Code distribution) generates a JavaScript plugin file, not JSON
       expect(generatedContent).toContain("export const RulesyncHooksPlugin");
       expect(generatedContent).toContain('"session.created"');
       expect(generatedContent).toContain('"session.idle"');
@@ -131,14 +261,8 @@ describe("E2E: hooks", () => {
       expect(
         await readFileContent(join(testDir, ".clinerules", "hooks", "TaskStart.ps1")),
       ).toContain(".rulesync/hooks/session-start.sh");
-    } else if (target === "pi") {
-      // Pi emits a TypeScript extension (.pi/extensions/rulesync-hooks.ts)
-      // that subscribes to snake_case extension events: sessionStart →
-      // session_start, stop → agent_end.
-      expect(generatedContent).toContain('pi.on("session_start"');
-      expect(generatedContent).toContain('pi.on("agent_end"');
-      expect(generatedContent).toContain(".rulesync/hooks/session-start.sh");
-      expect(generatedContent).toContain(".rulesync/hooks/audit.sh");
+    } else if (isPiExtensionTarget(target)) {
+      assertPiExtensionHooks({ target, generatedContent });
     } else {
       const parsed = JSON.parse(generatedContent);
 
@@ -148,11 +272,15 @@ describe("E2E: hooks", () => {
         expect(parsed.hooks.SessionStart).toBeDefined();
         expect(parsed.hooks.Stop).toBeDefined();
         expect(parsed.hooks.SessionStart[0].hooks[0].command).toContain('"$CLAUDE_PROJECT_DIR"/');
-      } else if (target === "cursor") {
-        // Cursor uses camelCase event names
-        expect(parsed.hooks).toBeDefined();
-        expect(parsed.hooks.sessionStart).toBeDefined();
-        expect(parsed.hooks.stop).toBeDefined();
+      } else if (target === "augmentcode-plugin") {
+        // Auggie plugin hooks use PascalCase events, and dot-relative scripts
+        // are anchored to the plugin root rather than the consumer's workspace.
+        expect(parsed.hooks.SessionStart[0].hooks[0].command).toBe(
+          '"$AUGMENT_PLUGIN_ROOT"/.rulesync/hooks/session-start.sh',
+        );
+        expect(parsed.hooks.Stop[0].hooks[0].command).toBe(
+          '"$AUGMENT_PLUGIN_ROOT"/.rulesync/hooks/audit.sh',
+        );
       } else if (target === "kiro") {
         // The deprecated `kiro` alias keeps the embedded
         // .kiro/agents/default.json agent-hook format and event mapping:
@@ -162,23 +290,8 @@ describe("E2E: hooks", () => {
         expect(parsed.hooks.stop).toBeDefined();
         expect(parsed.hooks.agentSpawn[0].command).toBe(".rulesync/hooks/session-start.sh");
         expect(parsed.hooks.stop[0].command).toBe(".rulesync/hooks/audit.sh");
-      } else if (target === "copilot" || target === "copilotcli") {
-        // Copilot and Copilot CLI use camelCase event names and both map the
-        // canonical `stop` event to `agentStop` (see COPILOT_HOOK_EVENTS /
-        // COPILOTCLI_HOOK_EVENTS in src/types/hooks.ts).
-        expect(parsed.hooks).toBeDefined();
-        expect(parsed.hooks.sessionStart).toBeDefined();
-        expect(parsed.hooks.agentStop).toBeDefined();
-        expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/session-start.sh");
-        expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/audit.sh");
-      } else if (target === "augmentcode") {
-        // AugmentCode mirrors Claude's PascalCase event names but emits commands
-        // verbatim (AUGMENT_PROJECT_DIR is a runtime env var, not an inline prefix).
-        expect(parsed.hooks).toBeDefined();
-        expect(parsed.hooks.SessionStart).toBeDefined();
-        expect(parsed.hooks.Stop).toBeDefined();
-        expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/session-start.sh");
-        expect(JSON.stringify(parsed.hooks)).not.toContain("$CLAUDE_PROJECT_DIR");
+      } else if (target in hooksKeyedEventNames) {
+        assertHooksKeyedEvents({ target, parsed });
       } else if (
         target === "antigravity-ide" ||
         target === "antigravity-cli" ||
@@ -191,17 +304,6 @@ describe("E2E: hooks", () => {
         // audit.sh — mapped to `Stop` — survives generation.
         expect(parsed.rulesync.Stop).toBeDefined();
         expect(JSON.stringify(parsed)).toContain(".rulesync/hooks/audit.sh");
-      } else if (target === "qwencode") {
-        // Qwen Code uses Claude-style PascalCase event names under the `hooks`
-        // key of .qwen/settings.json, but its mapping differs from Gemini CLI:
-        // canonical `sessionStart` → `SessionStart`, `stop` → `Stop`
-        // (NOT Gemini's BeforeAgent/AfterAgent). See
-        // CANONICAL_TO_QWENCODE_EVENT_NAMES in src/types/hooks.ts.
-        expect(parsed.hooks).toBeDefined();
-        expect(parsed.hooks.SessionStart).toBeDefined();
-        expect(parsed.hooks.Stop).toBeDefined();
-        expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/session-start.sh");
-        expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/audit.sh");
       } else if (target === "kiro-ide" || target === "kiro-cli") {
         // Kiro's standalone hooks format, shared by the IDE and by CLI 3.0:
         // a `{ version: "v1", hooks: [...] }` envelope with one entry per hook.
@@ -214,6 +316,35 @@ describe("E2E: hooks", () => {
         expect(triggers).toContain("Stop");
         expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/session-start.sh");
         expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/audit.sh");
+      } else if (target === "gitlabduo") {
+        // GitLab Duo CLI reads SessionStart, PreToolUse and SessionEnd, so `stop` (audit.sh) is
+        // dropped. Dot-relative commands are anchored to $DUO_PROJECT_DIR, which
+        // the CLI sets for hook processes.
+        expect(Object.keys(parsed.hooks)).toEqual(["SessionStart"]);
+        expect(parsed.hooks.SessionStart).toEqual([
+          {
+            hooks: [
+              { type: "command", command: '"$DUO_PROJECT_DIR"/.rulesync/hooks/session-start.sh' },
+            ],
+          },
+        ]);
+      } else if (target === "zcode") {
+        // ZCode nests the PascalCase event map under `hooks.events` of the
+        // workspace config and states `enabled: true`; the hooks still run only
+        // once each user trusts them in ZCode.
+        expect(parsed.hooks.enabled).toBe(true);
+        expect(parsed.hooks.events.SessionStart).toBeDefined();
+        expect(parsed.hooks.events.Stop).toBeDefined();
+        expect(JSON.stringify(parsed.hooks.events)).toContain(".rulesync/hooks/session-start.sh");
+        expect(JSON.stringify(parsed.hooks.events)).toContain(".rulesync/hooks/audit.sh");
+      } else if (target === "zcode-plugin") {
+        // A ZCode plugin's hooks/hooks.json holds the PascalCase event map
+        // directly under `hooks`, without the config file's `events` wrapper.
+        expect(parsed.hooks.events).toBeUndefined();
+        expect(JSON.stringify(parsed.hooks.SessionStart)).toContain(
+          ".rulesync/hooks/session-start.sh",
+        );
+        expect(JSON.stringify(parsed.hooks.Stop)).toContain(".rulesync/hooks/audit.sh");
       } else if (target === "deepagents") {
         // deepagents-cli gets the Hooks v2 document: PascalCase HookEvent keys
         // over matcher groups holding string commands (no bash -c argv
@@ -255,6 +386,8 @@ describe("E2E: hooks", () => {
     const generatedContent = await readFileContent(join(testDir, ".claude", "settings.json"));
     expect(generatedContent).toContain("echo from-jsonc");
     expect(generatedContent).not.toContain("echo stale");
+    expect(Object.keys(JSON.parse(generatedContent))[0]).toBe("$schema");
+    expect(JSON.parse(generatedContent).$schema).toBe(CLAUDECODE_SETTINGS_SCHEMA_URL);
   });
 
   it("should round-trip the legacy Kiro agent-config hook cache TTL", async () => {
@@ -410,6 +543,234 @@ describe("E2E: hooks", () => {
     expect(importedContent).toContain("echo audit");
   });
 
+  it("should generate vibe-plugin hooks into ai.mistral.vibe/hooks.toml", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH),
+      JSON.stringify({
+        version: 1,
+        hooks: { preToolUse: [{ command: "./scripts/audit.sh", matcher: "bash" }] },
+      }),
+    );
+
+    await runGenerate({ target: "vibe-plugin", features: "hooks" });
+
+    // Same `[[hooks]]` array as `.vibe/hooks.toml`; Vibe runs plugin hooks in
+    // the plugin root, so the relative command is kept as written.
+    const generatedContent = await readFileContent(join(testDir, "ai.mistral.vibe", "hooks.toml"));
+    expect(generatedContent).toContain('type = "pre_tool"');
+    expect(generatedContent).toContain('command = "./scripts/audit.sh"');
+    expect(await fileExists(join(testDir, ".vibe", "hooks.toml"))).toBe(false);
+  });
+
+  it("should generate devin-plugin hooks into the plugin-root hooks.json", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH),
+      JSON.stringify({
+        version: 1,
+        hooks: { preToolUse: [{ command: "./scripts/audit.sh", matcher: "exec" }] },
+      }),
+    );
+
+    await runGenerate({ target: "devin-plugin", features: "hooks" });
+
+    // Same bare event map as `.devin/hooks.v1.json`, at the plugin root.
+    const parsed = JSON.parse(await readFileContent(join(testDir, "hooks.json")));
+    expect(parsed).toEqual({
+      PreToolUse: [
+        { matcher: "exec", hooks: [{ type: "command", command: "./scripts/audit.sh" }] },
+      ],
+    });
+    expect(await fileExists(join(testDir, ".devin", "hooks.v1.json"))).toBe(false);
+
+    await removeFile(join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH));
+    await runImport({ target: "devin-plugin", features: "hooks" });
+
+    const importedContent = await readFileContent(join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH));
+    expect(importedContent).toContain("preToolUse");
+    expect(importedContent).toContain("./scripts/audit.sh");
+  });
+
+  it("should generate codewhale hooks into .codewhale/hooks.toml", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH),
+      JSON.stringify({
+        version: 1,
+        hooks: {
+          sessionStart: [{ command: ".rulesync/hooks/session-start.sh" }],
+          preToolUse: [{ command: ".rulesync/hooks/audit.sh", matcher: "exec_shell", timeout: 10 }],
+        },
+      }),
+    );
+
+    await runGenerate({ target: "codewhale", features: "hooks" });
+
+    const parsed = smolToml.parse(await readFileContent(join(testDir, ".codewhale", "hooks.toml")));
+    // Top-level `[[hooks]]` entries with snake_case events; the matcher
+    // becomes a `tool_name` condition.
+    expect(parsed.hooks).toEqual([
+      { event: "session_start", command: ".rulesync/hooks/session-start.sh" },
+      {
+        event: "tool_call_before",
+        command: ".rulesync/hooks/audit.sh",
+        condition: { type: "tool_name", name: "exec_shell" },
+        timeout_secs: 10,
+      },
+    ]);
+  });
+
+  it("should import codewhale hooks from .codewhale/hooks.toml", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".codewhale", "hooks.toml"),
+      [
+        "[[hooks]]",
+        'event = "tool_call_before"',
+        'command = "echo audit"',
+        'condition = { type = "tool_name", name = "exec_shell" }',
+        "",
+      ].join("\n"),
+    );
+
+    await runImport({ target: "codewhale", features: "hooks" });
+
+    const imported = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH)),
+    );
+    expect(imported.hooks.preToolUse).toEqual([
+      { type: "command", command: "echo audit", matcher: "exec_shell" },
+    ]);
+  });
+
+  it("should generate crush hooks into the hooks.PreToolUse list of crush.json", async () => {
+    const testDir = getTestDir();
+
+    // Crush only fires PreToolUse, so the generic matrix fixture (sessionStart/
+    // stop) would produce nothing; seed the one event it supports instead.
+    const hooksContent = JSON.stringify(
+      {
+        version: 1,
+        hooks: {
+          preToolUse: [{ command: ".rulesync/hooks/audit.sh", matcher: "bash", timeout: 5 }],
+          stop: [{ command: ".rulesync/hooks/on-stop.sh" }],
+        },
+      },
+      null,
+      2,
+    );
+    await writeFileContent(join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH), hooksContent);
+    // Unrelated top-level keys of the shared config file must survive.
+    await writeFileContent(
+      join(testDir, "crush.json"),
+      JSON.stringify({ options: { debug: true } }, null, 2),
+    );
+
+    await runGenerate({ target: "crush", features: "hooks" });
+
+    const parsed = JSON.parse(await readFileContent(join(testDir, "crush.json")));
+    expect(parsed.hooks).toEqual({
+      PreToolUse: [{ matcher: "bash", command: ".rulesync/hooks/audit.sh", timeout: 5 }],
+    });
+    expect(parsed.options).toEqual({ debug: true });
+  });
+
+  it("should import crush hooks from crush.json", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, "crush.json"),
+      JSON.stringify(
+        { hooks: { PreToolUse: [{ matcher: "bash|edit", command: "echo audit" }] } },
+        null,
+        2,
+      ),
+    );
+
+    await runImport({ target: "crush", features: "hooks" });
+
+    const imported = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH)),
+    );
+    expect(imported.hooks.preToolUse).toEqual([
+      { type: "command", matcher: "bash|edit", command: "echo audit" },
+    ]);
+  });
+
+  it("should generate pool hooks into the hooks block of .poolside/settings.yaml", async () => {
+    const testDir = getTestDir();
+
+    const hooksContent = JSON.stringify(
+      {
+        version: 1,
+        hooks: {
+          preToolUse: [
+            { name: "audit", command: ".poolside/hooks/audit.sh", matcher: "shell", timeout: 5 },
+          ],
+          stop: [{ command: ".poolside/hooks/on-stop.sh" }],
+        },
+      },
+      null,
+      2,
+    );
+    await writeFileContent(join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH), hooksContent);
+    // Unrelated top-level keys and the non-event siblings of the hooks block
+    // of the shared settings file must survive.
+    await writeFileContent(
+      join(testDir, ".poolside", "settings.yaml"),
+      "pool:\n  model: gpt\nhooks:\n  stop_hook_max_continuations: 2\n",
+    );
+
+    await runGenerate({ target: "pool", features: "hooks" });
+
+    const parsed = load(await readFileContent(join(testDir, ".poolside", "settings.yaml")));
+    expect(parsed).toEqual({
+      pool: { model: "gpt" },
+      hooks: {
+        stop_hook_max_continuations: 2,
+        PreToolUse: [
+          { name: "audit", matcher: "shell", command: ".poolside/hooks/audit.sh", timeout: 5 },
+        ],
+        Stop: [{ matcher: "*", command: ".poolside/hooks/on-stop.sh" }],
+      },
+    });
+  });
+
+  it("should import pool hooks from .poolside/settings.yaml", async () => {
+    const testDir = getTestDir();
+
+    await writeFileContent(
+      join(testDir, ".poolside", "settings.yaml"),
+      [
+        "hooks:",
+        "  PreToolUse:",
+        "    - matcher: shell|edit",
+        "      command: echo audit",
+        "  UserPromptSubmit:",
+        "    - matcher: '*'",
+        "      command: echo prompt",
+        "",
+      ].join("\n"),
+    );
+
+    await runImport({ target: "pool", features: "hooks" });
+
+    const imported = JSON.parse(
+      await readFileContent(join(testDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH)),
+    );
+    expect(imported.hooks.preToolUse).toEqual([
+      { type: "command", matcher: "shell|edit", command: "echo audit" },
+    ]);
+    expect(imported.hooks.beforeSubmitPrompt).toEqual([
+      { type: "command", command: "echo prompt" },
+    ]);
+  });
+
   it("should generate devin hooks", async () => {
     const testDir = getTestDir();
 
@@ -443,7 +804,7 @@ describe("E2E: hooks", () => {
   it("should generate reasonix hooks (.reasonix/settings.json, flat per-event arrays)", async () => {
     const testDir = getTestDir();
 
-    // Reasonix maps ten events; sessionStart ⇄ SessionStart,
+    // Reasonix maps thirteen events; sessionStart ⇄ SessionStart,
     // postModelInvocation ⇄ PostLLMCall, notification ⇄ Notification, and
     // preCompact ⇄ PreCompact are among them, while beforeReadFile has no mapped
     // Reasonix equivalent in rulesync's scoped surface and is dropped.
@@ -508,11 +869,15 @@ describe("E2E: hooks", () => {
     // claudecode, kiro use shared config files (isDeletable=false) — excluded.
     // factorydroid now writes a dedicated .factory/hooks.json (isDeletable=true).
     { target: "cursor", orphanPath: join(".cursor", "hooks.json") },
+    { target: "firebender", orphanPath: join(".firebender", "hooks.json") },
+    { target: "mimocode", orphanPath: join(".mimocode", "plugins", "rulesync-hooks.js") },
     { target: "opencode", orphanPath: join(".opencode", "plugins", "rulesync-hooks.js") },
     { target: "pi", orphanPath: join(".pi", "extensions", "rulesync-hooks.ts") },
+    { target: "omp", orphanPath: join(".omp", "extensions", "rulesync-hooks.ts") },
     { target: "codexcli", orphanPath: join(".codex", "hooks.json") },
     { target: "copilot", orphanPath: join(".github", "hooks", "copilot-hooks.json") },
     { target: "factorydroid", orphanPath: join(".factory", "hooks.json") },
+    { target: "gitlabduo", orphanPath: join(".gitlab", "duo", "hooks.json") },
   ])(
     "should fail in check mode when delete would remove an orphan $target hooks file",
     async ({ target, orphanPath }) => {
@@ -620,6 +985,16 @@ describe("E2E: hooks (import)", () => {
       },
     },
     {
+      target: "firebender",
+      sourcePath: join(".firebender", "hooks.json"),
+      sourceContent: {
+        version: 1,
+        hooks: {
+          sessionStart: [{ command: "echo session started" }],
+        },
+      },
+    },
+    {
       target: "factorydroid",
       sourcePath: join(".factory", "hooks.json"),
       sourceContent: {
@@ -685,6 +1060,116 @@ describe("E2E: hooks (import)", () => {
       },
     },
     {
+      // IBM Bob stores hooks under the top-level `hooks` key of .bob/settings.json
+      // using Claude-style PascalCase event names; SessionStart round-trips to
+      // the canonical `sessionStart` event.
+      target: "bob",
+      sourcePath: join(".bob", "settings.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [{ hooks: [{ type: "command", command: "echo session started" }] }],
+        },
+      },
+    },
+    {
+      // Tabnine CLI stores hooks under the `hooks` key of
+      // .tabnine/agent/settings.json using PascalCase event names;
+      // SessionStart round-trips to the canonical `sessionStart` event.
+      target: "tabnine",
+      sourcePath: join(".tabnine", "agent", "settings.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: "command", command: "echo session started", timeout: 30000 }] },
+          ],
+        },
+      },
+    },
+    {
+      // Snowflake Cortex Code stores hooks under the `hooks` key of
+      // .cortex/settings.json using PascalCase event names; SessionStart
+      // round-trips to the canonical `sessionStart` event.
+      target: "cortexcode",
+      sourcePath: join(".cortex", "settings.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: "command", command: "echo session started", timeout: 30 }] },
+          ],
+        },
+      },
+    },
+    {
+      // CodeBuddy Code stores hooks under the `hooks` key of
+      // .codebuddy/settings.json using Claude-style PascalCase event names;
+      // SessionStart round-trips to the canonical `sessionStart` event.
+      target: "codebuddy",
+      sourcePath: join(".codebuddy", "settings.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: "command", command: "echo session started", timeout: 30 }] },
+          ],
+        },
+      },
+    },
+    {
+      // Command Code stores hooks under the `hooks` key of
+      // .commandcode/settings.json using Claude-style PascalCase event names;
+      // SessionStart round-trips to the canonical `sessionStart` event.
+      target: "commandcode",
+      sourcePath: join(".commandcode", "settings.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: "command", command: "echo session started", timeout: 30 }] },
+          ],
+        },
+      },
+    },
+    {
+      // Continue stores hooks under the `hooks` key of .continue/settings.json
+      // using Claude-style PascalCase event names; SessionStart round-trips to
+      // the canonical `sessionStart` event.
+      target: "continue",
+      sourcePath: join(".continue", "settings.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: "command", command: "echo session started", timeout: 30 }] },
+          ],
+        },
+      },
+    },
+    {
+      // Letta Code stores hooks under the `hooks` key of .letta/settings.json
+      // using Claude-style PascalCase event names and millisecond timeouts;
+      // SessionStart round-trips to the canonical `sessionStart` event.
+      target: "lettacode",
+      sourcePath: join(".letta", "settings.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: "command", command: "echo session started", timeout: 30000 }] },
+          ],
+        },
+      },
+    },
+    {
+      // Qoder stores hooks under the `hooks` key of .qoder/settings.json using
+      // Claude-style PascalCase event names and second timeouts; SessionStart
+      // round-trips to the canonical `sessionStart` event.
+      target: "qoder",
+      sourcePath: join(".qoder", "settings.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [
+            { hooks: [{ type: "command", command: "echo session started", timeout: 30 }] },
+          ],
+        },
+      },
+    },
+    {
       // deepagents-cli uses the Hooks v2 document (PascalCase HookEvent keys
       // over matcher groups); SessionStart round-trips to canonical `sessionStart`.
       target: "deepagents",
@@ -707,6 +1192,36 @@ describe("E2E: hooks (import)", () => {
           SessionStart: [
             { matcher: "", hooks: [{ type: "command", command: "echo session started" }] },
           ],
+        },
+      },
+    },
+    {
+      // Auggie plugin bundles ship hooks in `hooks/hooks.json` with PascalCase
+      // events; the documented `${AUGMENT_PLUGIN_ROOT}` prefix is stripped.
+      target: "augmentcode-plugin",
+      sourcePath: join("hooks", "hooks.json"),
+      sourceContent: {
+        hooks: {
+          SessionStart: [
+            {
+              hooks: [{ type: "command", command: "${AUGMENT_PLUGIN_ROOT}/hooks/start.sh" }],
+            },
+          ],
+        },
+      },
+    },
+    {
+      // ZCode nests PascalCase events under `hooks.events` of the workspace
+      // config, beside its MCP servers.
+      target: "zcode",
+      sourcePath: join(".zcode", "config.json"),
+      sourceContent: {
+        mcp: { servers: {} },
+        hooks: {
+          enabled: true,
+          events: {
+            SessionStart: [{ hooks: [{ type: "command", command: "echo session started" }] }],
+          },
         },
       },
     },
@@ -736,22 +1251,35 @@ const hooksGlobalTargets = [
     target: "goose",
     outputPath: join(".agents", "plugins", "rulesync", "hooks", "hooks.json"),
   },
+  { target: "mimocode", outputPath: join(".config", "mimocode", "plugins", "rulesync-hooks.js") },
   { target: "opencode", outputPath: join(".config", "opencode", "plugins", "rulesync-hooks.js") },
   { target: "kilo", outputPath: join(".config", "kilo", "plugins", "rulesync-hooks.js") },
   { target: "pi", outputPath: join(".pi", "agent", "extensions", "rulesync-hooks.ts") },
+  { target: "omp", outputPath: join(".omp", "agent", "extensions", "rulesync-hooks.ts") },
   { target: "factorydroid", outputPath: join(".factory", "hooks.json") },
   { target: "deepagents", outputPath: join(".deepagents", "hooks.json") },
   { target: "junie", outputPath: join(".junie", "config.json") },
   { target: "cursor", outputPath: join(".cursor", "hooks.json") },
+  { target: "firebender", outputPath: join(".firebender", "hooks.json") },
   { target: "copilot", outputPath: join(".copilot", "hooks", "copilot-ide-hooks.json") },
   { target: "copilotcli", outputPath: join(".copilot", "hooks", "copilot-hooks.json") },
   { target: "antigravity-ide", outputPath: join(".gemini", "config", "hooks.json") },
   { target: "antigravity-cli", outputPath: join(".gemini", "config", "hooks.json") },
   { target: "augmentcode", outputPath: join(".augment", "settings.json") },
+  { target: "bob", outputPath: join(".bob", "settings", "settings.json") },
+  { target: "tabnine", outputPath: join(".tabnine", "agent", "settings.json") },
+  { target: "cortexcode", outputPath: join(".snowflake", "cortex", "hooks.json") },
+  { target: "codebuddy", outputPath: join(".codebuddy", "settings.json") },
+  { target: "commandcode", outputPath: join(".commandcode", "settings.json") },
+  { target: "continue", outputPath: join(".continue", "settings.json") },
+  { target: "lettacode", outputPath: join(".letta", "settings.json") },
+  { target: "qoder", outputPath: join(".qoder", "settings.json") },
   { target: "kiro-ide", outputPath: join(".kiro", "hooks", "rulesync.json") },
   { target: "kiro-cli", outputPath: join(".kiro", "hooks", "rulesync.json") },
+  { target: "gitlabduo", outputPath: join(".gitlab", "duo", "hooks.json") },
   { target: "grokcli", outputPath: join(".grok", "hooks", "rulesync.json") },
   { target: "cline", outputPath: join("Documents", "Cline", "Hooks", "rulesync-hooks.json") },
+  { target: "zcode", outputPath: join(".zcode", "cli", "config.json") },
 ] as const;
 
 // Global targets exercised by dedicated `it`s (bespoke per-tool serialization).
@@ -759,11 +1287,14 @@ const hooksGlobalTargets = [
 // enumeration matches the processor's declared set — not that a matching `it`
 // exists for each name; keep it in sync with the actual `it`s by hand.
 const hooksGlobalStandaloneTargets = [
+  "crush",
+  "codewhale",
   "devin",
   "vibe",
   "hermesagent",
   "kimi-code",
   "reasonix",
+  "pool",
 ] as const;
 
 describe("E2E: hooks (global mode)", () => {
@@ -810,7 +1341,7 @@ describe("E2E: hooks (global mode)", () => {
         expect(generatedContent).toContain('amp.on("agent.end"');
         expect(generatedContent).toContain(".rulesync/hooks/session-start.sh");
         expect(generatedContent).toContain(".rulesync/hooks/audit.sh");
-      } else if (target === "opencode") {
+      } else if (target === "opencode" || target === "mimocode") {
         expect(generatedContent).toContain("RulesyncHooksPlugin");
         expect(generatedContent).toContain(".rulesync/hooks/session-start.sh");
         expect(generatedContent).toContain(".rulesync/hooks/audit.sh");
@@ -823,17 +1354,28 @@ describe("E2E: hooks (global mode)", () => {
         // Kilo's JS plugin differs from OpenCode's shape; assert command paths.
         expect(generatedContent).toContain(".rulesync/hooks/session-start.sh");
         expect(generatedContent).toContain(".rulesync/hooks/audit.sh");
-      } else if (target === "pi") {
-        // Pi emits a TypeScript extension subscribing to snake_case events.
-        expect(generatedContent).toContain('pi.on("session_start"');
-        expect(generatedContent).toContain('pi.on("agent_end"');
-        expect(generatedContent).toContain(".rulesync/hooks/session-start.sh");
-        expect(generatedContent).toContain(".rulesync/hooks/audit.sh");
+      } else if (isPiExtensionTarget(target)) {
+        assertPiExtensionHooks({ target, generatedContent });
       } else if (target === "copilot" || target === "copilotcli") {
         // Neither Copilot target supports the `stop` hook event, so audit.sh is
         // intentionally dropped during generation.
         const parsed = JSON.parse(generatedContent);
         expect(parsed.hooks.sessionStart).toBeDefined();
+        expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/session-start.sh");
+      } else if (target === "zcode") {
+        // In global mode the `hooks` block (with `enabled: true`) goes to
+        // ~/.zcode/cli/config.json. See CANONICAL_TO_ZCODE_EVENT_NAMES in
+        // src/types/hooks.ts.
+        const parsedHooks = JSON.parse(generatedContent).hooks;
+        expect(parsedHooks.enabled).toBe(true);
+        expect(parsedHooks.events.SessionStart).toBeDefined();
+        expect(parsedHooks.events.Stop).toBeDefined();
+        expect(JSON.stringify(parsedHooks.events)).toContain(".rulesync/hooks/session-start.sh");
+        expect(JSON.stringify(parsedHooks.events)).toContain(".rulesync/hooks/audit.sh");
+      } else if (target === "gitlabduo") {
+        // GitLab Duo CLI has no `stop` event, so audit.sh is dropped.
+        const parsed = JSON.parse(generatedContent);
+        expect(Object.keys(parsed.hooks)).toEqual(["SessionStart"]);
         expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/session-start.sh");
       } else if (target === "junie") {
         // Junie CLI supports SessionStart, UserPromptSubmit, Stop, and SessionEnd
@@ -851,21 +1393,77 @@ describe("E2E: hooks (global mode)", () => {
         const parsed = JSON.parse(generatedContent);
         expect(parsed.rulesync.Stop).toBeDefined();
         expect(JSON.stringify(parsed)).toContain(".rulesync/hooks/audit.sh");
-      } else if (target === "qwencode") {
-        // Qwen Code emits Claude-style PascalCase event names under the `hooks`
-        // key of .qwen/settings.json: canonical `sessionStart` → `SessionStart`,
-        // `stop` → `Stop`. See CANONICAL_TO_QWENCODE_EVENT_NAMES in
-        // src/types/hooks.ts.
-        const parsed = JSON.parse(generatedContent);
-        expect(parsed.hooks.SessionStart).toBeDefined();
-        expect(parsed.hooks.Stop).toBeDefined();
-        expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/session-start.sh");
-        expect(JSON.stringify(parsed.hooks)).toContain(".rulesync/hooks/audit.sh");
+      } else if (target in hooksKeyedEventNames) {
+        assertHooksKeyedEvents({ target, parsed: JSON.parse(generatedContent) });
       } else {
         assertHookCommandsPreserved(JSON.parse(generatedContent));
       }
     },
   );
+
+  it("should generate crush hooks in the user config", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    const hooksContent = JSON.stringify(
+      {
+        version: 1,
+        root: true,
+        hooks: {
+          preToolUse: [{ command: ".rulesync/hooks/audit.sh", matcher: "bash" }],
+        },
+      },
+      null,
+      2,
+    );
+    await writeFileContent(join(projectDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH), hooksContent);
+
+    await runGenerate({
+      target: "crush",
+      features: "hooks",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const parsed = JSON.parse(
+      await readFileContent(join(homeDir, ".config", "crush", "crush.json")),
+    );
+    expect(parsed.hooks.PreToolUse).toEqual([
+      { matcher: "bash", command: ".rulesync/hooks/audit.sh" },
+    ]);
+  });
+
+  it("should generate pool hooks in the user settings", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    const hooksContent = JSON.stringify(
+      {
+        version: 1,
+        root: true,
+        hooks: {
+          sessionStart: [{ command: "~/hooks/session-start.sh" }],
+        },
+      },
+      null,
+      2,
+    );
+    await writeFileContent(join(projectDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH), hooksContent);
+
+    await runGenerate({
+      target: "pool",
+      features: "hooks",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const parsed = load(
+      await readFileContent(join(homeDir, ".config", "poolside", "settings.yaml")),
+    );
+    expect(parsed).toEqual({
+      hooks: { SessionStart: [{ matcher: "*", command: "~/hooks/session-start.sh" }] },
+    });
+  });
 
   it("should generate devin hooks in home directory", async () => {
     const projectDir = getProjectDir();
@@ -949,6 +1547,36 @@ describe("E2E: hooks (global mode)", () => {
     }
   });
 
+  it("should emit Kimi Code hook commands verbatim when runFromSourceDirectory is false", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(projectDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH),
+      JSON.stringify({
+        version: 1,
+        hooks: {
+          preToolUse: [{ matcher: "Bash", command: "$HOME/hooks/guard.py" }],
+        },
+        "kimi-code": { runFromSourceDirectory: false },
+      }),
+    );
+
+    await runGenerate({
+      target: "kimi-code",
+      features: "hooks",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const parsed = smolToml.parse(
+      await readFileContent(join(homeDir, ".kimi-code", "config.toml")),
+    ) as { hooks: Array<{ event: string; command: string; matcher?: string }> };
+    expect(parsed.hooks).toEqual([
+      { event: "PreToolUse", command: "$HOME/hooks/guard.py", matcher: "Bash" },
+    ]);
+  });
+
   it("should import Kimi Code hooks from the shared user config", async () => {
     const homeDir = getHomeDir();
 
@@ -1004,6 +1632,49 @@ describe("E2E: hooks (global mode)", () => {
     const regeneratedStop = regenerated.hooks.find(({ event }) => event === "Stop");
     expect(regeneratedStop?.command).toContain("RULESYNC_KIMI_HOOK_CWD=1");
     expect(regeneratedStop?.command).toContain("cd -- '/opt/company/security-hooks' && ./gate.sh");
+  });
+
+  it("should generate codewhale hooks into the [hooks] table of the user config", async () => {
+    const projectDir = getProjectDir();
+    const homeDir = getHomeDir();
+
+    await writeFileContent(
+      join(homeDir, ".codewhale", "config.toml"),
+      [
+        'model = "deepseek-v4"',
+        "",
+        "[hooks]",
+        "enabled = false",
+        "default_timeout_secs = 20",
+        "",
+      ].join("\n"),
+    );
+    await writeFileContent(
+      join(projectDir, RULESYNC_HOOKS_RELATIVE_FILE_PATH),
+      JSON.stringify({
+        version: 1,
+        hooks: { stop: [{ command: ".rulesync/hooks/audit.sh" }] },
+      }),
+    );
+
+    await runGenerate({
+      target: "codewhale",
+      features: "hooks",
+      global: true,
+      env: { HOME_DIR: homeDir },
+    });
+
+    const parsed = smolToml.parse(
+      await readFileContent(join(homeDir, ".codewhale", "config.toml")),
+    );
+    // Unrelated settings and the `[hooks]` table's own settings survive.
+    expect(parsed.model).toBe("deepseek-v4");
+    expect(parsed.hooks).toEqual({
+      enabled: false,
+      default_timeout_secs: 20,
+      hooks: [{ event: "turn_end", command: ".rulesync/hooks/audit.sh" }],
+    });
+    expect(await fileExists(join(homeDir, ".codewhale", "hooks.toml"))).toBe(false);
   });
 
   it("should generate vibe hooks in home directory", async () => {

@@ -107,16 +107,21 @@ export class AugmentcodeCommand extends ToolCommand {
     rulesyncCommand,
     validate = true,
     global = false,
+    logger,
   }: ToolCommandFromRulesyncCommandParams): AugmentcodeCommand {
     const rulesyncFrontmatter = rulesyncCommand.getFrontmatter();
 
     // Merge augmentcode-specific fields from rulesync frontmatter
     const augmentcodeFields = rulesyncFrontmatter.augmentcode ?? {};
 
-    const augmentcodeFrontmatter: AugmentcodeCommandFrontmatter = {
-      description: rulesyncFrontmatter.description,
-      ...augmentcodeFields,
-    };
+    const augmentcodeFrontmatter = this.sanitizeFrontmatter({
+      frontmatter: {
+        description: rulesyncFrontmatter.description,
+        ...augmentcodeFields,
+      },
+      relativeFilePath: rulesyncCommand.getRelativeFilePath(),
+      logger,
+    });
 
     // Generate proper file content with Augment Code specific frontmatter
     const body = rulesyncCommand.getBody();
@@ -131,6 +136,21 @@ export class AugmentcodeCommand extends ToolCommand {
       relativeFilePath: rulesyncCommand.getRelativeFilePath(),
       validate,
     });
+  }
+
+  /**
+   * Hook for subclasses whose destination honors fewer frontmatter fields.
+   * The `.augment/commands/` loader reads every documented field, so this is the
+   * identity.
+   */
+  protected static sanitizeFrontmatter({
+    frontmatter,
+  }: {
+    frontmatter: AugmentcodeCommandFrontmatter;
+    relativeFilePath: string;
+    logger?: Logger;
+  }): AugmentcodeCommandFrontmatter {
+    return frontmatter;
   }
 
   validate(): ValidationResult {
@@ -205,7 +225,7 @@ export class AugmentcodeCommand extends ToolCommand {
     logger?: Logger;
   } = {}): Promise<AugmentcodeCommand[]> {
     const rootDir = join(outputRoot, AUGMENTCODE_AGENTS_COMMANDS_DIR_PATH);
-    const filePaths = await findFilesByGlobs(join(rootDir, "**", "*.md"));
+    const filePaths = await findFilesByGlobs("**/*.md", { cwd: rootDir });
 
     const commands = await Promise.all(
       filePaths.map(async (filePath) => {

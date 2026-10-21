@@ -3,6 +3,7 @@ import { basename, dirname, join } from "node:path";
 import { encode } from "@toon-format/toon";
 import { z } from "zod/mini";
 
+import { ANTIGRAVITY_SKILLS_DIR_PATH } from "../../constants/antigravity-paths.js";
 import {
   CURATED_SKILLS_FEATURE_SUBDIR,
   SKILLS_FEATURE_SUBDIR,
@@ -18,7 +19,7 @@ import {
 } from "../../types/feature-processor.js";
 import { skillsProcessorToolTargetTuple } from "../../types/tool-target-tuples.js";
 import { ToolTarget } from "../../types/tool-targets.js";
-import { stripControlCharacters } from "../../utils/control-characters.js";
+import { quoteForLog, stripControlCharacters } from "../../utils/control-characters.js";
 import { formatError } from "../../utils/error.js";
 import {
   assertWritablePathInsideRoot,
@@ -29,36 +30,56 @@ import {
 } from "../../utils/file.js";
 import type { Logger } from "../../utils/logger.js";
 import { warnOnceWithFallback } from "../../utils/logger.js";
+import { antigravityCommandSkillNameExists } from "../commands/antigravity-command-skill-name.js";
 import { AgentsmdSkill } from "./agentsmd-skill.js";
 import { AgentsSkillsSkill } from "./agentsskills-skill.js";
 import { AiassistantSkill } from "./aiassistant-skill.js";
 import { AmpSkill } from "./amp-skill.js";
+import { AndroidstudioSkill } from "./androidstudio-skill.js";
 import { AntigravityCliSkill } from "./antigravity-cli-skill.js";
 import { AntigravityIdeSkill } from "./antigravity-ide-skill.js";
 import { AntigravityPluginSkill } from "./antigravity-plugin-skill.js";
+import { AugmentcodePluginSkill } from "./augmentcode-plugin-skill.js";
 import { AugmentcodeSkill } from "./augmentcode-skill.js";
+import { BobSkill } from "./bob-skill.js";
 import { ClaudecodePluginSkill } from "./claudecode-plugin-skill.js";
 import { ClaudecodeSkill } from "./claudecode-skill.js";
 import { ClineSkill } from "./cline-skill.js";
+import { CodebuddySkill } from "./codebuddy-skill.js";
+import { CodewhaleSkill } from "./codewhale-skill.js";
 import { CodexCliSkill } from "./codexcli-skill.js";
+import { CommandcodeSkill } from "./commandcode-skill.js";
+import { ContinueSkill } from "./continue-skill.js";
 import { CopilotSkill } from "./copilot-skill.js";
 import { CopilotcliSkill } from "./copilotcli-skill.js";
+import { CortexcodeSkill } from "./cortexcode-skill.js";
+import { CrushSkill } from "./crush-skill.js";
 import { CursorSkill } from "./cursor-skill.js";
 import { DeepagentsSkill } from "./deepagents-skill.js";
+import { DevinPluginSkill } from "./devin-plugin-skill.js";
 import { DevinSkill } from "./devin-skill.js";
+import { DshSkill } from "./dsh-skill.js";
 import { FactorydroidSkill } from "./factorydroid-skill.js";
+import { FirebenderSkill } from "./firebender-skill.js";
+import { GitlabduoSkill } from "./gitlabduo-skill.js";
 import { GooseSkill } from "./goose-skill.js";
 import { GrokcliSkill } from "./grokcli-skill.js";
 import { HermesagentSkill } from "./hermesagent-skill.js";
 import { JunieSkill } from "./junie-skill.js";
 import { KiloSkill } from "./kilo-skill.js";
+import { KimiCodePluginSkill } from "./kimi-code-plugin-skill.js";
 import { KimiCodeSkill } from "./kimi-code-skill.js";
 import { KiroCliSkill } from "./kiro-cli-skill.js";
 import { KiroIdeSkill } from "./kiro-ide-skill.js";
 import { KiroSkill } from "./kiro-skill.js";
+import { LettacodeSkill } from "./lettacode-skill.js";
+import { MimocodeSkill } from "./mimocode-skill.js";
 import { MusecodeSkill } from "./musecode-skill.js";
+import { OmpSkill } from "./omp-skill.js";
 import { OpenCodeSkill } from "./opencode-skill.js";
 import { PiSkill } from "./pi-skill.js";
+import { PoolSkill } from "./pool-skill.js";
+import { QoderSkill } from "./qoder-skill.js";
 import { QwencodeSkill } from "./qwencode-skill.js";
 import { ReasonixSkill } from "./reasonix-skill.js";
 import { ReplitSkill } from "./replit-skill.js";
@@ -67,6 +88,7 @@ import { RovodevSkill } from "./rovodev-skill.js";
 import { RulesyncSkill } from "./rulesync-skill.js";
 import { SimulatedSkill } from "./simulated-skill.js";
 import { getLocalSkillDirNames, isAddressableSkillName } from "./skills-utils.js";
+import { TabnineSkill } from "./tabnine-skill.js";
 import { TaktSkill } from "./takt-skill.js";
 import {
   ToolSkill,
@@ -79,8 +101,13 @@ import {
   toolSkillImportRoots,
   toolSkillSearchRoots,
 } from "./tool-skill.js";
+import { TraeSkill } from "./trae-skill.js";
+import { VibePluginSkill } from "./vibe-plugin-skill.js";
 import { VibeSkill } from "./vibe-skill.js";
 import { WarpSkill } from "./warp-skill.js";
+import { XumSkill } from "./xum-skill.js";
+import { ZcodePluginSkill } from "./zcode-plugin-skill.js";
+import { ZcodeSkill } from "./zcode-skill.js";
 import { ZedSkill } from "./zed-skill.js";
 import { ZoocodeSkill } from "./zoocode-skill.js";
 
@@ -109,6 +136,13 @@ type ToolSkillFactory = {
     getConfiguredImportRoots?(params: {
       outputRoot: string;
       global: boolean;
+      /**
+       * For reporting a root that was discovered but cannot be read. A root
+       * that simply is not there is not worth a word; one that a scan found and
+       * then had to drop is, because the skills in it are silently not
+       * imported.
+       */
+      logger?: Logger;
     }): Promise<Array<{ outputRoot: string; relativeDirPath: string }>>;
     /**
      * Optional content-aware ownership filter for tools whose skills directory
@@ -129,7 +163,30 @@ type ToolSkillFactory = {
        * overlay-only command still shadows the same-named skill.
        */
       inputRoots: readonly string[];
+      /**
+       * The scope being processed, for hooks whose co-owner exists in only one
+       * of them (Factory Droid's checks output is project-only, so the same
+       * directory name is an ordinary skill in global mode).
+       */
+      global: boolean;
     }): Promise<boolean>;
+    /**
+     * Optional write-direction counterpart of `isDirOwned`: the reason this
+     * tool must not emit a skill directory of this name, or `null` when it
+     * may. A name another feature owns must not be written from a rulesync
+     * skill, because `isDirOwned` then refuses to delete it again and the
+     * directory outlives the source it came from — so the two hooks have to
+     * agree, and they take the same parameters to make keeping them in step
+     * straightforward. The reason is logged verbatim, so it must not embed
+     * anything read off disk.
+     */
+    getDirWriteBlockReason?(params: {
+      outputRoot: string;
+      relativeDirPath: string;
+      dirName: string;
+      inputRoots: readonly string[];
+      global: boolean;
+    }): Promise<string | null>;
     /**
      * Opt-in name policy for the flat half of the `--delete` orphan sweep, for
      * a tool that writes one `<name>.md` per skill into a root it shares with
@@ -220,10 +277,20 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "androidstudio",
+    {
+      // Gemini in Android Studio (Quail 1+) loads Agent Skills from
+      // `.android-studio/skills/` at the project root or in the home directory.
+      // https://developer.android.com/studio/gemini/skills
+      class: AndroidstudioSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
     "amp",
     {
       // Amp reads Agent Skills from `.agents/skills/` (project) and
-      // `~/.config/agents/skills/` (global). https://ampcode.com/manual
+      // `~/.config/agents/skills/` (global). https://ampcode.com/docs/customize/skills
       class: AmpSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
@@ -260,10 +327,38 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "augmentcode-plugin",
+    {
+      // `<plugin>/skills/<name>/SKILL.md`. https://docs.augmentcode.com/cli/plugins
+      class: AugmentcodePluginSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: false },
+    },
+  ],
+  [
+    "bob",
+    {
+      // IBM Bob skills are Anthropic-style Agent Skills directories
+      // (<name>/SKILL.md) under .bob/skills/ (project) and ~/.bob/skills/
+      // (global). https://bob.ibm.com/docs/ide/features/skills
+      class: BobSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
     "claudecode",
     {
       class: ClaudecodeSkill,
-      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+      // Claude Code does not let one broken SKILL.md stop the others from
+      // loading ("If the YAML between the markers doesn't parse, the skill
+      // still loads with no fields set"), so import skips such a skill with a
+      // warning instead of aborting the run — and every feature after skills.
+      // https://code.claude.com/docs/en/skills
+      meta: {
+        supportsProject: true,
+        supportsSimulated: false,
+        supportsGlobal: true,
+        lenientImport: true,
+      },
     },
   ],
   [
@@ -288,9 +383,55 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "codebuddy",
+    {
+      class: CodebuddySkill,
+      // CodeBuddy Code reads <name>/SKILL.md directories from
+      // .codebuddy/skills/ (project) and ~/.codebuddy/skills/ (user).
+      // https://www.codebuddy.ai/docs/cli/skills
+      meta: {
+        supportsProject: true,
+        supportsSimulated: false,
+        supportsGlobal: true,
+      },
+    },
+  ],
+  [
+    "codewhale",
+    {
+      // Codewhale reads <name>/SKILL.md directories from .codewhale/skills/
+      // (project) and ~/.codewhale/skills/ (user).
+      // https://github.com/Hmbown/Codewhale/blob/main/docs/SKILLS.md
+      class: CodewhaleSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
     "codexcli",
     {
       class: CodexCliSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "commandcode",
+    {
+      // Command Code skills are Anthropic-style Agent Skills directories
+      // (<name>/SKILL.md) under .commandcode/skills/ (project) and
+      // ~/.commandcode/skills/ (user).
+      // https://commandcode.ai/docs/skills
+      class: CommandcodeSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "continue",
+    {
+      // Continue skills are Anthropic-style Agent Skills directories
+      // (<name>/SKILL.md) under .continue/skills/ (project) and
+      // ~/.continue/skills/ (user).
+      // https://github.com/continuedev/continue/blob/5522c6f44ca0ac3528b37244818fbfa39b5af470/extensions/cli/src/util/loadMarkdownSkills.ts
+      class: ContinueSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
   ],
@@ -309,6 +450,26 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
       // Copilot CLI reads project skills from `.github/skills/` and personal
       // skills from `~/.copilot/skills/`, so it supports both project and global.
       class: CopilotcliSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "cortexcode",
+    {
+      // Snowflake Cortex Code skills are Anthropic-style Agent Skills
+      // directories (<name>/SKILL.md) under .cortex/skills/ (project) and
+      // ~/.snowflake/cortex/skills/ (user).
+      // https://docs.snowflake.com/en/user-guide/cortex-code/extensibility
+      class: CortexcodeSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "crush",
+    {
+      // Crush auto-discovers project skills from `.crush/skills/` and global
+      // skills from `~/.config/crush/skills/` (or `$CRUSH_SKILLS_DIR`).
+      class: CrushSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
   ],
@@ -338,10 +499,20 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "firebender",
+    {
+      // Firebender reads <name>/SKILL.md directories from .firebender/skills/
+      // (project) and ~/.firebender/skills/ (user).
+      // https://docs.firebender.com/api-reference/skills
+      class: FirebenderSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
     "goose",
     {
       class: GooseSkill,
-      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: false },
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
   ],
   [
@@ -349,6 +520,27 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     {
       class: HermesagentSkill,
       meta: { supportsProject: false, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "gitlabduo",
+    {
+      // GitLab Duo reads project skills from the cross-tool `.agents/skills/`
+      // directory and a top-level `skills/` directory (`.agents/skills/` wins
+      // on a name clash), and user skills from `~/.gitlab/duo/skills/` (CLI
+      // only, behind `--enable-global-skills`). rulesync writes the former and
+      // imports from both.
+      // https://docs.gitlab.com/user/duo_agent_platform/customize/agent_skills/
+      class: GitlabduoSkill,
+      meta: {
+        supportsProject: true,
+        supportsSimulated: false,
+        supportsGlobal: true,
+        // The import-only `skills/` is a common, unrelated directory name, so a
+        // malformed SKILL.md there is skipped on import rather than aborting
+        // the run.
+        lenientImport: true,
+      },
     },
   ],
   [
@@ -386,10 +578,30 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "lettacode",
+    {
+      // Letta Code discovers Agent Skills (<name>/SKILL.md) from the shared
+      // `.agents/skills/` root (project) and `~/.letta/skills/` (user).
+      // https://docs.letta.com/configuration/skills/index.md
+      class: LettacodeSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
     "kimi-code",
     {
       class: KimiCodeSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "kimi-code-plugin",
+    {
+      // `<plugin>/skills/<name>/SKILL.md`, read when the manifest declares
+      // `"skills": "./skills/"`.
+      // https://github.com/MoonshotAI/kimi-code/blob/%40moonshot-ai/kimi-code%402.1.1/docs/en/customization/plugins.md
+      class: KimiCodePluginSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: false },
     },
   ],
   [
@@ -416,6 +628,13 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "mimocode",
+    {
+      class: MimocodeSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
     "musecode",
     {
       // Muse Code reads Agent Skills from `.agents/skills/` (project) and from
@@ -423,6 +642,13 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
       // XDG-default `~/.config/muse/skills` is emitted at global scope.
       // https://dev.meta.ai/docs/muse-code/extending.md
       class: MusecodeSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "omp",
+    {
+      class: OmpSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
   ],
@@ -437,6 +663,27 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     "pi",
     {
       class: PiSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "pool",
+    {
+      // Pool discovers Agent Skills (`<name>/SKILL.md`) from `.poolside/skills/`
+      // (project) and `~/.config/poolside/skills/` (global). It also scans the
+      // shared `.agents/skills/` roots, which belong to the agentsskills target.
+      // https://docs.poolside.ai/skills
+      class: PoolSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "qoder",
+    {
+      // Qoder skills are directories (`<name>/SKILL.md`) under `.qoder/skills/`
+      // (project) / `~/.qoder/skills/` (user), shared by the IDE and the CLI.
+      // https://docs.qoder.com/en/cli/04-extending-qoder-cli/Skills
+      class: QoderSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
   ],
@@ -494,9 +741,29 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "tabnine",
+    {
+      // Tabnine CLI skills are Anthropic-style Agent Skills directories
+      // (<name>/SKILL.md) under .tabnine/agent/skills/ (project) and
+      // ~/.tabnine/agent/skills/ (user).
+      // https://docs.tabnine.com/main/getting-started/tabnine-cli/features/agent-skills
+      class: TabnineSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
     "takt",
     {
       class: TaktSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "trae",
+    {
+      // Trae reads Agent Skills from `.trae/skills/` (project) and
+      // `~/.trae/skills/` (user). https://docs.trae.ai/ide/skills?_lang=en
+      class: TraeSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
   ],
@@ -511,9 +778,28 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "vibe-plugin",
+    {
+      // `<plugin>/skills/<name>/SKILL.md`, parsed like `.vibe/skills/`.
+      // https://github.com/mistralai/mistral-vibe/blob/v2.25.8/vibe/core/plugins/_native.py
+      class: VibePluginSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: false },
+    },
+  ],
+  [
     "warp",
     {
       class: WarpSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "xum",
+    {
+      // Xum skills are directories (`<name>/SKILL.md`) under `.xum/skills/`
+      // (project) / `~/.xum/skills/` (user).
+      // https://xum.cdr.dev/agents/agent-skills
+      class: XumSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
   ],
@@ -525,9 +811,40 @@ export const toolSkillFactories = new Map<SkillsProcessorToolTarget, ToolSkillFa
     },
   ],
   [
+    "devin-plugin",
+    {
+      // `<plugin>/skills/<name>/SKILL.md`.
+      // https://docs.devin.ai/cli/extensibility/plugins/overview
+      class: DevinPluginSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: false },
+    },
+  ],
+  [
+    "zcode",
+    {
+      class: ZcodeSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "zcode-plugin",
+    {
+      // `<plugin>/skills/<name>/SKILL.md`. https://zcode.z.ai/en/docs/plugin
+      class: ZcodePluginSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: false },
+    },
+  ],
+  [
     "zed",
     {
       class: ZedSkill,
+      meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
+    },
+  ],
+  [
+    "dsh",
+    {
+      class: DshSkill,
       meta: { supportsProject: true, supportsSimulated: false, supportsGlobal: true },
     },
   ],
@@ -612,29 +929,69 @@ export class SkillsProcessor extends DirFeatureProcessor {
 
     const factory = this.getFactory(this.toolTarget);
 
-    const toolSkills = rulesyncSkills
-      .map((rulesyncSkill) => {
-        const rulesyncFrontmatter = rulesyncSkill.getFrontmatter();
-        const isClaudecodeScheduledTask =
-          rulesyncFrontmatter.claudecode?.["scheduled-task"] === true;
-        if (
-          isClaudecodeScheduledTask &&
-          this.toolTarget !== "claudecode" &&
-          this.toolTarget !== "claudecode-legacy"
-        ) {
-          return null;
-        }
-        if (!factory.class.isTargetedByRulesyncSkill(rulesyncSkill)) {
-          return null;
-        }
-        return factory.class.fromRulesyncSkill({
-          outputRoot: this.outputRoot,
-          rulesyncSkill: rulesyncSkill,
-          global: this.global,
-          logger: this.logger,
-        });
-      })
-      .filter((skill): skill is ToolSkill => skill !== null);
+    const toolSkills = (
+      await Promise.all(
+        rulesyncSkills.map(async (rulesyncSkill) => {
+          const rulesyncFrontmatter = rulesyncSkill.getFrontmatter();
+          const isClaudecodeScheduledTask =
+            rulesyncFrontmatter.claudecode?.["scheduled-task"] === true;
+          if (
+            isClaudecodeScheduledTask &&
+            this.toolTarget !== "claudecode" &&
+            this.toolTarget !== "claudecode-legacy"
+          ) {
+            return null;
+          }
+          if (!factory.class.isTargetedByRulesyncSkill(rulesyncSkill)) {
+            return null;
+          }
+          const dirName = rulesyncSkill.getDirName();
+          if (isClaudecodeScheduledTask && !this.global) {
+            // Claude Code reads scheduled tasks only from the user config
+            // directory (~/.claude/scheduled-tasks/ or CLAUDE_CONFIG_DIR); no
+            // project-level location is documented, so a project-scope copy
+            // would never fire. Same policy as the user-scope-only sandbox keys
+            // in claudecode-permissions.ts: warn and skip instead of writing a
+            // file that looks live and does nothing.
+            // @see https://code.claude.com/docs/en/desktop-scheduled-tasks
+            this.logger.warn(
+              `Skipping skill ${quoteForLog(dirName)} for '${this.toolTarget}': ` +
+                "'claudecode.scheduled-task' skills are only read from the user " +
+                "config directory (~/.claude/scheduled-tasks/), so nothing is written " +
+                "at project scope. Generate it with --global instead; a stale copy an " +
+                "earlier generate left under .claude/scheduled-tasks/ is removed by a " +
+                "generate with --delete.",
+            );
+            return null;
+          }
+          const dirWriteBlockReason = await factory.class.getDirWriteBlockReason?.({
+            outputRoot: this.outputRoot,
+            relativeDirPath: factory.class.getSettablePaths({ global: this.global })
+              .relativeDirPath,
+            dirName,
+            inputRoots: this.inputRoots,
+            global: this.global,
+          });
+          if (dirWriteBlockReason !== undefined && dirWriteBlockReason !== null) {
+            // Another feature owns this output directory, so the skills feature
+            // never deletes it either: writing it here would leave a directory
+            // that outlives the rulesync skill it came from. The name is quoted
+            // and stripped because whoever wrote the repository chose it.
+            this.logger.warn(
+              `Skipping skill ${quoteForLog(dirName)} for ` +
+                `'${this.toolTarget}': ${dirWriteBlockReason}`,
+            );
+            return null;
+          }
+          return factory.class.fromRulesyncSkill({
+            outputRoot: this.outputRoot,
+            rulesyncSkill: rulesyncSkill,
+            global: this.global,
+            logger: this.logger,
+          });
+        }),
+      )
+    ).filter((skill): skill is ToolSkill => skill !== null);
 
     return toolSkills;
   }
@@ -782,6 +1139,7 @@ export class SkillsProcessor extends DirFeatureProcessor {
       ? await factory.class.getConfiguredImportRoots({
           outputRoot: this.outputRoot,
           global: this.global,
+          logger: this.logger,
         })
       : [];
     const configuredRootPaths = new Set(configuredRoots.map((root) => root.relativeDirPath));
@@ -828,8 +1186,9 @@ export class SkillsProcessor extends DirFeatureProcessor {
       const isConfiguredRoot = configuredRootPaths.has(relativeDirPath);
       // A root the tool's own config points at is arbitrary user territory,
       // the Agent Skills interop roots hold foreign-authored skills, and tools
-      // flagged `lenientImport` follow the Agent Skills guide's
-      // lenient-validation prescription for every root — in all three cases
+      // flagged `lenientImport` follow a lenient-validation rule for every root
+      // (the Agent Skills guide's prescription, or the tool's own loader keeping
+      // the other skills when one is broken, as Claude Code does) — in all three cases
       // one bad skill must not take the whole import (and every feature after
       // it) down, so it is skipped with a warning instead.
       const isLenientRoot =
@@ -882,7 +1241,7 @@ export class SkillsProcessor extends DirFeatureProcessor {
                 throw error;
               }
               this.logger.warn(
-                `Skipping ${JSON.stringify(stripControlCharacters(sourcePath))}: ` +
+                `Skipping ${quoteForLog(sourcePath)}: ` +
                   // The error names the same path, so it is stripped too.
                   stripControlCharacters(formatError(error)),
               );
@@ -900,7 +1259,7 @@ export class SkillsProcessor extends DirFeatureProcessor {
       if (!factory.class.fromFlatFile) {
         continue;
       }
-      const fromFlatFile = factory.class.fromFlatFile;
+      const fromFlatFile = factory.class.fromFlatFile.bind(factory.class);
       const directoryStems = new Set(ownedDirNames);
       const flatFileNames = this.keepAddressableNames({
         // The suffix is applied while reading rather than after, so a `.md`
@@ -932,7 +1291,7 @@ export class SkillsProcessor extends DirFeatureProcessor {
                 throw error;
               }
               this.logger.warn(
-                `Skipping ${JSON.stringify(stripControlCharacters(sourcePath))}: ` +
+                `Skipping ${quoteForLog(sourcePath)}: ` +
                   // The error names the same path, so it is stripped too.
                   stripControlCharacters(formatError(error)),
               );
@@ -988,7 +1347,7 @@ export class SkillsProcessor extends DirFeatureProcessor {
       // quoted string means.
       warnOnceWithFallback(
         this.logger,
-        `Skipping ${JSON.stringify(stripControlCharacters(join(dirPath, name)))}: a ${consequence}`,
+        `Skipping ${quoteForLog(join(dirPath, name))}: a ${consequence}`,
       );
       return false;
     });
@@ -1014,6 +1373,23 @@ export class SkillsProcessor extends DirFeatureProcessor {
     relativeDirPath: string;
     dirName: string;
   }): Promise<boolean> {
+    // Antigravity commands are emitted into the project `.agents/skills/` tree
+    // that several other tools share, so a directory one of them emits is not
+    // a skill for any of those tools, even in a run without the commands
+    // feature or the Antigravity targets.
+    if (
+      !this.global &&
+      relativeDirPath === ANTIGRAVITY_SKILLS_DIR_PATH &&
+      (await antigravityCommandSkillNameExists({
+        inputRoots: this.inputRoots,
+        dirName,
+        toolTargets: ["antigravity-ide", "antigravity-cli"],
+        skillsRelativeDirPath: relativeDirPath,
+        global: false,
+      }))
+    ) {
+      return false;
+    }
     if (factory.class.isDirOwned === undefined) {
       return true;
     }
@@ -1022,6 +1398,7 @@ export class SkillsProcessor extends DirFeatureProcessor {
       relativeDirPath,
       dirName,
       inputRoots: this.inputRoots,
+      global: this.global,
     });
   }
 
@@ -1030,6 +1407,15 @@ export class SkillsProcessor extends DirFeatureProcessor {
    * path and vetted as writable inside this run's output root. Shared by the
    * two halves of the orphan sweep so both look in exactly the same places,
    * under exactly the same guard.
+   *
+   * A root that fails the guard — a symbolic link, even one that stays inside
+   * the output root, such as a dotfiles checkout linked from the home
+   * directory — is left out with a warning rather than failing the run. The
+   * write path already wrote through such a link, and the sweep runs after
+   * those writes land, so throwing here would report a failure for a run whose
+   * output is in place. Sweeping through the link is not an option either: it
+   * can lead to a directory rulesync does not manage, and its entries would be
+   * deleted as orphans.
    */
   private async loadExistingSkillsRoots(
     paths: ToolSkillSettablePaths,
@@ -1040,10 +1426,18 @@ export class SkillsProcessor extends DirFeatureProcessor {
       if (!(await directoryExists(skillsDirPath))) {
         continue;
       }
-      await assertWritablePathInsideRoot({
-        rootPath: this.outputRoot,
-        targetPath: skillsDirPath,
-      });
+      try {
+        await assertWritablePathInsideRoot({
+          rootPath: this.outputRoot,
+          targetPath: skillsDirPath,
+        });
+      } catch (error) {
+        this.logger.warn(
+          `Skipping the orphan sweep for ${quoteForLog(skillsDirPath)}; nothing under it is ` +
+            `deleted: ${stripControlCharacters(formatError(error))}`,
+        );
+        continue;
+      }
       existingRoots.push({ root, skillsDirPath });
     }
     return existingRoots;

@@ -2,10 +2,7 @@ import { join } from "node:path";
 
 import { z } from "zod/mini";
 
-import {
-  OPENCODE_AGENTS_DIR_PATH,
-  OPENCODE_GLOBAL_AGENTS_DIR_PATH,
-} from "../../constants/opencode-paths.js";
+import { OPENCODE_LAYOUT, type OpencodeLayout } from "../../constants/opencode-paths.js";
 import { ValidationResult } from "../../types/ai-file.js";
 import { ToolTarget } from "../../types/tool-targets.js";
 import { formatError } from "../../utils/error.js";
@@ -13,8 +10,9 @@ import { readFileContent } from "../../utils/file.js";
 import { parseFrontmatter, stringifyFrontmatter } from "../../utils/frontmatter.js";
 import {
   asOpencodeEntries,
-  getOpencodeConfigDir,
-  readOpencodeConfig,
+  getOpencodeAgentEntries,
+  mergeOpencodeEntryLayers,
+  readOpencodeConfigLayers,
   resolveOpencodeFileTemplate,
 } from "../opencode-config.js";
 import { OpenCodeStyleSubagent, OpenCodeStyleSubagentParams } from "./opencode-style-subagent.js";
@@ -49,8 +47,20 @@ export const OpenCodeSubagentFrontmatterSchema = z.looseObject({
   top_p: z.optional(z.number()),
   prompt: z.optional(z.string()),
   disable: z.optional(z.boolean()),
+  // Hides a subagent from the `@` autocomplete menu; it stays invocable through
+  // the task tool.
+  hidden: z.optional(z.boolean()),
+  // A hex color or a theme color name, shown in the UI.
+  color: z.optional(z.string()),
+  // Maximum agentic iterations before the agent must answer in text. It
+  // supersedes the deprecated `maxSteps`, which still round-trips as an
+  // unknown field.
+  steps: z.optional(z.number().check(z.int(), z.gte(1))),
+  // Default model variant for the agent (e.g. a provider reasoning preset).
+  variant: z.optional(z.string()),
   // OpenCode accepts a per-tool enable map (`{ <tool>: boolean }`) as well as a
-  // per-tool permission object, so both are kept permissive.
+  // per-tool permission object, so both are kept permissive. OpenCode marks
+  // `tools` as deprecated in favor of `permission`, but still reads it.
   tools: z.optional(z.record(z.string(), z.unknown())),
   permission: z.optional(z.union([z.string(), z.record(z.string(), z.unknown())])),
 });
@@ -80,7 +90,45 @@ async function resolveOpenCodeAgentPrompt({
   return resolveOpencodeFileTemplate({ value: prompt, configDir });
 }
 
+/**
+ * Resolves the `prompt` of each inline agent entry of one config file against
+ * that file's directory, so entries from several files can be merged without
+ * losing where a `"{file:./path}"` reference points.
+ */
+async function resolveOpenCodeAgentPrompts({
+  entries,
+  configDir,
+}: {
+  entries: Record<string, unknown> | null;
+  configDir: string;
+}): Promise<Record<string, unknown> | null> {
+  if (entries === null) {
+    return null;
+  }
+  const resolved: Record<string, unknown> = {};
+  for (const [name, rawEntry] of Object.entries(entries)) {
+    const entry = asOpencodeEntries(rawEntry);
+    const value =
+      entry === null || !Object.hasOwn(entry, "prompt")
+        ? rawEntry
+        : {
+            ...entry,
+            prompt: await resolveOpenCodeAgentPrompt({ prompt: entry.prompt, configDir }),
+          };
+    Object.defineProperty(resolved, name, {
+      value,
+      enumerable: true,
+      configurable: true,
+      writable: true,
+    });
+  }
+  return resolved;
+}
+
 export class OpenCodeSubagent extends OpenCodeStyleSubagent {
+  /** Directory layout; OpenCode forks (MiMo Code) override it. */
+  protected static readonly layout: OpencodeLayout = OPENCODE_LAYOUT;
+
   declare protected readonly frontmatter: OpenCodeSubagentFrontmatter;
 
   constructor(params: OpenCodeSubagentParams) {
@@ -102,8 +150,8 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
     super({ ...params, frontmatter, validate: false });
   }
 
-  protected getToolTarget(): Extract<ToolTarget, "opencode" | "kilo"> {
-    return "opencode";
+  protected getToolTarget(): Extract<ToolTarget, "opencode" | "kilo" | "mimocode"> {
+    return (this.constructor as typeof OpenCodeSubagent).layout.toolTarget;
   }
 
   getFrontmatter(): OpenCodeSubagentFrontmatter {
@@ -137,7 +185,7 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
     // `agent/` is deprecated upstream (kept only for backwards compatibility),
     // so rulesync emits the plural form to match the documented convention.
     return {
-      relativeDirPath: global ? OPENCODE_GLOBAL_AGENTS_DIR_PATH : OPENCODE_AGENTS_DIR_PATH,
+      relativeDirPath: join(global ? this.layout.globalDir : this.layout.dir, "agents"),
     };
   }
 
@@ -148,7 +196,7 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
     global = false,
   }: ToolSubagentFromRulesyncSubagentParams): ToolSubagent {
     const rulesyncFrontmatter = rulesyncSubagent.getFrontmatter();
-    const opencodeSection = rulesyncFrontmatter.opencode ?? {};
+    const opencodeSection = rulesyncFrontmatter[this.layout.toolTarget] ?? {};
 
     const parseResult = OpenCodeSubagentFrontmatterSchema.safeParse({
       ...opencodeSection,
@@ -167,7 +215,7 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
     const fileContent = stringifyFrontmatter(body, opencodeFrontmatter);
     const paths = this.getSettablePaths({ global });
 
-    return new OpenCodeSubagent({
+    return new this({
       outputRoot,
       frontmatter: opencodeFrontmatter,
       body,
@@ -182,13 +230,15 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
   static isTargetedByRulesyncSubagent(rulesyncSubagent: RulesyncSubagent): boolean {
     return this.isTargetedByRulesyncSubagentDefault({
       rulesyncSubagent,
-      toolTarget: "opencode",
+      toolTarget: this.layout.toolTarget,
     });
   }
 
   /**
-   * Imports agents defined inline in `opencode.json` / `opencode.jsonc` under
-   * the top-level `agent` key (in addition to the Markdown files under
+   * Imports agents defined inline in `opencode.json` / `opencode.jsonc` (and,
+   * at project scope, `.opencode/opencode.json(c)`, which OpenCode merges over
+   * them) under the top-level `agent` key — or its V2 spelling `agents`, see
+   * `getOpencodeAgentEntries` — (in addition to the Markdown files under
    * `.opencode/agents/`). Each entry's `prompt` becomes the subagent body
    * (a `"{file:./path}"` reference is resolved relative to the config file's
    * location); the remaining fields (`description` / `mode` / `model` /
@@ -206,14 +256,24 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
     outputRoot?: string;
     global?: boolean;
   } = {}): Promise<OpenCodeSubagent[]> {
-    const config = await readOpencodeConfig({ outputRoot, global });
-    const agentEntries = asOpencodeEntries(config.agent);
+    // Each file is lowered on its own and its `prompt` resolved against its
+    // own directory before the files are merged, later files winning, as
+    // OpenCode merges `.opencode/opencode.json(c)` over the root config.
+    const layers = await readOpencodeConfigLayers({ outputRoot, global, layout: this.layout });
+    const layerEntries = await Promise.all(
+      layers.map(({ config, configDir }) =>
+        resolveOpenCodeAgentPrompts({
+          entries: getOpencodeAgentEntries({ config, layout: this.layout }),
+          configDir,
+        }),
+      ),
+    );
+    const agentEntries = mergeOpencodeEntryLayers(layerEntries);
     if (!agentEntries) {
       return [];
     }
 
     const paths = this.getSettablePaths({ global });
-    const configDir = getOpencodeConfigDir({ outputRoot, global });
     const subagents: OpenCodeSubagent[] = [];
 
     for (const [name, rawEntry] of Object.entries(agentEntries)) {
@@ -223,7 +283,7 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
       }
 
       const { prompt, ...frontmatterFields } = entry;
-      const body = await resolveOpenCodeAgentPrompt({ prompt, configDir });
+      const body = typeof prompt === "string" ? prompt : "";
 
       const parseResult = OpenCodeSubagentFrontmatterSchema.safeParse(frontmatterFields);
       if (!parseResult.success) {
@@ -232,7 +292,7 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
       const frontmatter = parseResult.data;
 
       subagents.push(
-        new OpenCodeSubagent({
+        new this({
           outputRoot,
           frontmatter,
           body,
@@ -264,7 +324,7 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
       throw new Error(`Invalid frontmatter in ${filePath}: ${formatError(result.error)}`);
     }
 
-    return new OpenCodeSubagent({
+    return new this({
       outputRoot,
       relativeDirPath: paths.relativeDirPath,
       relativeFilePath,
@@ -282,7 +342,7 @@ export class OpenCodeSubagent extends OpenCodeStyleSubagent {
     relativeFilePath,
     global = false,
   }: ToolSubagentForDeletionParams): OpenCodeSubagent {
-    return new OpenCodeSubagent({
+    return new this({
       outputRoot,
       relativeDirPath,
       relativeFilePath,

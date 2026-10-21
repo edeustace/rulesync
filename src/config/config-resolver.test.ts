@@ -233,6 +233,126 @@ describe("config-resolver", () => {
     });
   });
 
+  describe("retireTargets", () => {
+    beforeEach(async () => {
+      await writeFileContent(
+        join(testDir, "rulesync.jsonc"),
+        JSON.stringify({ outputRoots: ["./"], targets: ["claudecode"] }),
+      );
+    });
+
+    it("defaults to no retired targets", async () => {
+      const config = await ConfigResolver.resolve({ configPath: join(testDir, "rulesync.jsonc") });
+      expect(config.getRetireTargets()).toEqual([]);
+    });
+
+    it("takes retired targets from the CLI", async () => {
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+        retireTargets: ["cursor"],
+        features: ["rules"],
+      });
+      expect(config.getRetireTargets()).toEqual(["cursor"]);
+    });
+
+    it("requires --features", async () => {
+      await expect(
+        ConfigResolver.resolve({
+          configPath: join(testDir, "rulesync.jsonc"),
+          retireTargets: ["cursor"],
+        }),
+      ).rejects.toThrow(/requires --features/);
+    });
+
+    it("rejects the '*' feature wildcard", async () => {
+      await expect(
+        ConfigResolver.resolve({
+          configPath: join(testDir, "rulesync.jsonc"),
+          retireTargets: ["cursor"],
+          features: ["*"],
+        }),
+      ).rejects.toThrow(/requires --features/);
+    });
+
+    it("rejects --retire-targets combined with --targets", async () => {
+      await expect(
+        ConfigResolver.resolve({
+          configPath: join(testDir, "rulesync.jsonc"),
+          targets: ["claudecode"],
+          retireTargets: ["cursor"],
+        }),
+      ).rejects.toThrow(/cannot be combined with --targets/);
+    });
+
+    it("rejects retiring a target the config file still declares", async () => {
+      await expect(
+        ConfigResolver.resolve({
+          configPath: join(testDir, "rulesync.jsonc"),
+          retireTargets: ["claudecode"],
+          features: ["rules"],
+        }),
+      ).rejects.toThrow(/still configured: claudecode/);
+    });
+
+    it("keeps the configured per-target features with object-form targets", async () => {
+      await writeFileContent(
+        join(testDir, "rulesync.jsonc"),
+        JSON.stringify({ outputRoots: ["./"], targets: { claudecode: ["rules"] } }),
+      );
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+        retireTargets: ["cursor"],
+        features: ["mcp"],
+      });
+      expect(config.getFeatures("claudecode")).toEqual(["rules"]);
+      expect(config.getRetireFeatures()).toEqual(["mcp"]);
+    });
+
+    it("scopes an array-form run to the retired features", async () => {
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+        retireTargets: ["cursor"],
+        features: ["mcp"],
+      });
+      expect(config.getFeatures()).toEqual(["mcp"]);
+      expect(config.getRetireFeatures()).toEqual(["mcp"]);
+    });
+
+    it("keeps the configured features when a configured array-form target retires one", async () => {
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+        retireTargets: ["claudecode"],
+        features: ["mcp"],
+      });
+      expect(config.getFeatures()).toEqual(["rules"]);
+      expect(config.getConfigFileFeatures("claudecode")).toEqual(["rules"]);
+      expect(config.getRetireFeatures()).toEqual(["mcp"]);
+    });
+
+    it("retires a feature an object-form target no longer has", async () => {
+      await writeFileContent(
+        join(testDir, "rulesync.jsonc"),
+        JSON.stringify({ outputRoots: ["./"], targets: { claudecode: ["rules"] } }),
+      );
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+        retireTargets: ["claudecode"],
+        features: ["mcp"],
+      });
+      expect(config.getRetireTargets()).toEqual(["claudecode"]);
+      expect(config.getFeatures("claudecode")).toEqual(["rules"]);
+    });
+
+    it("is not a config-file option", async () => {
+      await writeFileContent(
+        join(testDir, "rulesync.jsonc"),
+        JSON.stringify({ outputRoots: ["./"], targets: ["claudecode"], retireTargets: ["cursor"] }),
+      );
+      const config = await ConfigResolver.resolve({ configPath: join(testDir, "rulesync.jsonc") });
+      expect(config.getRetireTargets()).toEqual([]);
+    });
+  });
+
   describe("config file targets (getConfigFileTargets)", () => {
     it("expands wildcard targets ['*'] to the full non-legacy target list", async () => {
       // Regression for #1981 / #1894: a `targets: ["*"]` config must not collapse
@@ -281,6 +401,76 @@ describe("config-resolver", () => {
       expect(config.getTargets()).toEqual(["codexcli"]);
       expect(config.getConfigFileTargets().length).toBeGreaterThan(1);
       expect(config.getConfigFileTargets()).toContain("claudecode");
+    });
+  });
+
+  describe("config file features (getConfigFileFeatures)", () => {
+    it("keeps per-target features from object-form targets when CLI -t replaces them", async () => {
+      const configContent = JSON.stringify({
+        outputRoots: ["./"],
+        targets: { codexcli: ["rules"], opencode: ["mcp"] },
+      });
+      await writeFileContent(join(testDir, "rulesync.jsonc"), configContent);
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+        targets: ["codexcli"],
+        features: ["rules"],
+      });
+
+      expect(config.getConfigFileFeatures("codexcli")).toEqual(["rules"]);
+      expect(config.getConfigFileFeatures("opencode")).toEqual(["mcp"]);
+      expect(config.getConfigFileFeatures("claudecode")).toEqual([]);
+    });
+
+    it("applies CLI -f to every array-form config file target, as a run without -t would", async () => {
+      const configContent = JSON.stringify({
+        outputRoots: ["./"],
+        targets: ["codexcli", "opencode"],
+        features: ["mcp"],
+      });
+      await writeFileContent(join(testDir, "rulesync.jsonc"), configContent);
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+        targets: ["codexcli"],
+        features: ["rules"],
+      });
+
+      expect(config.getFeatures("codexcli")).toEqual(["rules"]);
+      expect(config.getConfigFileFeatures("opencode")).toEqual(["rules"]);
+    });
+
+    it("uses the config file's array-form features when CLI -f is absent", async () => {
+      const configContent = JSON.stringify({
+        outputRoots: ["./"],
+        targets: ["codexcli", "opencode"],
+        features: ["mcp"],
+      });
+      await writeFileContent(join(testDir, "rulesync.jsonc"), configContent);
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+        targets: ["codexcli"],
+      });
+
+      expect(config.getConfigFileFeatures("opencode")).toEqual(["mcp"]);
+    });
+
+    it("expands a wildcard feature list from the config file", async () => {
+      const configContent = JSON.stringify({
+        outputRoots: ["./"],
+        targets: ["codexcli", "opencode"],
+        features: ["*"],
+      });
+      await writeFileContent(join(testDir, "rulesync.jsonc"), configContent);
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+      });
+
+      expect(config.getConfigFileFeatures("opencode")).toContain("rules");
+      expect(config.getConfigFileFeatures("opencode")).toContain("mcp");
     });
   });
 
@@ -393,6 +583,24 @@ describe("config-resolver", () => {
       expect(config.getFlattenedCommandNaming()).toBe("path");
     });
 
+    it("should allow rulesync.local.jsonc to route entries to gitexclude", async () => {
+      await writeFileContent(
+        join(testDir, "rulesync.jsonc"),
+        JSON.stringify({ outputRoots: ["./"], targets: ["claudecode"] }),
+      );
+      await writeFileContent(
+        join(testDir, "rulesync.local.jsonc"),
+        JSON.stringify({ gitignoreDestination: "gitexclude" }),
+      );
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+      });
+
+      expect(config.getRootGitignoreDestination()).toBe("gitexclude");
+      expect(config.getGitignoreDestination("claudecode", "rules")).toBe("gitexclude");
+    });
+
     it("should reject an invalid flattenedCommandNaming value", async () => {
       const configContent = JSON.stringify({
         outputRoots: ["./"],
@@ -409,7 +617,111 @@ describe("config-resolver", () => {
     });
   });
 
+  describe("language", () => {
+    it("should load language from config file", async () => {
+      const configContent = JSON.stringify({
+        outputRoots: ["./"],
+        targets: ["cursor"],
+        language: "ja",
+      });
+      await writeFileContent(join(testDir, "rulesync.jsonc"), configContent);
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+      });
+
+      expect(config.getLanguage()).toBe("ja");
+    });
+
+    it("should leave language unset when not specified", async () => {
+      const configContent = JSON.stringify({
+        outputRoots: ["./"],
+        targets: ["cursor"],
+      });
+      await writeFileContent(join(testDir, "rulesync.jsonc"), configContent);
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+      });
+
+      expect(config.getLanguage()).toBeUndefined();
+    });
+
+    it("should allow rulesync.local.jsonc to override language", async () => {
+      const baseConfigContent = JSON.stringify({
+        outputRoots: ["./"],
+        targets: ["cursor"],
+        language: "en",
+      });
+      const localConfigContent = JSON.stringify({
+        language: "pt-BR",
+      });
+      await writeFileContent(join(testDir, "rulesync.jsonc"), baseConfigContent);
+      await writeFileContent(join(testDir, "rulesync.local.jsonc"), localConfigContent);
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+      });
+
+      expect(config.getLanguage()).toBe("pt-BR");
+    });
+
+    it("should keep the base language when rulesync.local.jsonc does not set one", async () => {
+      await writeFileContent(
+        join(testDir, "rulesync.jsonc"),
+        JSON.stringify({ outputRoots: ["./"], targets: ["cursor"], language: "zh-CN" }),
+      );
+      await writeFileContent(
+        join(testDir, "rulesync.local.jsonc"),
+        JSON.stringify({ verbose: true }),
+      );
+
+      const config = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+      });
+
+      expect(config.getLanguage()).toBe("zh-CN");
+    });
+
+    it("should reject an unsupported language value", async () => {
+      const configContent = JSON.stringify({
+        outputRoots: ["./"],
+        targets: ["cursor"],
+        language: "klingon",
+      });
+      await writeFileContent(join(testDir, "rulesync.jsonc"), configContent);
+
+      await expect(
+        ConfigResolver.resolve({
+          configPath: join(testDir, "rulesync.jsonc"),
+        }),
+      ).rejects.toThrow(/language/);
+    });
+  });
+
   describe("local configuration (rulesync.local.jsonc)", () => {
+    it("should read deriveSubprojectPathFromGlobs from rulesync.jsonc and let rulesync.local.jsonc override it", async () => {
+      await writeFileContent(
+        join(testDir, "rulesync.jsonc"),
+        JSON.stringify({ targets: ["agentsmd"], deriveSubprojectPathFromGlobs: true }),
+      );
+
+      const fromFile = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+      });
+      expect(fromFile.getDeriveSubprojectPathFromGlobs()).toBe(true);
+
+      await writeFileContent(
+        join(testDir, "rulesync.local.jsonc"),
+        JSON.stringify({ deriveSubprojectPathFromGlobs: false }),
+      );
+
+      const overridden = await ConfigResolver.resolve({
+        configPath: join(testDir, "rulesync.jsonc"),
+      });
+      expect(overridden.getDeriveSubprojectPathFromGlobs()).toBe(false);
+    });
+
     it("should use rulesync.local.jsonc to override rulesync.jsonc", async () => {
       const baseConfigContent = JSON.stringify({
         outputRoots: ["./"],

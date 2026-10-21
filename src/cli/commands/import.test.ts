@@ -40,6 +40,8 @@ describe("importCommand", () => {
       getFeatureOptions: vi.fn().mockReturnValue(undefined),
       getGlobal: vi.fn().mockReturnValue(false),
       getOutputRoots: vi.fn().mockReturnValue(["."]),
+      getInputRoots: vi.fn().mockReturnValue(["."]),
+      getDeriveSubprojectPathFromGlobs: vi.fn().mockReturnValue(false),
     };
 
     vi.mocked(ConfigResolver.resolve).mockResolvedValue(mockConfig);
@@ -131,6 +133,7 @@ describe("importCommand", () => {
         loadToolFiles: vi.fn().mockResolvedValue([{ file: "rule1" }]),
         convertToolFilesToRulesyncFiles: vi.fn().mockResolvedValue([{ rule: "converted" }]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
+        warnForFoldImportDuplicationRisk: vi.fn().mockResolvedValue(undefined),
       };
       vi.mocked(RulesProcessor).mockImplementation(function () {
         return mockRulesProcessor as any;
@@ -326,6 +329,7 @@ describe("importCommand", () => {
         loadToolFiles: vi.fn().mockResolvedValue([{ file: "rule1" }]),
         convertToolFilesToRulesyncFiles: vi.fn().mockResolvedValue([{ rule: "converted" }]),
         writeAiFiles: vi.fn().mockResolvedValue({ count: 2, paths: [] }),
+        warnForFoldImportDuplicationRisk: vi.fn().mockResolvedValue(undefined),
       };
       vi.mocked(RulesProcessor).mockImplementation(function () {
         return mockRulesProcessor as any;
@@ -466,6 +470,7 @@ describe("importCommand", () => {
           loadToolFiles: vi.fn().mockResolvedValue([{ file: "test1" }]),
           convertToolFilesToRulesyncFiles: vi.fn().mockResolvedValue([{ test: "converted" }]),
           writeAiFiles: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
+          warnForFoldImportDuplicationRisk: vi.fn().mockResolvedValue(undefined),
         } as any;
       });
       vi.mocked(IgnoreProcessor).mockImplementation(function () {

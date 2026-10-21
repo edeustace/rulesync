@@ -9,8 +9,13 @@ import {
   DEEPAGENTS_LEGACY_TO_CANONICAL_EVENT_NAMES,
   DEEPAGENTS_TO_CANONICAL_EVENT_NAMES,
 } from "../../types/hooks.js";
+import {
+  getDeepagentsRelativeDirPath,
+  getDeepagentsRulesyncOutputRoot,
+} from "../../utils/deepagents.js";
 import { formatError } from "../../utils/error.js";
 import { readFileContentOrNull } from "../../utils/file.js";
+import { lookupOwn } from "../../utils/own-lookup.js";
 import type { RulesyncHooks } from "./rulesync-hooks.js";
 import { buildImportedHooksConfig } from "./tool-hooks-converter.js";
 import {
@@ -71,7 +76,10 @@ function canonicalToDeepagentsHooks(config: HooksConfig): DeepagentsHooksFile["h
   for (const [canonicalEvent, definitions] of Object.entries(effectiveHooks)) {
     if (!supported.has(canonicalEvent)) continue;
 
-    const deepagentsEvent = CANONICAL_TO_DEEPAGENTS_EVENT_NAMES[canonicalEvent];
+    const deepagentsEvent = lookupOwn({
+      record: CANONICAL_TO_DEEPAGENTS_EVENT_NAMES,
+      key: canonicalEvent,
+    });
     if (!deepagentsEvent) continue;
 
     for (const def of definitions) {
@@ -115,7 +123,10 @@ function deepagentsToCanonicalHooks(hooks: DeepagentsHooksFile["hooks"]): HooksC
   const canonical: HooksConfig["hooks"] = {};
 
   for (const [deepagentsEvent, groups] of Object.entries(hooks)) {
-    const canonicalEvent = DEEPAGENTS_TO_CANONICAL_EVENT_NAMES[deepagentsEvent];
+    const canonicalEvent = lookupOwn({
+      record: DEEPAGENTS_TO_CANONICAL_EVENT_NAMES,
+      key: deepagentsEvent,
+    });
     if (!canonicalEvent || !Array.isArray(groups)) continue;
 
     for (const group of groups) {
@@ -162,7 +173,7 @@ function deepagentsLegacyToCanonicalHooks(entries: unknown[]): HooksConfig["hook
     for (const legacyEvent of events) {
       const canonicalEvent =
         typeof legacyEvent === "string"
-          ? DEEPAGENTS_LEGACY_TO_CANONICAL_EVENT_NAMES[legacyEvent]
+          ? lookupOwn({ record: DEEPAGENTS_LEGACY_TO_CANONICAL_EVENT_NAMES, key: legacyEvent })
           : undefined;
       if (!canonicalEvent) continue;
 
@@ -185,9 +196,11 @@ export class DeepagentsHooks extends ToolHooks {
     return true;
   }
 
-  static getSettablePaths(_options: { global?: boolean } = {}): ToolHooksSettablePaths {
+  static getSettablePaths({ global = false }: { global?: boolean } = {}): ToolHooksSettablePaths {
+    // `.deepagents/hooks.json` in both scopes; `DEEPAGENTS_HOME`, when set, is
+    // the global directory itself.
     return {
-      relativeDirPath: DEEPAGENTS_DIR,
+      relativeDirPath: getDeepagentsRelativeDirPath({ global, relativeDirPath: DEEPAGENTS_DIR }),
       relativeFilePath: DEEPAGENTS_HOOKS_FILE_NAME,
     };
   }
@@ -207,6 +220,7 @@ export class DeepagentsHooks extends ToolHooks {
       relativeFilePath: paths.relativeFilePath,
       fileContent,
       validate,
+      global,
     });
   }
 
@@ -251,6 +265,10 @@ export class DeepagentsHooks extends ToolHooks {
         : {};
 
     return this.toRulesyncHooksDefault({
+      outputRoot: getDeepagentsRulesyncOutputRoot({
+        nativeOutputRoot: this.outputRoot,
+        global: this.global,
+      }),
       fileContent: JSON.stringify(
         buildImportedHooksConfig({ hooks, overrideKey: "deepagents" }),
         null,

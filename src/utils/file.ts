@@ -1,24 +1,27 @@
-import type { Stats } from "node:fs";
+import { constants, readdirSync, realpathSync, statSync, type Stats } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import {
-  chmod,
   cp,
   lstat,
   mkdir,
   mkdtemp,
-  readdir,
+  open,
   readFile,
+  readdir,
+  readlink,
   realpath,
   rm,
   stat,
   writeFile,
 } from "node:fs/promises";
 import os from "node:os";
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, parse, posix, relative, resolve, sep } from "node:path";
 
 import { kebabCase } from "es-toolkit";
 import { globbySync, isGitIgnoredSync } from "globby";
 
 import { mapWithConcurrency } from "./concurrency.js";
+import { quoteForLog, stripControlCharacters } from "./control-characters.js";
 import { formatError } from "./error.js";
 import { isEnvTest } from "./vitest.js";
 
@@ -174,13 +177,21 @@ export async function ensureDir(dirPath: string): Promise<void> {
  * Ignore rules come from the `.gitignore` files at and below `rootDir`; a parent
  * repository's rules are not consulted, so running against a subdirectory of a
  * repository only sees that subdirectory's own rules.
+ *
+ * `ownedDirPath` names a tool-owned directory (such as `.trae/rules`) whose
+ * per-subdirectory copies are what the scan discovers. `rulesync gitignore`
+ * ignores those directories themselves (`**\/.trae/rules/`), so the last
+ * segment of the last such match and everything below it are not tested; its
+ * parents (`<dir>/.trae`) still are, so a user's own ignore rule there holds.
  */
 export function filterOutPathsInGitIgnoredDirectories({
   rootDir,
   filePaths,
+  ownedDirPath,
 }: {
   rootDir: string;
   filePaths: string[];
+  ownedDirPath?: string;
 }): string[] {
   if (filePaths.length === 0) {
     // Building the matcher scans the tree for `.gitignore` files, which is not
@@ -209,7 +220,20 @@ export function filterOutPathsInGitIgnoredDirectories({
     return ignored;
   };
 
-  return filePaths.filter((filePath) => !isInIgnoredDirectory(dirname(resolve(filePath))));
+  const ownedPosix = ownedDirPath === undefined ? undefined : toPosixPath(ownedDirPath);
+  const testedDirectory = (filePath: string): string => {
+    const directory = dirname(resolve(filePath));
+    if (ownedPosix === undefined) {
+      return directory;
+    }
+    // Separators are one character on every platform, so an index into the
+    // POSIX form is also an index into the native one.
+    const index = `${toPosixPath(directory)}/`.lastIndexOf(`/${ownedPosix}/`);
+    // Cut before the owned directory's last segment (`.../pkg/.trae`).
+    return index === -1 ? directory : directory.slice(0, index + 1 + ownedPosix.lastIndexOf("/"));
+  };
+
+  return filePaths.filter((filePath) => !isInIgnoredDirectory(testedDirectory(filePath)));
 }
 
 /**
@@ -232,13 +256,13 @@ export function checkPathTraversal({
   // Check for .. segments in the path (even if they don't escape the directory)
   const segments = relativePath.split(/[/\\]/);
   if (segments.includes("..")) {
-    throw new Error(`Path traversal detected: ${relativePath}`);
+    throw new Error(`Path traversal detected: ${quoteForLog(relativePath)}`);
   }
 
   const resolved = resolve(intendedRootDir, relativePath);
   const rel = relative(intendedRootDir, resolved);
   if (rel.startsWith("..") || resolve(resolved) !== resolved) {
-    throw new Error(`Path traversal detected: ${relativePath}`);
+    throw new Error(`Path traversal detected: ${quoteForLog(relativePath)}`);
   }
 }
 
@@ -350,32 +374,75 @@ export async function writeFileContent(filepath: string, content: string): Promi
  * Apply a POSIX mode to an existing file. Windows has no executable bit and
  * `chmod` there only toggles the read-only flag, so the call is skipped rather
  * than writing a mode the platform cannot honor.
+ *
+ * The mode goes through a handle opened with `O_NOFOLLOW`, so a symbolic link
+ * standing where the file should be is left alone rather than having the mode
+ * land on whatever it points at -- possibly outside the output tree -- and the
+ * file whose mode changes is the very one that was opened, with no path to
+ * swap between the check and the `chmod`. The write side refuses to read
+ * through links; the mode side refuses to write through them. A link is
+ * skipped silently, like Windows; a file that does not exist still throws.
  */
 export async function applyFileMode(filepath: string, mode: number): Promise<void> {
   if (process.platform === "win32") {
     return;
   }
-  await chmod(filepath, mode);
+  const fileHandle = await openNotFollowingLinks(filepath);
+  if (fileHandle === undefined) {
+    return;
+  }
+  try {
+    await fileHandle.chmod(mode);
+  } finally {
+    await fileHandle.close();
+  }
 }
 
 /**
  * Restore an executable bit that went missing (interrupted run, a copy that
  * dropped the mode). A file whose mode is merely stricter than `mode` — the
- * user chose 0700 over 0755 — is left alone.
+ * user chose 0700 over 0755 — is left alone, and so is a symbolic link or a
+ * file that cannot be opened: this repairs, it never creates.
  */
 export async function restoreMissingExecutableBit(filepath: string, mode: number): Promise<void> {
   if (process.platform === "win32") {
     return;
   }
+  let fileHandle: FileHandle | undefined;
   try {
-    const current = (await stat(filepath)).mode;
-    if ((current & 0o111) !== 0) {
-      return;
-    }
+    fileHandle = await openNotFollowingLinks(filepath);
   } catch {
     return;
   }
-  await chmod(filepath, mode);
+  if (fileHandle === undefined) {
+    return;
+  }
+  try {
+    const current = await fileHandle.stat();
+    if ((current.mode & 0o111) !== 0) {
+      return;
+    }
+    await fileHandle.chmod(mode);
+  } finally {
+    await fileHandle.close();
+  }
+}
+
+/**
+ * Open a file for its mode without following a symbolic link at the path.
+ * Returns `undefined` when the path is a link (`O_NOFOLLOW` fails with
+ * `ELOOP`, or `EMLINK` on some BSDs); any other failure is the caller's.
+ */
+async function openNotFollowingLinks(filepath: string): Promise<FileHandle | undefined> {
+  try {
+    return await open(filepath, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ELOOP" || code === "EMLINK") {
+      return undefined;
+    }
+    throw error;
+  }
 }
 
 export async function writeFileBuffer(filepath: string, buffer: Buffer): Promise<void> {
@@ -539,12 +606,19 @@ export async function fileExists(filepath: string): Promise<boolean> {
   }
 }
 
-export async function getFileSize(filepath: string): Promise<number> {
+/**
+ * The size of a file and whether it carries any execute bit, read with a single
+ * `stat`. Windows reports no execute bits, so a file there is never seen as
+ * executable.
+ */
+export async function getFileSizeAndExecutableBit(
+  filepath: string,
+): Promise<{ size: number; executable: boolean }> {
   try {
     const stats = await stat(filepath);
-    return stats.size;
+    return { size: stats.size, executable: (stats.mode & 0o111) !== 0 };
   } catch (error) {
-    throw new Error(`Failed to get file size for "${filepath}": ${formatError(error)}`, {
+    throw new Error(`Failed to stat "${filepath}": ${formatError(error)}`, {
       cause: error,
     });
   }
@@ -559,7 +633,16 @@ export async function isSymlink(filepath: string): Promise<boolean> {
   }
 }
 
-export async function listDirectoryFiles(dir: string): Promise<string[]> {
+/**
+ * Every entry name directly under `dir`, of whatever kind, in the order the
+ * filesystem reports them.
+ *
+ * Named for what it returns, because {@link listFileNames} sits beside it and
+ * answers a narrower question: this one reports directories and links as well
+ * as files, and reads an unreadable directory as an empty one instead of
+ * failing. Picking this where the other was meant brings both of those back.
+ */
+export async function listDirectoryEntryNames(dir: string): Promise<string[]> {
   try {
     return await readdir(dir);
   } catch {
@@ -582,6 +665,21 @@ function countHiddenSegments(filePath: string): number {
 }
 
 /**
+ * A path the running platform produced, written posix-separated.
+ *
+ * Not {@link toPosixPath}, which rewrites every backslash whatever it means. That
+ * is right for a path a caller spelled, which may be spelled either way; it is
+ * wrong for one the platform handed back. On a posix platform a backslash is an
+ * ordinary character in a name, so rewriting it folds `a\b` onto `a/b` -- two
+ * different directories, and wherever the result is used as a file's identity the
+ * second one to be seen is taken for a repeat of the first and dropped. On
+ * Windows no name can hold a backslash, so the rewrite there is lossless.
+ */
+function nativePathToPosix(filePath: string): string {
+  return sep === "\\" ? filePath.replaceAll("\\", "/") : filePath;
+}
+
+/**
  * The real file a path denotes, posix-separated so it compares against the globby results
  * that produce it. Two paths share an identity when they resolve to the very same file --
  * a link beside its target, a link into a shared tree, or a cycle that walks back into an
@@ -589,22 +687,263 @@ function countHiddenSegments(filePath: string): number {
  */
 async function realFileIdentity(filePath: string): Promise<string> {
   try {
-    return toPosixPath(await realpath(filePath));
+    return nativePathToPosix(await realpath(filePath));
   } catch {
     // realpath can fail on a broken link or a race; fall back to the literal path so the
     // entry still counts (and is still deduplicated against identical literals).
-    return toPosixPath(filePath);
+    return nativePathToPosix(filePath);
   }
+}
+
+/**
+ * Where the file `targetPath` really denotes sits relative to the one `rootPath`
+ * does, with every link on both sides resolved. Posix-separated, because the
+ * resolved paths it is built from are; a caller that splits it must split on `/`
+ * alone, which is also the only separator a real name can never contain.
+ *
+ * Both sides fall back to their literal path when they cannot be resolved, so an
+ * unresolvable path reads as an escape rather than as a contained one.
+ */
+export async function resolvedRelativePath({
+  rootPath,
+  targetPath,
+}: {
+  rootPath: string;
+  targetPath: string;
+}): Promise<string> {
+  const [realRootPath, realTargetPath] = await Promise.all([
+    realFileIdentity(rootPath),
+    realFileIdentity(targetPath),
+  ]);
+  // Both sides are posix-separated by `realFileIdentity`, so the comparison has to be
+  // too -- the native `relative` would read a posix path as one segment on Windows.
+  return posix.relative(realRootPath, realTargetPath);
+}
+
+/**
+ * Whether a posix relative path -- one {@link resolvedRelativePath} returned, or any
+ * built the same way -- leads out of the root it was taken against.
+ *
+ * Exported so a caller that already holds the relative path can ask this of the very
+ * path it goes on to read, instead of resolving both sides a second time and judging
+ * a result it then has to trust is the same one.
+ */
+export function posixRelativePathEscapesRoot(relativePath: string): boolean {
+  return relativePath === ".." || relativePath.startsWith("../") || posix.isAbsolute(relativePath);
+}
+
+/**
+ * Whether the file `targetPath` really denotes sits outside `rootPath`. Unlike
+ * `pathEscapesRoot`, which reads a path as it is spelled, this resolves every link
+ * on both sides first, so a name that sits inside the root but is a link pointing
+ * out of it is reported as the escape it is. Both sides fall back to their literal
+ * path when they cannot be resolved, which reports an escape rather than hiding one.
+ */
+export async function resolvedPathEscapesRoot({
+  rootPath,
+  targetPath,
+}: {
+  rootPath: string;
+  targetPath: string;
+}): Promise<boolean> {
+  return posixRelativePathEscapesRoot(await resolvedRelativePath({ rootPath, targetPath }));
+}
+
+/**
+ * How many links {@link writeLandingPath} follows before it treats the chain as
+ * a cycle it cannot write through. Linux itself gives up after 40.
+ */
+const MAX_LINK_HOPS = 40;
+
+/**
+ * Whether `error` is the ENOTDIR a lookup through a file raises. On the way to
+ * a write it means the same as a missing entry: nothing at or below the path
+ * exists, so nothing there can be a link.
+ */
+function isNotADirectoryError(error: unknown): boolean {
+  return someErrorInChain(
+    error,
+    (candidate) => "code" in candidate && candidate.code === "ENOTDIR",
+  );
+}
+
+/**
+ * Where a write to `targetPath` lands once the OS has followed every link on
+ * the way there, or `null` when the links form a cycle no write can get
+ * through. The target itself usually does not exist yet, so the walk goes
+ * segment by segment from the filesystem root: an existing segment that is a
+ * link is replaced by what it resolves to, and a dangling link — one whose
+ * target does not exist yet, which is exactly the shape of a link planted at
+ * `AGENTS.md` pointing at a `~/.zshenv` that is still to be created — has its
+ * target spliced into the walk in its place, so the segments of that target
+ * are looked up one by one too. Once a segment is missing, nothing below it
+ * exists, and the rest of the path is where the write's `mkdir -p` will put it.
+ *
+ * Walking segment by segment is what keeps a `..` honest. A link target is a
+ * path the OS resolves left to right, so in `sub/../victim` the `..` climbs out
+ * of wherever `sub` leads, not out of the directory `sub` is spelled in; a
+ * lexical `resolve` folds `sub/..` away before `sub` is ever looked at, which
+ * is how a link chain could be spelled to pass the check and still land
+ * outside the root.
+ */
+export async function writeLandingPath(targetPath: string): Promise<string | null> {
+  const start = splitAbsolutePath(isAbsolute(targetPath) ? targetPath : resolve(targetPath));
+  let current = start.root;
+  let pending = start.segments;
+  // Once a segment is missing, nothing below it can be a link.
+  let exists = true;
+  let linkHops = 0;
+  while (pending.length > 0) {
+    const segment = pending.shift();
+    if (segment === undefined || segment === "" || segment === ".") {
+      continue;
+    }
+    if (segment === "..") {
+      // `current` is fully resolved up to here, so its parent is the real one.
+      current = dirname(current);
+      continue;
+    }
+    current = join(current, segment);
+    if (!exists) {
+      continue;
+    }
+    let stats: Stats;
+    try {
+      stats = await lstat(current);
+    } catch (error) {
+      if (!isFileNotFoundError(error) && !isNotADirectoryError(error)) {
+        throw error;
+      }
+      exists = false;
+      continue;
+    }
+    if (!stats.isSymbolicLink()) {
+      continue;
+    }
+    linkHops += 1;
+    if (linkHops > MAX_LINK_HOPS) {
+      return null;
+    }
+    try {
+      // A link that resolves is replaced by what it resolves to.
+      current = await realpath(current);
+      continue;
+    } catch {
+      // Dangling, or a cycle `realpath` gave up on: walk its target by hand.
+    }
+    const linkTarget = await readlink(current);
+    if (isAbsolute(linkTarget)) {
+      const target = splitAbsolutePath(linkTarget);
+      current = target.root;
+      pending = [...target.segments, ...pending];
+    } else {
+      current = dirname(current);
+      pending = [...splitPathSegments(linkTarget), ...pending];
+    }
+  }
+  return current;
+}
+
+/**
+ * Split an absolute path into its root and its raw segments, without folding a
+ * `..` away: {@link writeLandingPath} has to see every `..` where it is spelled.
+ */
+function splitAbsolutePath(absolutePath: string): { root: string; segments: string[] } {
+  const root = parse(absolutePath).root;
+  return { root, segments: splitPathSegments(absolutePath.slice(root.length)) };
+}
+
+/**
+ * Whether writing `targetPath` would land outside `rootPath` once every link on
+ * the way there is resolved. Both sides are taken to where a write to them
+ * would land (see {@link writeLandingPath}), so a root that does not fully
+ * exist yet is judged the same way as the target below it.
+ *
+ * A link that stays inside the root passes. That is what sets this apart from
+ * the stricter {@link assertWritablePathInsideRoot} the sweep paths use: a
+ * dotfiles checkout linked from inside the home directory is a common shape for
+ * a global write target, and refusing it would refuse `--global` outright.
+ *
+ * A link chain that cycles is reported as an escape: the write could not get
+ * through it, and refusing it is the answer that never writes somewhere
+ * unexpected.
+ */
+export async function writablePathEscapesRoot({
+  rootPath,
+  targetPath,
+}: {
+  rootPath: string;
+  targetPath: string;
+}): Promise<boolean> {
+  const relativeLanding = await relativeWriteLanding({ rootPath, targetPath });
+  return relativeLanding === null || pathEscapesRoot(relativeLanding);
+}
+
+/**
+ * Where a write to `targetPath` lands relative to where a write to `rootPath`
+ * lands, both taken through {@link writeLandingPath}: `""` when the two land on
+ * the same directory, and `null` when either side's links form a cycle. Errors
+ * other than a missing entry (an `EACCES` on the way, say) propagate, so each
+ * caller decides what an unreadable path means for it.
+ */
+export async function relativeWriteLanding({
+  rootPath,
+  targetPath,
+}: {
+  rootPath: string;
+  targetPath: string;
+}): Promise<string | null> {
+  const [rootLanding, targetLanding] = await Promise.all([
+    writeLandingPath(rootPath),
+    writeLandingPath(targetPath),
+  ]);
+  if (rootLanding === null || targetLanding === null) {
+    return null;
+  }
+  return relative(rootLanding, targetLanding);
+}
+
+/**
+ * How many trailing segments `filePath` and `identity` have in common.
+ *
+ * A path that walked through no link at all shares all of its own segments with
+ * the file's identity; one that walked through a link named differently from
+ * its target parts from the identity at that segment and shares only what
+ * follows it. Counting from the end rather than testing the two for equality is
+ * what lets the comparison hold for a path that is not itself resolved: a glob
+ * rooted at a directory that is a link of its own gives every candidate the
+ * same unresolved prefix, and only the segments below it decide.
+ *
+ * `filePath` is spelled the way the platform reported it and `identity` is
+ * posix-separated, so the two are split on both separators: on Windows a
+ * backslash-separated path then shares its segments with the posix identity
+ * without being rewritten first, and on a posix platform a backslash inside a
+ * name is split the same way on both sides, which keeps the count symmetric.
+ *
+ * Exported for its tests, which need a Windows-style spelling on any platform.
+ */
+export function sharedTrailingSegments(filePath: string, identity: string): number {
+  const left = splitPathSegments(filePath);
+  const right = splitPathSegments(identity);
+  let shared = 0;
+  while (
+    shared < left.length &&
+    shared < right.length &&
+    left[left.length - 1 - shared] === right[right.length - 1 - shared]
+  ) {
+    shared++;
+  }
+  return shared;
 }
 
 /**
  * Pick the one path that represents a file among the paths that resolve to it.
  *
- * The path that walked through no link at all wins outright: it is already the real one,
- * so it equals the file's identity. That keeps the real location of a file as the path
- * callers see, rather than an alias that happens to sort first -- a directory link named
- * `aaa` pointing at `zzz` must not make `zzz/x.md` disappear, and a cycle must not replace
- * `sub/note.md` with the same file reached back through the cycle.
+ * The path that walked through no link at all wins outright: it shares every one of its
+ * segments with the file's identity, which no alias does. That keeps the real location of
+ * a file as the path callers see, rather than an alias that happens to sort first -- a
+ * directory link named `aaa` pointing at `zzz` must not make `zzz/x.md` disappear, and a
+ * cycle must not replace `sub/note.md` with the same file reached back through the cycle.
  * Failing that, the fewest dot-prefixed segments wins: when only links are on offer, the
  * named one represents the entry rather than a hidden alias that a hidden-entry rule may
  * then drop, taking the named path's content with it. `candidates` arrives in sorted
@@ -612,19 +951,67 @@ async function realFileIdentity(filePath: string): Promise<string> {
  */
 function chooseRepresentative(candidates: string[], identity: string): string {
   return candidates.reduce((best, candidate) => {
-    if (toPosixPath(best) === identity) {
-      return best;
-    }
-    if (toPosixPath(candidate) === identity) {
-      return candidate;
+    const bestShared = sharedTrailingSegments(best, identity);
+    const candidateShared = sharedTrailingSegments(candidate, identity);
+    if (candidateShared !== bestShared) {
+      return candidateShared > bestShared ? candidate : best;
     }
     return countHiddenSegments(candidate) < countHiddenSegments(best) ? candidate : best;
   });
 }
 
+/**
+ * A `readdirSync` for one glob walk that reads a directory as empty when its real
+ * path equals the real path of a directory above it in the same walk -- the loop
+ * check `find -L` makes. Without it, globby follows a directory link cycle until the
+ * kernel's ELOOP limit, and two links back to one directory (`a -> .`, `b -> .`)
+ * double the walk at every level, so it never finishes in practice.
+ *
+ * Only ancestors are compared, not every directory seen: a link that aliases a
+ * sibling (`aaa -> zzz`) is still walked, so both names reach the deduplication in
+ * `findFilesByGlobs` and the real path can represent the file. A directory cut here
+ * only repeats one the walk is already inside, so its files are still found under the
+ * ancestor's path (a pattern that names the looping link itself, like `**\/loop/*.md`,
+ * no longer matches through it), and every endless descent must repeat such a real
+ * path, so the walk always ends without a depth cap.
+ */
+function createCycleSafeReaddirSync(): typeof readdirSync {
+  const realPathByDir = new Map<string, string>();
+  const guarded = (dirPath: string, options?: unknown): unknown => {
+    const dir = resolve(dirPath);
+    let real: string | undefined;
+    try {
+      real = realpathSync.native(dir);
+    } catch {
+      // Leave an unresolvable directory to `readdirSync` and its own error.
+    }
+    if (real !== undefined) {
+      let child = dir;
+      let ancestor = dirname(dir);
+      while (ancestor !== child) {
+        if (realPathByDir.get(ancestor) === real) {
+          return [];
+        }
+        child = ancestor;
+        ancestor = dirname(ancestor);
+      }
+      realPathByDir.set(dir, real);
+    }
+    return readdirSync(dir, options as Parameters<typeof readdirSync>[1]);
+  };
+  return guarded as typeof readdirSync;
+}
+
 export async function findFilesByGlobs(
   globs: string | string[],
   options: {
+    /**
+     * Directory in which relative patterns and relative `ignore` patterns are
+     * evaluated. This is a starting point, not a containment boundary:
+     * callers must pass relative patterns without `..` when results must stay
+     * beneath this directory. Absolute patterns can escape it.
+     */
+    cwd?: string;
     type?: "file" | "dir" | "all";
     followSymbolicLinks?: boolean;
     /**
@@ -635,7 +1022,8 @@ export async function findFilesByGlobs(
      *
      * Match the form of the include patterns: when those are absolute, a
      * relative `ignore` such as `dist/**` silently excludes nothing. Either use
-     * absolute ignore patterns or anchor them with a leading `**\/`.
+     * absolute ignore patterns or anchor them with a leading `**\/`. When `cwd`
+     * is set, relative ignore patterns are evaluated from that directory.
      */
     ignore?: string[];
     /**
@@ -657,7 +1045,7 @@ export async function findFilesByGlobs(
     dot?: boolean;
   } = {},
 ): Promise<string[]> {
-  const { type = "all", followSymbolicLinks = true, ignore, dot = false } = options;
+  const { cwd, type = "all", followSymbolicLinks = true, ignore, dot = false } = options;
   const globbyOptions =
     type === "file"
       ? { onlyFiles: true, onlyDirectories: false }
@@ -665,26 +1053,51 @@ export async function findFilesByGlobs(
         ? { onlyFiles: false, onlyDirectories: true }
         : { onlyFiles: false, onlyDirectories: false };
   // Normalize glob patterns to use forward slashes (required for globby on Windows)
-  const normalizedGlobs = Array.isArray(globs)
-    ? globs.map((g) => g.replaceAll("\\", "/"))
-    : globs.replaceAll("\\", "/");
+  const normalizedGlobs = (Array.isArray(globs) ? globs : [globs]).map((g) =>
+    g.replaceAll("\\", "/"),
+  );
   // Symlink following defaults to true so callers can share skills/rules without
   // duplication (see issue #1707). Destructive discovery passes false and validates
   // real-path containment before deletion. Untrusted remote content is a separate code
-  // path: git-client.ts (`walkDirectory`) skips symlinks entirely.
-  const results = globbySync(normalizedGlobs, {
-    absolute: true,
-    followSymbolicLinks,
-    dot,
-    ...(ignore ? { ignore: ignore.map((pattern) => pattern.replaceAll("\\", "/")) } : {}),
-    ...globbyOptions,
-  });
-  // Deduplicate by real file so that directory symlink cycles (which globby follows up to
-  // the kernel ELOOP limit, ~40 levels) do not yield ~40x duplicated entries that would be
-  // read and re-emitted -- and so that a thousand links to one file cost one read of it,
-  // not a thousand. One path per file, chosen by `chooseRepresentative`.
+  // path: git-client.ts (`walkDirectory`) skips symlinks entirely. A followed directory
+  // link that leads back above itself is not descended (see `createCycleSafeReaddirSync`).
+  // That check needs one walk per pattern: fast-glob runs every pattern's walk through
+  // the same `fs`, and a directory one pattern read must not count as an ancestor in
+  // another's walk. Each walk keeps the negative patterns that follow its pattern, which
+  // are the ones globby applies to it (an absolute negative pattern is still resolved
+  // against the positive patterns of its own walk only; prefer `ignore`). fast-glob also
+  // splits a single brace pattern whose alternatives have different bases, such as
+  // `{*.txt,sub/*.md}`, into walks that share the check; pass such alternatives as
+  // separate patterns instead.
+  const walks = followSymbolicLinks
+    ? normalizedGlobs.flatMap((pattern, index) =>
+        pattern.startsWith("!")
+          ? []
+          : [[pattern, ...normalizedGlobs.slice(index + 1).filter((g) => g.startsWith("!"))]],
+      )
+    : [];
+  const results = new Set(
+    (walks.length > 0 ? walks : [normalizedGlobs]).flatMap((patterns) =>
+      globbySync(patterns, {
+        absolute: true,
+        cwd,
+        followSymbolicLinks,
+        ...(followSymbolicLinks
+          ? // `statSync` keeps globby's check that `cwd` is a directory, which it skips
+            // for a custom `fs` without one.
+            { fs: { readdirSync: createCycleSafeReaddirSync(), statSync } }
+          : {}),
+        dot,
+        ...(ignore ? { ignore: ignore.map((pattern) => pattern.replaceAll("\\", "/")) } : {}),
+        ...globbyOptions,
+      }),
+    ),
+  );
+  // Deduplicate by real file so that a file reached through several directory aliases is
+  // read and re-emitted once -- and so that a thousand links to one file cost one read of
+  // it, not a thousand. One path per file, chosen by `chooseRepresentative`.
   const candidatesByFile = new Map<string, string[]>();
-  for (const result of results.toSorted()) {
+  for (const result of [...results].toSorted()) {
     const identity = await realFileIdentity(result);
     const candidates = candidatesByFile.get(identity);
     if (candidates === undefined) {
@@ -799,17 +1212,19 @@ async function dedupeNamesByFileIdentity(params: {
   entries: readonly ClassifiedEntry[];
 }): Promise<string[]> {
   const { dirPath, entries } = params;
-  const identities = await mapWithConcurrency({
+  // Each entry travels with its identity rather than being matched back to it by
+  // index. `realFileIdentity` never rejects -- an entry whose real path cannot be
+  // read keeps its literal one and stands on its own -- so every entry has one.
+  const identifiedEntries = await mapWithConcurrency({
     items: entries,
     limit: ENTRY_CLASSIFY_CONCURRENCY,
-    mapper: async (entry) => await realFileIdentity(join(dirPath, entry.name)),
+    mapper: async (entry) => ({
+      entry,
+      identity: await realFileIdentity(join(dirPath, entry.name)),
+    }),
   });
   const entriesByIdentity = new Map<string, ClassifiedEntry[]>();
-  for (const [index, entry] of entries.entries()) {
-    // `realFileIdentity` falls back to the literal path rather than failing, so
-    // an entry whose identity cannot be read stands on its own here instead of
-    // dropping out of the listing.
-    const identity = identities[index] ?? toPosixPath(join(dirPath, entry.name));
+  for (const { entry, identity } of identifiedEntries) {
     const group = entriesByIdentity.get(identity);
     if (group === undefined) {
       entriesByIdentity.set(identity, [entry]);
@@ -891,6 +1306,143 @@ export async function listFileNames(
     includeHidden: options.includeHidden ?? false,
     nameFilter: options.nameFilter,
   });
+}
+
+/**
+ * The paths of every file below `dirPath`, relative to it, walked rather than
+ * globbed.
+ *
+ * The recursive counterpart of {@link listFileNames}, and there for the same
+ * reason: globby reads a backslash as a path separator and rewrites it in the
+ * paths it returns, so a file named `back\\slash.md` comes back as
+ * `back/slash.md` — a path that belongs to no file, under a name that belongs
+ * to no file either.
+ *
+ * A root that is not there is an empty root. A root that is there but cannot be
+ * read is reported, so it is never mistaken for an empty one — as is a
+ * directory below it, since a subtree silently missing from the result is the
+ * same mistake one level down.
+ *
+ * A directory link is followed like any other directory, but each real
+ * directory is walked only once, so neither a cycle nor a mesh of links can
+ * make the walk repeat itself -- taking every distinct route through a graph of
+ * aliases would cost one traversal per route, which a handful of links is
+ * enough to make hopeless. The name a twice-reachable directory is reported
+ * under is therefore whichever the walk reaches first, and the walk goes level
+ * by level with each level sorted, so that is the shortest path to it and the
+ * first in sorted order among equals. Note the difference from
+ * {@link findFilesByGlobs}, which resolves each of its results and keeps the
+ * real one: here a link nearer the root than the directory it points at stands
+ * in for it. `nameFilter` narrows the files, not the directories the walk
+ * descends into.
+ *
+ * The cost is one round of `readdir` per directory, taken in sequence, and the
+ * whole of a level is held at once, so residency follows the widest level
+ * rather than the deepest path.
+ */
+export async function listFilePathsRecursively(
+  dirPath: string,
+  options: {
+    followSymbolicLinks?: boolean;
+    includeHidden?: boolean;
+    nameFilter?: (name: string) => boolean;
+    /**
+     * Report one path per real file rather than one per name, the way
+     * {@link findFilesByGlobs} does. Off by default: a walk that carries a tree
+     * as it is must keep every name the tree gives a file. Turn it on where the
+     * result is read as a set of files -- there, two names for one file are two
+     * files that do not exist.
+     */
+    deduplicateByFileIdentity?: boolean;
+  } = {},
+): Promise<string[]> {
+  const {
+    followSymbolicLinks = true,
+    includeHidden = false,
+    nameFilter,
+    deduplicateByFileIdentity = false,
+  } = options;
+  if (!(await directoryExists(dirPath))) {
+    return [];
+  }
+  const filePaths: string[] = [];
+  // Every real directory already walked. Keeping the whole set, rather than
+  // only the chain above the current directory, is what bounds the work: links
+  // that alias one another turn the tree into a graph, and a walk that took
+  // every distinct route through it would cost one traversal per route --
+  // exponential in the number of aliases, from a handful of real directories.
+  const walkedIdentities = new Set<string>();
+  // Level by level, sorted within each level, so the name a directory ends up
+  // reported under is decided by the tree rather than by readdir order.
+  let level = [{ currentPath: dirPath, prefix: "" }];
+  while (level.length > 0) {
+    const nextLevel: Array<{ currentPath: string; prefix: string }> = [];
+    for (const { currentPath, prefix } of level.toSorted((a, b) =>
+      a.prefix < b.prefix ? -1 : a.prefix > b.prefix ? 1 : 0,
+    )) {
+      const identity = await realFileIdentity(currentPath);
+      if (walkedIdentities.has(identity)) {
+        continue;
+      }
+      walkedIdentities.add(identity);
+      const [fileNames, dirNames] = await Promise.all([
+        listFileNames(currentPath, { followSymbolicLinks, includeHidden, nameFilter }),
+        listSubdirectoryNames(currentPath, { followSymbolicLinks, includeHidden }),
+      ]);
+      for (const fileName of fileNames) {
+        filePaths.push(prefix === "" ? fileName : join(prefix, fileName));
+      }
+      for (const dirName of dirNames) {
+        nextLevel.push({
+          currentPath: join(currentPath, dirName),
+          prefix: prefix === "" ? dirName : join(prefix, dirName),
+        });
+      }
+    }
+    level = nextLevel;
+  }
+  return deduplicateByFileIdentity
+    ? await deduplicateRelativePathsByFileIdentity({ dirPath, relativePaths: filePaths })
+    : filePaths.toSorted();
+}
+
+/**
+ * One path per real file, chosen the way {@link findFilesByGlobs} chooses it.
+ *
+ * The walk de-duplicates the directories it descends into, so it cannot loop,
+ * but it still reports every name it walks past: a file reached under two names
+ * is listed twice. A caller reading the result as a set of files has to fold
+ * those aliases together, and has to fold them the same way the glob does, or
+ * the two disagree about the name a file has.
+ */
+async function deduplicateRelativePathsByFileIdentity({
+  dirPath,
+  relativePaths,
+}: {
+  dirPath: string;
+  relativePaths: string[];
+}): Promise<string[]> {
+  // Folded on absolute paths, exactly the shape `findFilesByGlobs` folds, and
+  // relativized only afterwards. `chooseRepresentative` scores a candidate by the
+  // segments it shares with the file's identity, and only an absolute path can
+  // share all of its own: a relative one that names a file at the top of the walk
+  // scores a single segment, which any alias of the same basename ties -- leaving
+  // the choice to sort order, and the two sides free to disagree about the name a
+  // file has.
+  const candidatesByFile = new Map<string, string[]>();
+  for (const relativePath of relativePaths.toSorted()) {
+    const absolutePath = join(dirPath, relativePath);
+    const identity = await realFileIdentity(absolutePath);
+    const candidates = candidatesByFile.get(identity);
+    if (candidates === undefined) {
+      candidatesByFile.set(identity, [absolutePath]);
+    } else {
+      candidates.push(absolutePath);
+    }
+  }
+  return [...candidatesByFile.entries()]
+    .map(([identity, candidates]) => relative(dirPath, chooseRepresentative(candidates, identity)))
+    .toSorted();
 }
 
 export async function findRuleFiles(aiRulesDir: string): Promise<string[]> {
@@ -996,7 +1548,7 @@ export function validateOutputRoot(outputRoot: string): void {
     const separatorRegex = process.platform === "win32" ? /[/\\]/ : /\//;
     const segments = outputRoot.split(separatorRegex);
     if (segments.includes("..")) {
-      throw new Error(`Path traversal detected: ${outputRoot}`);
+      throw new Error(`Path traversal detected: ${stripControlCharacters(outputRoot)}`);
     }
 
     // Reject unnormalized absolute paths. After `resolve(outputRoot)` collapses
@@ -1006,7 +1558,8 @@ export function validateOutputRoot(outputRoot: string): void {
     const normalized = resolve(outputRoot);
     if (normalized !== outputRoot) {
       throw new Error(
-        `outputRoot must be a normalized absolute path: ${outputRoot} (normalized: ${normalized})`,
+        `outputRoot must be a normalized absolute path: ${stripControlCharacters(outputRoot)} ` +
+          `(normalized: ${stripControlCharacters(normalized)})`,
       );
     }
 
@@ -1014,7 +1567,7 @@ export function validateOutputRoot(outputRoot: string): void {
     // standard cross-platform way to detect the root of the volume.
     if (dirname(normalized) === normalized) {
       throw new Error(
-        `outputRoot must not be the filesystem root: ${outputRoot}. ` +
+        `outputRoot must not be the filesystem root: ${stripControlCharacters(outputRoot)}. ` +
           `Pass a specific project directory instead.`,
       );
     }

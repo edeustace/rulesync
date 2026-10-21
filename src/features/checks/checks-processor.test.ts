@@ -23,14 +23,22 @@ describe("ChecksProcessor.getToolTargets", () => {
       "amp",
       "augmentcode",
       "cursor",
+      "factorydroid",
+      "gitlabduo",
       "hermesagent",
+      "kilo",
+      "qwencode",
       "rovodev",
       "takt",
     ]);
   });
 
-  it("should return amp for global scope", () => {
-    expect(ChecksProcessor.getToolTargets({ global: true })).toEqual(["amp", "takt"]);
+  it("should return the global-capable targets for global scope", () => {
+    expect(ChecksProcessor.getToolTargets({ global: true })).toEqual(["amp", "goose", "takt"]);
+  });
+
+  it("should leave the global-only goose target out of project scope", () => {
+    expect(ChecksProcessor.getToolTargets({ global: false })).not.toContain("goose");
   });
 
   it("should return no simulated targets", () => {
@@ -121,6 +129,80 @@ Look for issues.
     expect(rulesyncFiles[0]).toBeInstanceOf(RulesyncCheck);
     expect((rulesyncFiles[0] as RulesyncCheck).getFrontmatter().severity).toBe("medium");
   });
+
+  it("should load checks when the output root contains glob metacharacters", async () => {
+    const literalRoot = join(testDir, "project(glob)");
+    await writeFileContent(
+      join(literalRoot, AMP_CHECKS_PROJECT_DIR, "literal.md"),
+      "---\nname: literal\ndescription: Literal path\n---\n\nContent",
+    );
+
+    const processor = new ChecksProcessor({
+      outputRoot: literalRoot,
+      inputRoots: [join(literalRoot, RULESYNC_RELATIVE_DIR_PATH)],
+      toolTarget: "amp",
+      logger,
+    });
+
+    const toolFiles = await processor.loadToolFiles({ forDeletion: true });
+
+    expect(toolFiles).toHaveLength(1);
+    expect(toolFiles[0]?.getRelativeFilePath()).toBe("literal.md");
+  });
+
+  // `*` is not a legal filename character on Windows.
+  it.skipIf(process.platform === "win32")(
+    "should not reach a sibling project when the output root ends in a wildcard",
+    async () => {
+      // Matching too much is the dangerous direction here: every path this
+      // returns goes on the `--delete` orphan list, so a root read as a pattern
+      // would put another project's files there.
+      const literalRoot = join(testDir, "project*x");
+      await writeFileContent(
+        join(literalRoot, AMP_CHECKS_PROJECT_DIR, "mine.md"),
+        "---\nname: mine\ndescription: Mine\n---\n\nContent",
+      );
+      await writeFileContent(
+        join(testDir, "projectOTHERx", AMP_CHECKS_PROJECT_DIR, "theirs.md"),
+        "---\nname: theirs\ndescription: Theirs\n---\n\nContent",
+      );
+
+      const processor = new ChecksProcessor({
+        outputRoot: literalRoot,
+        inputRoots: [join(literalRoot, RULESYNC_RELATIVE_DIR_PATH)],
+        toolTarget: "amp",
+        logger,
+      });
+
+      const toolFiles = await processor.loadToolFiles({ forDeletion: true });
+
+      expect(toolFiles.map((file) => file.getRelativeFilePath())).toEqual(["mine.md"]);
+    },
+  );
+
+  // Windows needs elevated rights to create symlinks, so this one is POSIX-only.
+  it.skipIf(process.platform === "win32")(
+    "should not load symlinked checks for deletion",
+    async () => {
+      const sharedDir = join(testDir, "shared");
+      const checksDir = join(testDir, AMP_CHECKS_PROJECT_DIR);
+      await ensureDir(checksDir);
+      await writeFileContent(
+        join(sharedDir, "shared.md"),
+        "---\nname: shared\ndescription: Shared path\n---\n\nContent",
+      );
+      await symlink(sharedDir, join(checksDir, "team"));
+
+      const processor = new ChecksProcessor({
+        outputRoot: testDir,
+        inputRoots: [join(testDir, RULESYNC_RELATIVE_DIR_PATH)],
+        toolTarget: "amp",
+        logger,
+      });
+
+      expect(await processor.loadToolFiles({ forDeletion: true })).toEqual([]);
+    },
+  );
 
   it("should return an empty array when the rulesync checks directory is missing", async () => {
     const processor = new ChecksProcessor({

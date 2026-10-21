@@ -1,9 +1,15 @@
 import { posix } from "node:path";
 
+import type { Feature } from "../types/features.js";
+
 const { join } = posix;
 
 export const RULESYNC_CONFIG_RELATIVE_FILE_PATH = "rulesync.jsonc";
 export const RULESYNC_LOCAL_CONFIG_RELATIVE_FILE_PATH = "rulesync.local.jsonc";
+// User-level defaults read by `rulesync init` (never by `generate`): the
+// directory is relative to `$XDG_CONFIG_HOME`, which defaults to `~/.config`.
+export const RULESYNC_USER_CONFIG_DIR_NAME = "rulesync";
+export const RULESYNC_XDG_CONFIG_HOME_DEFAULT_DIR_NAME = ".config";
 export const RULESYNC_RELATIVE_DIR_PATH = ".rulesync";
 
 // Feature subdirectory names WITHIN a rulesync source tree. Processors use
@@ -79,6 +85,25 @@ export const RULESYNC_PERMISSIONS_FILE_NAME = "permissions.jsonc";
 export const RULESYNC_MCP_LEGACY_FILE_NAME = "mcp.json";
 export const RULESYNC_HOOKS_LEGACY_FILE_NAME = "hooks.json";
 export const RULESYNC_PERMISSIONS_LEGACY_FILE_NAME = "permissions.json";
+// Deprecated dotfile spelling of the MCP config, still read for compatibility.
+export const RULESYNC_MCP_DEPRECATED_DOTFILE_NAME = ".mcp.json";
+
+// Top-level entries of a rulesync source tree, per feature.
+export const FEATURE_SOURCE_TREE_ENTRIES: Record<Feature, readonly string[]> = {
+  rules: [RULES_FEATURE_SUBDIR],
+  commands: [COMMANDS_FEATURE_SUBDIR],
+  subagents: [SUBAGENTS_FEATURE_SUBDIR],
+  skills: [SKILLS_FEATURE_SUBDIR],
+  checks: [CHECKS_FEATURE_SUBDIR],
+  ignore: [RULESYNC_AIIGNORE_FILE_NAME],
+  mcp: [
+    RULESYNC_MCP_FILE_NAME,
+    RULESYNC_MCP_LEGACY_FILE_NAME,
+    RULESYNC_MCP_DEPRECATED_DOTFILE_NAME,
+  ],
+  hooks: [RULESYNC_HOOKS_FILE_NAME, RULESYNC_HOOKS_LEGACY_FILE_NAME],
+  permissions: [RULESYNC_PERMISSIONS_FILE_NAME, RULESYNC_PERMISSIONS_LEGACY_FILE_NAME],
+};
 
 // JSON Schema URLs (published as GitHub release assets)
 export const RULESYNC_CONFIG_SCHEMA_URL =
@@ -93,3 +118,9 @@ export const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
 
 // Concurrency limits
 export const FETCH_CONCURRENCY_LIMIT = 10;
+/**
+ * How many declared sources `rulesync install` downloads at once ahead of the
+ * serial pass that writes them. Requests across those sources still share one
+ * `FETCH_CONCURRENCY_LIMIT` budget.
+ */
+export const SOURCE_PREFETCH_CONCURRENCY_LIMIT = 4;
