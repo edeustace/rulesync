@@ -1455,6 +1455,109 @@ args = ["server.js"]
 
         expect(mcpServers.local).toEqual({ command: "node" });
       });
+
+      it("should move same-name whole-value env refs on a stdio server into env_vars", async () => {
+        const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        const mcpServers = await generate({
+          langsmith: {
+            command: "node",
+            args: ["server.js"],
+            env: {
+              LANGSMITH_API_KEY: "${LANGSMITH_API_KEY}",
+              LANGSMITH_ENDPOINT: "https://api.smith.langchain.com",
+            },
+          },
+        });
+
+        expect(mcpServers.langsmith).toEqual({
+          command: "node",
+          args: ["server.js"],
+          env: { LANGSMITH_ENDPOINT: "https://api.smith.langchain.com" },
+          env_vars: ["LANGSMITH_API_KEY"],
+        });
+        expect(warnSpy).not.toHaveBeenCalled();
+      });
+
+      it("should warn and leave different-name env refs on a stdio server verbatim", async () => {
+        const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        const mcpServers = await generate({
+          langsmith: {
+            command: "node",
+            env: {
+              LANGSMITH_WORKSPACE_ID: "${LANGSMITH_WORKSPACE}",
+            },
+          },
+        });
+
+        expect(mcpServers.langsmith).toEqual({
+          command: "node",
+          env: { LANGSMITH_WORKSPACE_ID: "${LANGSMITH_WORKSPACE}" },
+        });
+        const messages = warnSpy.mock.calls.map(([message]) => String(message));
+        expect(
+          messages.some(
+            (m) =>
+              m.includes('"langsmith"') &&
+              m.includes("'LANGSMITH_WORKSPACE_ID'") &&
+              m.includes("${LANGSMITH_WORKSPACE}"),
+          ),
+        ).toBe(true);
+      });
+
+      it("should warn and leave a partial env ref on a stdio server verbatim", async () => {
+        const warnSpy = vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        const mcpServers = await generate({
+          svc: {
+            command: "node",
+            env: {
+              AUTH_HEADER: "ApiKey ${TOKEN}",
+            },
+          },
+        });
+
+        expect(mcpServers.svc).toEqual({
+          command: "node",
+          env: { AUTH_HEADER: "ApiKey ${TOKEN}" },
+        });
+        const messages = warnSpy.mock.calls.map(([message]) => String(message));
+        expect(
+          messages.some((m) => m.includes('"svc"') && m.includes("'AUTH_HEADER'")),
+        ).toBe(true);
+      });
+
+      it("should merge same-name refs with an existing envVars list without duplicating", async () => {
+        vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        const mcpServers = await generate({
+          svc: {
+            command: "node",
+            env: { FOO: "${FOO}", BAR: "${BAR}" },
+            envVars: ["FOO", { name: "BAZ", source: "local" }],
+          },
+        });
+
+        expect(mcpServers.svc.env).toBeUndefined();
+        expect(mcpServers.svc.env_vars).toEqual([
+          "FOO",
+          { name: "BAZ", source: "local" },
+          "BAR",
+        ]);
+      });
+
+      it("should not translate env refs on a url-based server", async () => {
+        vi.spyOn(fallbackLogger, "warn").mockImplementation(() => {});
+        // env is dropped on HTTP servers by dropTransportRejectedKeys anyway;
+        // this just pins down that the stdio converter does not fire here.
+        const mcpServers = await generate({
+          remote: {
+            type: "http",
+            url: "https://mcp.example.com",
+            env: { TOKEN: "${TOKEN}" },
+          },
+        });
+
+        expect(mcpServers.remote.env).toBeUndefined();
+        expect(mcpServers.remote.env_vars).toBeUndefined();
+      });
     });
 
     it("should drop headers from a stdio server rather than fail the entry (#2496)", async () => {

@@ -397,22 +397,40 @@ async function importSkillsCore(params: {
 
   const rulesyncDirs = await skillsProcessor.convertToolDirsToRulesyncDirs(toolDirs);
   const rebasedRulesyncDirs = rulesyncDirs.map((dir) => {
-    if (!isPackagingToolTarget(tool)) {
-      return dir;
-    }
     if (!(dir instanceof RulesyncSkill)) {
       return dir;
     }
-    return new RulesyncSkill({
-      outputRoot: process.cwd(),
-      relativeDirPath: dir.getRelativeDirPath(),
-      dirName: dir.getDirName(),
-      frontmatter: dir.getFrontmatter(),
-      body: dir.getBody(),
-      otherFiles: dir.getOtherFiles(),
-      validate: true,
-      global: false,
-    });
+    if (isPackagingToolTarget(tool)) {
+      return new RulesyncSkill({
+        outputRoot: process.cwd(),
+        relativeDirPath: dir.getRelativeDirPath(),
+        dirName: dir.getDirName(),
+        frontmatter: dir.getFrontmatter(),
+        body: dir.getBody(),
+        otherFiles: dir.getOtherFiles(),
+        validate: true,
+        global: false,
+      });
+    }
+    // In global mode a tool skill's `outputRoot` is the tool's own home-relative
+    // root (e.g. `~/` for claudecode). `toRulesyncSkill` propagates it, so
+    // without a rebase the imported rulesync skill would land at
+    // `~/.rulesync/skills/<name>` instead of the configured rulesync input
+    // root (e.g. `~/.aiglobal/.rulesync/skills/<name>`). Mirrors the
+    // packaging-target rebase above.
+    if (global) {
+      return new RulesyncSkill({
+        outputRoot: config.getInputRoots()[0],
+        relativeDirPath: dir.getRelativeDirPath(),
+        dirName: dir.getDirName(),
+        frontmatter: dir.getFrontmatter(),
+        body: dir.getBody(),
+        otherFiles: dir.getOtherFiles(),
+        validate: true,
+        global: true,
+      });
+    }
+    return dir;
   });
   const { count: writtenCount } = await skillsProcessor.writeAiDirs(rebasedRulesyncDirs);
 

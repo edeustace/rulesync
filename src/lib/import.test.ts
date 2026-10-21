@@ -20,6 +20,7 @@ import { RulesyncMcp } from "../features/mcp/rulesync-mcp.js";
 import { PermissionsProcessor } from "../features/permissions/permissions-processor.js";
 import { RulesyncPermissions } from "../features/permissions/rulesync-permissions.js";
 import { RulesProcessor } from "../features/rules/rules-processor.js";
+import { RulesyncSkill } from "../features/skills/rulesync-skill.js";
 import { SkillsProcessor } from "../features/skills/skills-processor.js";
 import { SubagentsProcessor } from "../features/subagents/subagents-processor.js";
 import { createMockLogger } from "../test-utils/mock-logger.js";
@@ -836,6 +837,68 @@ describe("importFromTool", () => {
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining("No skill directories found for claudecode"),
       );
+    });
+
+    it("should rebase imported rulesync skills onto the configured input root in global mode", async () => {
+      // In global mode a tool skill's outputRoot is the tool's own home-relative
+      // root (e.g. ~/ for claudecode). Without a rebase the imported rulesync
+      // skill would land at ~/.rulesync/skills/ instead of the configured input
+      // root (e.g. ~/.aiglobal/.rulesync/skills/).
+      mockConfig.getFeatures.mockReturnValue(["skills"]);
+      mockConfig.getGlobal.mockReturnValue(true);
+      mockConfig.getOutputRoots.mockReturnValue(["/home/user"]);
+      mockConfig.getInputRoots.mockReturnValue(["/home/user/.aiglobal/.rulesync"]);
+
+      const toolRootedSkill = new RulesyncSkill({
+        outputRoot: "/home/user",
+        dirName: "test-skill",
+        frontmatter: { name: "test-skill", description: "d" },
+        body: "b",
+        validate: false,
+      });
+
+      const mockProcessor = {
+        loadToolDirs: vi.fn().mockResolvedValue([{ dir: "tool" }]),
+        convertToolDirsToRulesyncDirs: vi.fn().mockResolvedValue([toolRootedSkill]),
+        writeAiDirs: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
+      };
+      vi.mocked(SkillsProcessor).mockImplementation(function () {
+        return mockProcessor as unknown as SkillsProcessor;
+      });
+
+      await importFromTool({ logger, config: mockConfig as never, tool: "claudecode" });
+
+      expect(mockProcessor.writeAiDirs).toHaveBeenCalledTimes(1);
+      const writtenDirs = mockProcessor.writeAiDirs.mock.calls[0]?.[0] as RulesyncSkill[];
+      expect(writtenDirs).toHaveLength(1);
+      expect(writtenDirs[0]).toBeInstanceOf(RulesyncSkill);
+      expect(writtenDirs[0]!.getOutputRoot()).toBe("/home/user/.aiglobal/.rulesync");
+    });
+
+    it("should leave imported rulesync skills untouched in project mode", async () => {
+      mockConfig.getFeatures.mockReturnValue(["skills"]);
+
+      const projectRootedSkill = new RulesyncSkill({
+        outputRoot: "/project/root",
+        dirName: "test-skill",
+        frontmatter: { name: "test-skill", description: "d" },
+        body: "b",
+        validate: false,
+      });
+
+      const mockProcessor = {
+        loadToolDirs: vi.fn().mockResolvedValue([{ dir: "tool" }]),
+        convertToolDirsToRulesyncDirs: vi.fn().mockResolvedValue([projectRootedSkill]),
+        writeAiDirs: vi.fn().mockResolvedValue({ count: 1, paths: [] }),
+      };
+      vi.mocked(SkillsProcessor).mockImplementation(function () {
+        return mockProcessor as unknown as SkillsProcessor;
+      });
+
+      await importFromTool({ logger, config: mockConfig as never, tool: "claudecode" });
+
+      const writtenDirs = mockProcessor.writeAiDirs.mock.calls[0]?.[0] as RulesyncSkill[];
+      expect(writtenDirs[0]).toBe(projectRootedSkill);
     });
   });
 

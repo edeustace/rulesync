@@ -619,6 +619,89 @@ function convertEnvVarRefsForCodex({
 }
 
 /**
+ * Rewrite a stdio server's `env` entries whose value is a canonical `${VAR}`
+ * reference into `env_vars` entries, because Codex writes `env` values
+ * verbatim and never expands them — the server would receive the literal
+ * `${VAR}` string. `env_vars` is Codex's own mechanism for pulling values
+ * from the user's shell environment at launch.
+ *
+ * Only acts on the same-name case (`"FOO": "${FOO}"` → `env_vars += ["FOO"]`):
+ * Codex has no way to express "set env `FOO` from shell var `BAR`" in a single
+ * step, so a different-name reference is left in `env` with a warning. A
+ * partial reference (`"ApiKey ${TOKEN}"`) is likewise left verbatim with a
+ * warning — Codex has no analogue for an interpolated prefix.
+ *
+ * An existing `env_vars` entry for the same variable is kept rather than
+ * duplicated, matching the "explicit wins" rule used for `env_http_headers`.
+ *
+ * This runs after key translation, so `env_vars` is already spelled with the
+ * underscore (not the canonical `envVars`).
+ * @see https://learn.chatgpt.com/docs/config-file/config-reference
+ */
+function convertStdioEnvRefsForCodex({
+  converted,
+  isStdio,
+  serverName,
+}: {
+  converted: Record<string, unknown>;
+  isStdio: boolean;
+  serverName: string;
+}): void {
+  if (!isStdio) return;
+  const env = converted["env"];
+  if (!isPlainObject(env)) return;
+
+  const existingEnvVarsRaw = converted["env_vars"];
+  const existingEnvVars = isEnvVarEntryArray(existingEnvVarsRaw) ? existingEnvVarsRaw : [];
+  const existingNames = new Set(
+    existingEnvVars.map((entry) => (typeof entry === "string" ? entry : entry.name)),
+  );
+  const derivedNames: string[] = [];
+  const remainingEnv: Record<string, unknown> = {};
+
+  for (const [name, value] of Object.entries(env)) {
+    if (typeof value !== "string") {
+      remainingEnv[name] = value;
+      continue;
+    }
+    const wholeMatch = WHOLE_ENV_VAR_REF_PATTERN.exec(value);
+    if (wholeMatch?.[1] === name) {
+      if (!existingNames.has(name)) {
+        derivedNames.push(name);
+        existingNames.add(name);
+      }
+      continue;
+    }
+    if (wholeMatch?.[1]) {
+      warnWithFallback(
+        undefined,
+        `[CodexCliMcp] MCP server "${serverName}": env entry '${name}' references '\${${wholeMatch[1]}}' but Codex's 'env_vars' can only pass a shell variable through under its own name. The reference is left in 'env' and will reach the server literally.`,
+      );
+      remainingEnv[name] = value;
+      continue;
+    }
+    if (hasUnexpandedEnvVarRef(value)) {
+      warnWithFallback(
+        undefined,
+        `[CodexCliMcp] MCP server "${serverName}": env entry '${name}' contains an environment variable reference that Codex does not expand, so it is written verbatim to 'env' and reaches the server literally. Only a whole-value '\${${name}}' matching the entry's own name is converted to 'env_vars'.`,
+      );
+      remainingEnv[name] = value;
+      continue;
+    }
+    remainingEnv[name] = value;
+  }
+
+  if (Object.keys(remainingEnv).length > 0) {
+    converted["env"] = remainingEnv;
+  } else {
+    delete converted["env"];
+  }
+  if (derivedNames.length > 0) {
+    converted["env_vars"] = [...existingEnvVars, ...derivedNames];
+  }
+}
+
+/**
  * Codex states no transport of its own — it infers one from `command` versus
  * `url`, which is why generate drops the canonical `type`. Restate it for a url
  * server on the way back, so a config imported from Codex reaches the adapters
@@ -782,6 +865,7 @@ function convertToCodexFormat(mcpServers: Record<string, unknown>): Record<strin
     }
 
     convertEnvVarRefsForCodex({ converted, serverName: name });
+    convertStdioEnvRefsForCodex({ converted, isStdio, serverName: name });
     dropTransportRejectedKeys({ converted, isStdio, serverName: name });
 
     const previousName = originalNames.get(codexName);
